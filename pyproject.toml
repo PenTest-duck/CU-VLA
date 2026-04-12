@@ -10,4 +10,6 @@ dependencies = [
     "pygame>=2.6",
     "h5py>=3.12",
     "matplotlib>=3.10",
+    "torchvision>=0.22",
+    "transformers>=4.52",
 ]
