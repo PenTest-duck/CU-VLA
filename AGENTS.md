@@ -32,6 +32,8 @@ Serves as a high-level table of contents.
 | `experiments/reactive_clicks/` | Experiment 1 code (see below) |
 | `docs/experiments/2-act.md` | Experiment 2 brief — ACT for drag-and-label |
 | `docs/plans/2026-04-13-act-drag-and-label-design.md` | Experiment 2 full design doc — ACT architecture, drag-and-label task, vision backbone + chunk size ablations |
+| `docs/plans/2026-04-13-act-drag-and-label-implementation.md` | Experiment 2 implementation plan — 12-task breakdown |
+| `experiments/act_drag_label/` | Experiment 2 code (see below) |
 
 ## Experiment 1: Reactive Clicks
 
@@ -56,6 +58,31 @@ uv run python experiments/reactive_clicks/evaluate.py --visual  # with visible P
 | `model.py` | `TinyCNN` — 4-conv + FC + regression dx/dy + classification btn (~2.2M params, <2ms) |
 | `train.py` | BC training loop: HDF5 loader, L1 loss (dx/dy) + CE (btn), AdamW + cosine LR |
 | `evaluate.py` | Runs all agents, reports decomposed metrics (MAE, hit rate, RT, loop Hz) |
+
+## Experiment 2: ACT Drag-and-Label
+
+Validates ACT (Action Chunking with Transformers) for desktop interaction: drag colored shapes to matching zones, type 3-char labels. Tests whether action chunking provides genuine advantage over reactive single-step models.
+
+**Run sequence:**
+```bash
+uv run python experiments/act_drag_label/generate_data.py -n 10000       # generate expert demos
+uv run python experiments/act_drag_label/train.py --backbone resnet18 --chunk-size 10 --device mps
+uv run python experiments/act_drag_label/evaluate.py --backbone resnet18 --chunk-size 10
+uv run python experiments/act_drag_label/evaluate.py --visual            # with Pygame window
+```
+
+**Code layout:**
+| File | Purpose |
+|------|---------|
+| `config.py` | All hyperparameters (env, action, model, chunk, training, eval, expert) |
+| `env.py` | `DragLabelEnv` — Pygame-based Gym-style env (headless + visual modes) |
+| `expert.py` | Fitts's Law expert with drag + typing phases |
+| `backbones.py` | ResNet18, DINOv2 ViT-S/14, SigLIP2 base — all output (B, 49, 256) |
+| `model.py` | `ACT` — CVAE + transformer encoder-decoder + action heads (~33M params) |
+| `baseline_cnn.py` | `BaselineCNN` — extended TinyCNN, single-step no-chunking baseline |
+| `generate_data.py` | Runs expert, saves HDF5 episodes to `data/` |
+| `train.py` | BC training: chunk sampling, multi-head loss, KL annealing, AMP |
+| `evaluate.py` | Runs all agents, temporal ensemble, decomposed metrics by phase |
 
 ## Key Technical Decisions (from research)
 

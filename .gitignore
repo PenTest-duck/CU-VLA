@@ -13,3 +13,5 @@ wheels/
 experiments/*/data/
 experiments/*/checkpoints/
 experiments/*/results/
+
+.firecrawl
