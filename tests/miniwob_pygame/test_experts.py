@@ -3,10 +3,18 @@
 import numpy as np
 
 from experiments.miniwob_pygame.experts.click_target import run_expert_episode
+from experiments.miniwob_pygame.experts.drag_to_zone import (
+    run_expert_episode as run_drag_to_zone_expert_episode,
+)
+from experiments.miniwob_pygame.experts.type_field import (
+    run_expert_episode as run_type_field_expert_episode,
+)
 from experiments.miniwob_pygame.experts.use_slider import (
     run_expert_episode as run_slider_expert_episode,
 )
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
+from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
+from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
 from experiments.miniwob_pygame.tasks.use_slider import UseSliderEnv
 
 
@@ -36,3 +44,17 @@ class TestUseSliderExpert:
                 successes += 1
         env.close()
         assert successes >= 15, f"Expert only succeeded {successes}/{n_episodes} times"
+
+
+class TestDragToZoneExpert:
+    def test_expert_completes_task(self):
+        env = DragToZoneEnv(num_shapes=1)
+        successes = 0
+        n_episodes = 20
+        for i in range(n_episodes):
+            rng = np.random.default_rng(seed=i)
+            _, _, info = run_drag_to_zone_expert_episode(env, rng, seed=i)
+            if info.get("success"):
+                successes += 1
+        env.close()
+        assert successes >= 18, f"Expert only succeeded {successes}/{n_episodes} times"

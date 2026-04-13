@@ -107,3 +107,117 @@ class TestUseSlider:
         _, done, info = env.step(_noop())
         assert not done or info.get("success") is not True
         env.close()
+
+
+class TestDragToZone:
+    def test_drag_to_correct_zone_succeeds(self):
+        env = DragToZoneEnv(num_shapes=1)
+        env.reset(seed=42)
+        shape = env.shapes[0]
+        zone = env.zones[0]
+        assert shape["color"] == zone["color"]
+
+        # Teleport cursor to shape center and press (grab)
+        env._cursor_x = shape["x"] + shape["width"] / 2
+        env._cursor_y = shape["y"] + shape["height"] / 2
+        _, done, _ = env.step(_noop(mouse_left=1))
+        assert not done
+        assert shape["grabbed"] is True
+
+        # Teleport cursor to zone center (while held)
+        zone_cx = zone["x"] + zone["width"] / 2
+        zone_cy = zone["y"] + zone["height"] / 2
+        env._cursor_x = zone_cx
+        env._cursor_y = zone_cy
+        # Step with mouse held to update drag position
+        _, done, _ = env.step(_noop(mouse_left=1))
+        assert not done
+
+        # Release mouse -> drop on correct zone
+        _, done, info = env.step(_noop(mouse_left=0))
+        assert done
+        assert info.get("success") is True
+        assert shape["dropped"] is True
+        env.close()
+
+    def test_drop_wrong_zone_fails(self):
+        env = DragToZoneEnv(num_shapes=2)
+        env.reset(seed=42)
+        shape = env.shapes[0]
+        # Find the zone that does NOT match shape's color
+        wrong_zone = None
+        for z in env.zones:
+            if z["color"] != shape["color"]:
+                wrong_zone = z
+                break
+        assert wrong_zone is not None, "Need a zone with different color"
+
+        # Grab the shape
+        env._cursor_x = shape["x"] + shape["width"] / 2
+        env._cursor_y = shape["y"] + shape["height"] / 2
+        env.step(_noop(mouse_left=1))
+
+        # Drag to wrong zone center
+        env._cursor_x = wrong_zone["x"] + wrong_zone["width"] / 2
+        env._cursor_y = wrong_zone["y"] + wrong_zone["height"] / 2
+        env.step(_noop(mouse_left=1))
+
+        # Release on wrong zone
+        _, done, info = env.step(_noop(mouse_left=0))
+        assert not done
+        assert shape["dropped"] is False
+        env.close()
+
+
+class TestTypeField:
+    def test_correct_typing_succeeds(self):
+        env = TypeFieldEnv()
+        env.reset(seed=42)
+        ti = env._text_input
+        target = env._target_word
+        # Teleport cursor to text input center and click to focus
+        env._cursor_x = float(ti.x + ti.width / 2)
+        env._cursor_y = float(ti.y + ti.height / 2)
+        env.step(_noop(mouse_left=1))
+        env.step(_noop(mouse_left=0))
+        assert ti.focused
+        # Type each character of the target word
+        done = False
+        info = {}
+        for ch in target:
+            key_idx = char_to_key_index(ch)
+            keys = [0] * NUM_KEYS
+            keys[key_idx] = 1
+            _, done, info = env.step(_noop(keys_held=keys))
+            if done:
+                break
+            # Release key
+            _, done, info = env.step(_noop())
+            if done:
+                break
+        assert done
+        assert info.get("success") is True
+        env.close()
+
+    def test_wrong_character_fails(self):
+        env = TypeFieldEnv()
+        env.reset(seed=42)
+        ti = env._text_input
+        target = env._target_word
+        # Focus the field
+        env._cursor_x = float(ti.x + ti.width / 2)
+        env._cursor_y = float(ti.y + ti.height / 2)
+        env.step(_noop(mouse_left=1))
+        env.step(_noop(mouse_left=0))
+        # Type a character that is NOT the first char of target
+        wrong_char = "Z" if target[0] != "Z" else "A"
+        key_idx = char_to_key_index(wrong_char)
+        keys = [0] * NUM_KEYS
+        keys[key_idx] = 1
+        _, done, info = env.step(_noop(keys_held=keys))
+        if not done:
+            # Release key triggers check
+            _, done, info = env.step(_noop())
+        assert done
+        assert info.get("failure") == "wrong_key"
+        env.close()
