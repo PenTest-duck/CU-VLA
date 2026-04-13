@@ -1,4 +1,5 @@
 # /// script
+# requires-python = ">=3.14"
 # dependencies = [
 #     "torch>=2.11",
 #     "torchvision>=0.22",
