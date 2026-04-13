@@ -1,7 +1,10 @@
 """Tests for MiniWoB-Pygame task environments."""
 
-from experiments.miniwob_pygame.config import NUM_KEYS
+from experiments.miniwob_pygame.config import ENV, NUM_KEYS, char_to_key_index
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
+from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
+from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
+from experiments.miniwob_pygame.tasks.use_slider import UseSliderEnv
 
 
 def _noop(**overrides):
@@ -75,4 +78,32 @@ class TestClickTarget:
         # Distractor colors differ from target
         for d in env._distractors:
             assert d["color"] != env._target["color"]
+        env.close()
+
+
+class TestUseSlider:
+    def test_slider_at_target_succeeds(self):
+        env = UseSliderEnv()
+        env.reset(seed=42)
+        slider = env._slider
+        assert slider is not None
+        # Teleport slider value to target
+        slider.value = slider.target_value
+        slider.dragging = False
+        # _check_success is called every step, so a noop triggers it
+        _, done, info = env.step(_noop())
+        assert done
+        assert info.get("success") is True
+        env.close()
+
+    def test_slider_wrong_value_not_success(self):
+        env = UseSliderEnv(tolerance=5.0)
+        env.reset(seed=42)
+        slider = env._slider
+        assert slider is not None
+        # Set value far from target
+        slider.value = (slider.target_value + 50) % 100
+        slider.dragging = False
+        _, done, info = env.step(_noop())
+        assert not done or info.get("success") is not True
         env.close()
