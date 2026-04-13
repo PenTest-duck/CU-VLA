@@ -97,7 +97,7 @@ def replay(
         print(f"Loading dataset from {data_dir} ...")
         ds = load_from_disk(data_dir)
 
-    episode_offsets = build_episode_offsets(ds)
+    episode_offsets = build_episode_offsets(np.array(ds["episode_id"], dtype=np.int32))
     all_episode_ids = sorted(episode_offsets.keys())
 
     if not all_episode_ids:

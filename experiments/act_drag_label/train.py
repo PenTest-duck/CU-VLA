@@ -31,23 +31,20 @@ from experiments.act_drag_label.model import ACT, count_parameters
 # ---------------------------------------------------------------------------
 
 def build_episode_offsets(
-    ds,
+    ep_ids: np.ndarray,
 ) -> dict[int, tuple[int, int]]:
-    """Scan the episode_id column and return {episode_id: (start_row, length)}.
+    """Return {episode_id: (start_row, length)} from a sorted episode_id array.
 
-    Assumes the dataset is sorted by (episode_id, timestep) — which is the
+    Assumes the array is sorted by (episode_id, timestep) — which is the
     natural output order from generate_data.py / Dataset.from_generator().
     """
-    ep_col = ds["episode_id"]
+    # Find indices where episode_id changes
+    changes = np.where(np.diff(ep_ids) != 0)[0] + 1
+    starts = np.concatenate([[0], changes])
+    ends = np.concatenate([changes, [len(ep_ids)]])
     offsets: dict[int, tuple[int, int]] = {}
-    cur_ep = ep_col[0]
-    cur_start = 0
-    for i in range(1, len(ep_col)):
-        if ep_col[i] != cur_ep:
-            offsets[cur_ep] = (cur_start, i - cur_start)
-            cur_ep = ep_col[i]
-            cur_start = i
-    offsets[cur_ep] = (cur_start, len(ep_col) - cur_start)
+    for s, e in zip(starts, ends):
+        offsets[int(ep_ids[s])] = (int(s), int(e - s))
     return offsets
 
 
@@ -201,9 +198,25 @@ def train(
         )
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # Pre-extract scalar columns to numpy (avoids per-sample Arrow access)
+    t_extract = time.perf_counter()
+    ep_ids_np = np.array(ds["episode_id"], dtype=np.int32)
+    action_arrays = {
+        "action_dx": np.array(ds["action_dx"], dtype=np.float32),
+        "action_dy": np.array(ds["action_dy"], dtype=np.float32),
+        "action_click": np.array(ds["action_click"], dtype=np.int8),
+        "action_key": np.array(ds["action_key"], dtype=np.int8),
+    }
+    extract_mb = (ep_ids_np.nbytes + sum(a.nbytes for a in action_arrays.values())) / 1024 / 1024
+    print(
+        f"Scalar columns extracted to numpy in {time.perf_counter() - t_extract:.2f}s "
+        f"({extract_mb:.1f}MB)",
+        flush=True,
+    )
+
     # Build episode offset table
     t_init = time.perf_counter()
-    episode_offsets = build_episode_offsets(ds)
+    episode_offsets = build_episode_offsets(ep_ids_np)
     print(f"Episode offsets built in {time.perf_counter() - t_init:.2f}s", flush=True)
     all_episode_ids = sorted(episode_offsets.keys())
 
@@ -211,21 +224,6 @@ def train(
         all_episode_ids = all_episode_ids[:max_episodes]
 
     print(f"Using {len(all_episode_ids)} episodes")
-
-    # Pre-extract action columns to numpy (avoids ds.select() per sample)
-    t_extract = time.perf_counter()
-    action_arrays = {
-        "action_dx": np.array(ds["action_dx"], dtype=np.float32),
-        "action_dy": np.array(ds["action_dy"], dtype=np.float32),
-        "action_click": np.array(ds["action_click"], dtype=np.int8),
-        "action_key": np.array(ds["action_key"], dtype=np.int8),
-    }
-    extract_mb = sum(a.nbytes for a in action_arrays.values()) / 1024 / 1024
-    print(
-        f"Action columns extracted to numpy in {time.perf_counter() - t_extract:.2f}s "
-        f"({extract_mb:.1f}MB)",
-        flush=True,
-    )
 
     # Train/val split by episode
     rng = np.random.default_rng(42)
