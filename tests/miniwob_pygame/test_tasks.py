@@ -1,6 +1,7 @@
 """Tests for MiniWoB-Pygame task environments."""
 
 from experiments.miniwob_pygame.config import ENV, NUM_KEYS, char_to_key_index
+from experiments.miniwob_pygame.tasks.click_sequence import ClickSequenceEnv
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
 from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
 from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
@@ -166,6 +167,66 @@ class TestDragToZone:
         _, done, info = env.step(_noop(mouse_left=0))
         assert not done
         assert shape["dropped"] is False
+        env.close()
+
+
+class TestClickSequence:
+    def test_correct_order_succeeds(self):
+        env = ClickSequenceEnv(num_buttons=3)
+        env.reset(seed=42)
+        target_order = env._target_order
+        buttons = env._buttons
+
+        # Build lookup by number
+        btn_by_num = {b["number"]: b for b in buttons}
+
+        done = False
+        info = {}
+        for number in target_order:
+            btn = btn_by_num[number]
+            # Teleport cursor to button center
+            env._cursor_x = float(btn["x"] + btn["width"] / 2)
+            env._cursor_y = float(btn["y"] + btn["height"] / 2)
+            # Press
+            _, done, info = env.step(_noop(mouse_left=1))
+            if done:
+                break
+            # Release (click)
+            _, done, info = env.step(_noop(mouse_left=0))
+            if done:
+                break
+
+        assert done
+        assert info.get("success") is True
+        env.close()
+
+    def test_wrong_order_fails(self):
+        env = ClickSequenceEnv(num_buttons=3)
+        env.reset(seed=42)
+        target_order = env._target_order
+        buttons = env._buttons
+
+        # Build lookup by number
+        btn_by_num = {b["number"]: b for b in buttons}
+
+        # Find a button that is NOT the first expected
+        expected_first = target_order[0]
+        wrong_number = None
+        for number in target_order:
+            if number != expected_first:
+                wrong_number = number
+                break
+        assert wrong_number is not None, "Need at least 2 distinct buttons"
+
+        # Click the wrong button
+        btn = btn_by_num[wrong_number]
+        env._cursor_x = float(btn["x"] + btn["width"] / 2)
+        env._cursor_y = float(btn["y"] + btn["height"] / 2)
+        env.step(_noop(mouse_left=1))
+        _, done, info = env.step(_noop(mouse_left=0))
+
+        assert done
+        assert info.get("success") is not True
         env.close()
 
 
