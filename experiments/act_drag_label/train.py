@@ -60,6 +60,10 @@ class ChunkDataset(Dataset):
 
     Every timestep t in every episode is a valid start index.
     Action chunks are zero-padded when near the episode end.
+
+    Action columns are pre-extracted to numpy arrays (~7MB) to avoid
+    expensive ds.select() calls per sample. Only the image column is
+    read from Arrow at __getitem__ time (single PNG decode per sample).
     """
 
     def __init__(
@@ -68,6 +72,7 @@ class ChunkDataset(Dataset):
         episode_offsets: dict[int, tuple[int, int]],
         episode_ids: set[int],
         chunk_size: int,
+        action_arrays: dict[str, np.ndarray],
     ) -> None:
         self.ds = ds
         self.chunk_size = chunk_size
@@ -75,6 +80,10 @@ class ChunkDataset(Dataset):
             eid: episode_offsets[eid] for eid in episode_ids
             if eid in episode_offsets
         }
+        self.action_dx = action_arrays["action_dx"]
+        self.action_dy = action_arrays["action_dy"]
+        self.action_click = action_arrays["action_click"]
+        self.action_key = action_arrays["action_key"]
 
         # Build flat index: every timestep in the selected episodes
         self.index: list[tuple[int, int]] = []
@@ -101,14 +110,15 @@ class ChunkDataset(Dataset):
         eid, t = self.index[idx]
         start_row, ep_len = self.episode_offsets[eid]
         C = self.chunk_size
+        row_idx = start_row + t
 
-        # --- Observation at time t (single PNG decode) ---
-        row = self.ds[start_row + t]
+        # --- Observation at time t (single PNG decode from Arrow) ---
+        row = self.ds[row_idx]
         obs = torch.from_numpy(np.array(row["image"])).permute(2, 0, 1).float() / 255.0
 
-        # --- Proprioception at time t ---
-        click_t = float(row["action_click"])
-        key_t = int(row["action_key"])
+        # --- Proprioception at time t (from pre-extracted numpy) ---
+        click_t = float(self.action_click[row_idx])
+        key_t = int(self.action_key[row_idx])
         key_onehot = np.zeros(ACTION.num_key_classes, dtype=np.float32)
         key_onehot[key_t] = 1.0
         proprio = np.zeros(31, dtype=np.float32)
@@ -118,12 +128,10 @@ class ChunkDataset(Dataset):
         proprio[3:] = key_onehot
         proprio = torch.from_numpy(proprio)
 
-        # --- Action chunk [t:t+C], zero-padded if near end ---
+        # --- Action chunk [t:t+C], zero-padded if near end (numpy slices) ---
         end_t = min(t + C, ep_len)
         real_len = end_t - t
-
-        # Columnar access — no image decode for action columns
-        chunk_rows = self.ds.select(range(start_row + t, start_row + end_t))
+        sl = slice(row_idx, row_idx + real_len)
 
         dx_chunk = np.zeros(C, dtype=np.float32)
         dy_chunk = np.zeros(C, dtype=np.float32)
@@ -131,10 +139,10 @@ class ChunkDataset(Dataset):
         key_chunk = np.zeros(C, dtype=np.int64)
         pad_mask = np.ones(C, dtype=np.float32)  # 1=padded, 0=real
 
-        dx_chunk[:real_len] = chunk_rows["action_dx"]
-        dy_chunk[:real_len] = chunk_rows["action_dy"]
-        click_chunk[:real_len] = np.array(chunk_rows["action_click"], dtype=np.float32)
-        key_chunk[:real_len] = np.array(chunk_rows["action_key"], dtype=np.int64)
+        dx_chunk[:real_len] = self.action_dx[sl]
+        dy_chunk[:real_len] = self.action_dy[sl]
+        click_chunk[:real_len] = self.action_click[sl].astype(np.float32)
+        key_chunk[:real_len] = self.action_key[sl].astype(np.int64)
         pad_mask[:real_len] = 0.0
 
         dx_chunk = torch.from_numpy(dx_chunk)
@@ -185,7 +193,7 @@ def train(
         print(f"Loading dataset from {default_dir} ...")
         ds = load_from_disk(default_dir)
 
-    print(f"Dataset: {ds}")
+    print(f"Dataset: {ds}", flush=True)
 
     if checkpoint_dir is None:
         checkpoint_dir = os.path.join(
@@ -194,13 +202,30 @@ def train(
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Build episode offset table
+    t_init = time.perf_counter()
     episode_offsets = build_episode_offsets(ds)
+    print(f"Episode offsets built in {time.perf_counter() - t_init:.2f}s", flush=True)
     all_episode_ids = sorted(episode_offsets.keys())
 
     if max_episodes is not None and max_episodes < len(all_episode_ids):
         all_episode_ids = all_episode_ids[:max_episodes]
 
     print(f"Using {len(all_episode_ids)} episodes")
+
+    # Pre-extract action columns to numpy (avoids ds.select() per sample)
+    t_extract = time.perf_counter()
+    action_arrays = {
+        "action_dx": np.array(ds["action_dx"], dtype=np.float32),
+        "action_dy": np.array(ds["action_dy"], dtype=np.float32),
+        "action_click": np.array(ds["action_click"], dtype=np.int8),
+        "action_key": np.array(ds["action_key"], dtype=np.int8),
+    }
+    extract_mb = sum(a.nbytes for a in action_arrays.values()) / 1024 / 1024
+    print(
+        f"Action columns extracted to numpy in {time.perf_counter() - t_extract:.2f}s "
+        f"({extract_mb:.1f}MB)",
+        flush=True,
+    )
 
     # Train/val split by episode
     rng = np.random.default_rng(42)
@@ -217,9 +242,9 @@ def train(
 
     print(f"DataLoader workers: {num_workers}")
 
-    train_dataset = ChunkDataset(ds, episode_offsets, train_ids, chunk_size)
-    val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size)
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    train_dataset = ChunkDataset(ds, episode_offsets, train_ids, chunk_size, action_arrays)
+    val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size, action_arrays)
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}", flush=True)
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
@@ -264,7 +289,7 @@ def train(
     amp_dtype = torch.float16 if use_amp else torch.float32
 
     print(f"AMP: {'enabled' if use_amp else 'disabled (GradScaler requires CUDA)'}")
-    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}")
+    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}", flush=True)
 
     # Training loop
     history: dict[str, list] = {
@@ -288,8 +313,9 @@ def train(
         model.train()
         train_loss_sum = 0.0
         train_total = 0
+        n_batches = len(train_loader)
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             (obs, proprio, actions_cvae, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = batch
             obs = obs.to(device)
             proprio = proprio.to(device)
@@ -364,6 +390,16 @@ def train(
             bs = obs.size(0)
             train_loss_sum += total_loss.item() * bs
             train_total += bs
+
+            # Debug: log progress during first epoch to diagnose throughput
+            if epoch == 0 and (batch_idx == 0 or (batch_idx + 1) % 100 == 0):
+                elapsed_batch = time.perf_counter() - t0
+                print(
+                    f"    batch {batch_idx+1}/{n_batches} | "
+                    f"loss={total_loss.item():.4f} | "
+                    f"{elapsed_batch:.1f}s elapsed",
+                    flush=True,
+                )
 
         scheduler.step()
         train_loss = train_loss_sum / max(train_total, 1)
@@ -459,7 +495,8 @@ def train(
                 f"train={train_loss:.4f} val={val_loss:.4f} | "
                 f"kl_w={kl_weight:.4f} | "
                 f"lr={scheduler.get_last_lr()[0]:.6f} | "
-                f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min"
+                f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min",
+                flush=True,
             )
 
         # Early stopping
