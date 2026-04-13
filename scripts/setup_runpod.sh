@@ -11,8 +11,8 @@
 
 set -e
 
-REPO_URL="${REPO_URL:-https://github.com/YOUR_USER/CU-VLA.git}"
-HF_DATA_REPO="${HF_DATA_REPO:-YOUR_USER/cu-vla-data}"
+REPO_URL="${REPO_URL:-https://github.com/PenTest-duck/CU-VLA.git}"
+HF_DATA_REPO="${HF_DATA_REPO:-PenTest-duck/cu-vla-data}"
 WORKDIR="/workspace/cu-vla"
 
 echo "=== RunPod Setup ==="
@@ -58,4 +58,4 @@ echo "    uv run python experiments/act_drag_label/train.py --backbone \$bb --ch
 echo "  done"
 echo ""
 echo "Upload checkpoints when done:"
-echo "  uv run python experiments/act_drag_label/hf_sync.py upload-checkpoints --repo YOUR_USER/cu-vla-checkpoints"
+echo "  uv run python experiments/act_drag_label/hf_sync.py upload-checkpoints"

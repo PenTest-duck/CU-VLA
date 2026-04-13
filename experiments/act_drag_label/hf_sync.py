@@ -1,12 +1,12 @@
 """Upload/download data and checkpoints to/from HuggingFace Hub.
 
 Usage:
-    uv run python experiments/act_drag_label/hf_sync.py upload-data --repo user/cu-vla-data
-    uv run python experiments/act_drag_label/hf_sync.py download-data --repo user/cu-vla-data
-    uv run python experiments/act_drag_label/hf_sync.py upload-checkpoints --repo user/cu-vla-checkpoints
-    uv run python experiments/act_drag_label/hf_sync.py download-checkpoints --repo user/cu-vla-checkpoints
+    uv run python experiments/act_drag_label/hf_sync.py upload-data
+    uv run python experiments/act_drag_label/hf_sync.py download-data
+    uv run python experiments/act_drag_label/hf_sync.py upload-checkpoints
+    uv run python experiments/act_drag_label/hf_sync.py download-checkpoints
 
-Requires: huggingface-cli login (or HF_TOKEN env var)
+Requires: hf auth login (or HF_TOKEN env var)
 """
 
 import argparse
@@ -15,6 +15,10 @@ import sys
 
 from huggingface_hub import HfApi, snapshot_download
 
+
+HF_USER = "PenTest-duck"
+DEFAULT_DATA_REPO = f"{HF_USER}/cu-vla-data"
+DEFAULT_CHECKPOINTS_REPO = f"{HF_USER}/cu-vla-checkpoints"
 
 BASE = os.path.join(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE, "data")
@@ -75,17 +79,17 @@ if __name__ == "__main__":
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("upload-data", help="Upload dataset to HF Hub")
-    p.add_argument("--repo", required=True, help="HF repo id (e.g. user/cu-vla-data)")
+    p.add_argument("--repo", default=DEFAULT_DATA_REPO)
 
     p = sub.add_parser("download-data", help="Download dataset from HF Hub")
-    p.add_argument("--repo", required=True)
+    p.add_argument("--repo", default=DEFAULT_DATA_REPO)
     p.add_argument("--local-dir", default=None)
 
     p = sub.add_parser("upload-checkpoints", help="Upload checkpoints to HF Hub")
-    p.add_argument("--repo", required=True, help="HF repo id (e.g. user/cu-vla-checkpoints)")
+    p.add_argument("--repo", default=DEFAULT_CHECKPOINTS_REPO)
 
     p = sub.add_parser("download-checkpoints", help="Download checkpoints from HF Hub")
-    p.add_argument("--repo", required=True)
+    p.add_argument("--repo", default=DEFAULT_CHECKPOINTS_REPO)
     p.add_argument("--local-dir", default=None)
 
     args = parser.parse_args()
