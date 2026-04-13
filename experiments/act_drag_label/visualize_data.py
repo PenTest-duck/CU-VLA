@@ -90,7 +90,7 @@ def replay(
     if data_dir is None:
         data_dir = os.path.join(os.path.dirname(__file__), "data")
 
-    episode_files = sorted(glob.glob(os.path.join(data_dir, "episode_*.hdf5")))
+    episode_files = sorted(glob.glob(os.path.join(data_dir, "**", "episode_*.hdf5"), recursive=True))
     if not episode_files:
         print(f"No episodes found in {data_dir}")
         return

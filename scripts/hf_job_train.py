@@ -13,13 +13,13 @@
 """Self-contained training script for HuggingFace Jobs.
 
 Clones the repo, installs it, and runs train.py with forwarded args.
+The dataset should be volume-mounted at /data by the launcher script.
+Falls back to --hf-data-repo snapshot_download if /data is empty.
 
-Usage (via hf CLI):
-    hf jobs uv run scripts/hf_job_train.py \
-      --flavor t4-medium --timeout 4h --secrets HF_TOKEN \
-      -- --backbone resnet18 --chunk-size 10 \
-         --hf-data-repo PenTest-duck/cu-vla-data \
-         --hf-upload-repo PenTest-duck/cu-vla-checkpoints
+Launch via the companion script:
+    uv run python scripts/launch_hf_job.py \
+      --flavor t4-medium --timeout 4h \
+      -- --backbone resnet18 --chunk-size 10
 """
 
 import os
@@ -28,6 +28,7 @@ import sys
 
 REPO_URL = "https://github.com/PenTest-duck/CU-VLA.git"
 WORKDIR = "/tmp/cu-vla"
+MOUNTED_DATA_DIR = "/data"
 
 
 def main() -> None:
@@ -46,6 +47,13 @@ def main() -> None:
     train_args = [a for a in sys.argv[1:] if a.strip()]
     if "--device" not in train_args:
         train_args.extend(["--device", "cuda"])
+
+    # Use mounted dataset volume if available and populated
+    import glob
+    mounted_episodes = glob.glob(os.path.join(MOUNTED_DATA_DIR, "**", "episode_*.hdf5"), recursive=True)
+    if mounted_episodes and "--data-dir" not in train_args:
+        print(f"Found {len(mounted_episodes)} episodes in mounted volume {MOUNTED_DATA_DIR}")
+        train_args.extend(["--data-dir", MOUNTED_DATA_DIR])
 
     print(f"Running train.py with args: {train_args}")
     cmd = [sys.executable, "experiments/act_drag_label/train.py"] + train_args

@@ -34,6 +34,8 @@ Serves as a high-level table of contents.
 | `docs/plans/2026-04-13-act-drag-and-label-design.md` | Experiment 2 full design doc — ACT architecture, drag-and-label task, vision backbone + chunk size ablations |
 | `docs/plans/2026-04-13-act-drag-and-label-implementation.md` | Experiment 2 implementation plan — 12-task breakdown |
 | `experiments/act_drag_label/` | Experiment 2 code (see below) |
+| `scripts/launch_hf_job.py` | Launcher for HF Jobs training (volume-mounts dataset, calls `run_uv_job()`) |
+| `scripts/hf_job_train.py` | UV script that runs inside HF Jobs (clones repo, runs train.py) |
 
 ## Experiment 1: Reactive Clicks
 
@@ -80,9 +82,23 @@ uv run python experiments/act_drag_label/evaluate.py --visual            # with 
 | `backbones.py` | ResNet18, DINOv2 ViT-S/14, SigLIP2 base — all output (B, 49, 256) |
 | `model.py` | `ACT` — CVAE + transformer encoder-decoder + action heads (~33M params) |
 | `baseline_cnn.py` | `BaselineCNN` — extended TinyCNN, single-step no-chunking baseline |
-| `generate_data.py` | Runs expert, saves HDF5 episodes to `data/` |
+| `generate_data.py` | Runs expert, saves HDF5 episodes to `data/<shard>/` (1000 per shard) |
 | `train.py` | BC training: chunk sampling, multi-head loss, KL annealing, AMP |
 | `evaluate.py` | Runs all agents, temporal ensemble, decomposed metrics by phase |
+| `hf_sync.py` | Upload/download data and checkpoints to/from HuggingFace Hub |
+
+**Dataset layout:** Episodes are sharded into subdirectories of 1000 to stay under HF's 10k files/directory limit:
+```
+data/000/episode_00000.hdf5 ... episode_00999.hdf5
+data/001/episode_01000.hdf5 ... episode_01999.hdf5
+...
+```
+
+**HF Jobs training** (uses volume-mounted dataset, no snapshot_download needed):
+```bash
+uv run python scripts/launch_hf_job.py --flavor t4-medium --timeout 4h \
+  -- --backbone resnet18 --chunk-size 10 --hf-upload-repo PenTest-duck/cu-vla-checkpoints
+```
 
 ## Key Technical Decisions (from research)
 

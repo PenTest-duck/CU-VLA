@@ -182,7 +182,7 @@ def train(
         data_dir = os.path.join(base, "data")
 
     # Auto-download data from HF Hub if repo specified and local dir is empty
-    if hf_data_repo and not glob.glob(os.path.join(data_dir, "episode_*.hdf5")):
+    if hf_data_repo and not glob.glob(os.path.join(data_dir, "**", "episode_*.hdf5"), recursive=True):
         from huggingface_hub import snapshot_download
         print(f"Downloading data from {hf_data_repo} ...")
         os.makedirs(data_dir, exist_ok=True)
@@ -194,8 +194,8 @@ def train(
         )
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Find episodes
-    episode_files = sorted(glob.glob(os.path.join(data_dir, "episode_*.hdf5")))
+    # Find episodes (supports both flat and sharded subdirectory layouts)
+    episode_files = sorted(glob.glob(os.path.join(data_dir, "**", "episode_*.hdf5"), recursive=True))
     if not episode_files:
         print(f"No episodes found in {data_dir}. Run generate_data.py first.")
         return

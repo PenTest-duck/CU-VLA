@@ -53,8 +53,11 @@ def generate(
         click_array = np.array([a["click"] for a in actions], dtype=np.int8)
         key_array = np.array([a["key"] for a in actions], dtype=np.int8)
 
-        # Save to HDF5
-        path = os.path.join(output_dir, f"episode_{ep:05d}.hdf5")
+        # Save to HDF5 — shard into subdirs of 1000 to stay under HF's 10k/dir limit
+        shard = f"{ep // 1000:03d}"
+        shard_dir = os.path.join(output_dir, shard)
+        os.makedirs(shard_dir, exist_ok=True)
+        path = os.path.join(shard_dir, f"episode_{ep:05d}.hdf5")
         with h5py.File(path, "w") as f:
             f.create_dataset(
                 "observations", data=obs_array, compression="gzip", compression_opts=4

@@ -46,7 +46,8 @@ def download_data(repo: str, local_dir: str | None = None) -> None:
         repo_type="dataset",
         local_dir=dest,
     )
-    n_files = len([f for f in os.listdir(dest) if f.endswith(".hdf5")])
+    import glob
+    n_files = len(glob.glob(os.path.join(dest, "**", "episode_*.hdf5"), recursive=True))
     print(f"Done. {n_files} episodes downloaded.")
 
 
