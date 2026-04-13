@@ -10,6 +10,7 @@ Saves checkpoints + training history.
 """
 
 import argparse
+import collections
 import glob
 import os
 import sys
@@ -29,6 +30,26 @@ from experiments.act_drag_label.config import ACTION, CHUNK, TRAIN
 from experiments.act_drag_label.model import ACT, count_parameters
 
 
+def _auto_cache_size(num_workers: int = 0) -> int:
+    """Pick LRU cache size based on system RAM. ~5MB per cached episode."""
+    try:
+        total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        total_gb = total_bytes / (1024 ** 3)
+    except (ValueError, OSError):
+        total_gb = 8  # conservative fallback
+
+    if total_gb > 24:
+        limit = 999_999  # effectively unlimited
+    elif total_gb > 12:
+        limit = 2000
+    else:
+        limit = 100  # 8GB M1 range
+
+    # Each DataLoader worker gets its own cache via fork
+    effective_processes = max(1, num_workers + 1)
+    return max(10, limit // effective_processes)
+
+
 class ChunkDataset(Dataset):
     """Loads HDF5 episodes and samples (obs, proprio, action_chunk, ...) tuples.
 
@@ -36,9 +57,13 @@ class ChunkDataset(Dataset):
     Action chunks are zero-padded when near the episode end.
     """
 
-    def __init__(self, episode_files: list[str], chunk_size: int) -> None:
+    def __init__(self, episode_files: list[str], chunk_size: int,
+                 cache_max: int | None = None) -> None:
         self.chunk_size = chunk_size
-        self.episode_cache: dict[str, dict[str, np.ndarray]] = {}
+        self._cache_max = cache_max if cache_max is not None else _auto_cache_size()
+        self._cache: collections.OrderedDict[str, dict[str, np.ndarray]] = (
+            collections.OrderedDict()
+        )
         self.index: list[tuple[str, int]] = []
 
         for path in episode_files:
@@ -49,16 +74,24 @@ class ChunkDataset(Dataset):
                 self.index.append((path, t))
 
     def _load_episode(self, path: str) -> dict[str, np.ndarray]:
-        if path not in self.episode_cache:
-            with h5py.File(path, "r") as f:
-                self.episode_cache[path] = {
-                    "observations": f["observations"][:],
-                    "actions_dx": f["actions_dx"][:],
-                    "actions_dy": f["actions_dy"][:],
-                    "actions_click": f["actions_click"][:],
-                    "actions_key": f["actions_key"][:],
-                }
-        return self.episode_cache[path]
+        if path in self._cache:
+            self._cache.move_to_end(path)
+            return self._cache[path]
+
+        with h5py.File(path, "r") as f:
+            data = {
+                "observations": f["observations"][:],
+                "actions_dx": f["actions_dx"][:],
+                "actions_dy": f["actions_dy"][:],
+                "actions_click": f["actions_click"][:],
+                "actions_key": f["actions_key"][:],
+            }
+
+        self._cache[path] = data
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)  # evict oldest
+
+        return data
 
     def __len__(self) -> int:
         return len(self.index)
@@ -134,6 +167,10 @@ class ChunkDataset(Dataset):
 def train(
     backbone: str = "resnet18",
     chunk_size: int = CHUNK.default_chunk_size,
+    batch_size: int = TRAIN.batch_size,
+    max_episodes: int | None = None,
+    num_workers: int | None = None,
+    cache_episodes: int | None = None,
     data_dir: str | None = None,
     checkpoint_dir: str | None = None,
     device: str = "cpu",
@@ -152,7 +189,9 @@ def train(
     if not episode_files:
         print(f"No episodes found in {data_dir}. Run generate_data.py first.")
         return
-    print(f"Found {len(episode_files)} episodes")
+    if max_episodes is not None and max_episodes < len(episode_files):
+        episode_files = episode_files[:max_episodes]
+    print(f"Using {len(episode_files)} episodes")
 
     # Train/val split by episode
     rng = np.random.default_rng(42)
@@ -163,15 +202,24 @@ def train(
 
     print(f"Train: {len(train_files)} episodes, Val: {len(val_files)} episodes")
 
-    train_dataset = ChunkDataset(train_files, chunk_size)
-    val_dataset = ChunkDataset(val_files, chunk_size)
+    # Default num_workers: 4 for CUDA (overlap data loading with GPU), 0 for MPS/CPU
+    if num_workers is None:
+        num_workers = 4 if device.startswith("cuda") else 0
+
+    cache_max = cache_episodes if cache_episodes is not None else _auto_cache_size(num_workers)
+    print(f"DataLoader workers: {num_workers}, Episode cache: {cache_max}")
+
+    train_dataset = ChunkDataset(train_files, chunk_size, cache_max=cache_max)
+    val_dataset = ChunkDataset(val_files, chunk_size, cache_max=cache_max)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     train_loader = DataLoader(
-        train_dataset, batch_size=TRAIN.batch_size, shuffle=True, num_workers=0
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=TRAIN.batch_size, shuffle=False, num_workers=0
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, persistent_workers=num_workers > 0,
     )
 
     # Model
@@ -202,12 +250,12 @@ def train(
         optimizer, T_max=TRAIN.epochs
     )
 
-    # AMP
-    use_amp = TRAIN.use_amp and device != "cpu"
+    # AMP — GradScaler only works on CUDA, not MPS
+    use_amp = TRAIN.use_amp and device.startswith("cuda")
     scaler = torch.amp.GradScaler(enabled=use_amp)
     amp_dtype = torch.float16 if use_amp else torch.float32
 
-    print(f"AMP: {'enabled' if use_amp else 'disabled'}")
+    print(f"AMP: {'enabled' if use_amp else 'disabled (GradScaler requires CUDA)'}")
     print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}")
 
     # Training loop
@@ -395,12 +443,15 @@ def train(
         else:
             epochs_without_improvement += 1
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
+        if True:
+            remaining_epochs = TRAIN.epochs - epoch - 1
+            eta_min = remaining_epochs * elapsed / 60
             print(
                 f"  Epoch {epoch+1:3d}/{TRAIN.epochs} | "
                 f"train={train_loss:.4f} val={val_loss:.4f} | "
                 f"kl_w={kl_weight:.4f} | "
-                f"lr={scheduler.get_last_lr()[0]:.6f} | {elapsed:.1f}s"
+                f"lr={scheduler.get_last_lr()[0]:.6f} | "
+                f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min"
             )
 
         # Early stopping
@@ -427,6 +478,13 @@ if __name__ == "__main__":
         choices=["resnet18", "dinov2-vits14", "siglip2-base"],
     )
     parser.add_argument("--chunk-size", type=int, default=CHUNK.default_chunk_size)
+    parser.add_argument("--batch-size", type=int, default=TRAIN.batch_size)
+    parser.add_argument("--max-episodes", type=int, default=None,
+                        help="Cap number of episodes to load (default: all)")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader workers (default: 4 for CUDA, 0 for MPS/CPU)")
+    parser.add_argument("--cache-episodes", type=int, default=None,
+                        help="LRU cache size per worker (default: auto based on RAM)")
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
@@ -435,6 +493,10 @@ if __name__ == "__main__":
     train(
         backbone=args.backbone,
         chunk_size=args.chunk_size,
+        batch_size=args.batch_size,
+        max_episodes=args.max_episodes,
+        num_workers=args.num_workers,
+        cache_episodes=args.cache_episodes,
         data_dir=args.data_dir,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,

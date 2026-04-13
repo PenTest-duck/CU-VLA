@@ -46,7 +46,7 @@ def generate(
         if info.get("success"):
             successes += 1
 
-        # Stack observations and actions
+        # Stack observations and actions — T frames for T actions
         obs_array = np.stack(observations)  # (T, 224, 224, 3)
         dx_array = np.array([a["dx"] for a in actions], dtype=np.float32)
         dy_array = np.array([a["dy"] for a in actions], dtype=np.float32)

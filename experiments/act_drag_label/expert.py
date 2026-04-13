@@ -239,5 +239,7 @@ def run_episode(
     if not final_info.get("success"):
         final_info = info if trajectory else {}
 
-    observations = observations[: len(actions)]
+    # Trim to T observations for T actions: obs[t] is the state when action[t] was chosen.
+    # The terminal observation (after last action) is discarded — it has no action pair.
+    observations = observations[:len(actions)]
     return observations, actions, final_info
