@@ -26,3 +26,7 @@ System 0/1/2 thinking (inspired by Figure AI's Helix 02):
 How to have continuous memory window over past states?
   - Maybe only store System 1/2?
   - How to compress? Esp. if we are doing high-frequency
+
+Take inspiration from other uses like gaming, e.g. JARVIS-VLA
+
+Frequency domain

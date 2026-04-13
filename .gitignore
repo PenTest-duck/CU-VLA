@@ -15,3 +15,4 @@ experiments/*/checkpoints/
 experiments/*/results/
 
 .firecrawl
+.pytest_cache
