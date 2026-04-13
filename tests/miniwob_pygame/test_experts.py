@@ -6,6 +6,9 @@ from experiments.miniwob_pygame.experts.click_sequence import (
     run_expert_episode as run_click_sequence_expert_episode,
 )
 from experiments.miniwob_pygame.experts.click_target import run_expert_episode
+from experiments.miniwob_pygame.experts.drag_and_label import (
+    run_expert_episode as run_drag_and_label_expert_episode,
+)
 from experiments.miniwob_pygame.experts.drag_sort import (
     run_expert_episode as run_drag_sort_expert_episode,
 )
@@ -24,15 +27,20 @@ from experiments.miniwob_pygame.experts.highlight_text import (
 from experiments.miniwob_pygame.experts.type_field import (
     run_expert_episode as run_type_field_expert_episode,
 )
+from experiments.miniwob_pygame.experts.scroll_and_click import (
+    run_expert_episode as run_scroll_and_click_expert_episode,
+)
 from experiments.miniwob_pygame.experts.use_slider import (
     run_expert_episode as run_slider_expert_episode,
 )
 from experiments.miniwob_pygame.tasks.click_sequence import ClickSequenceEnv
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
+from experiments.miniwob_pygame.tasks.drag_and_label import DragAndLabelEnv
 from experiments.miniwob_pygame.tasks.drag_sort import DragSortEnv
 from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
 from experiments.miniwob_pygame.tasks.form_fill import FormFillEnv
 from experiments.miniwob_pygame.tasks.draw_path import DrawPathEnv
+from experiments.miniwob_pygame.tasks.scroll_and_click import ScrollAndClickEnv
 from experiments.miniwob_pygame.tasks.highlight_text import HighlightTextEnv
 from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
 from experiments.miniwob_pygame.tasks.use_slider import UseSliderEnv
@@ -162,3 +170,31 @@ class TestFormFillExpert:
                 successes += 1
         env.close()
         assert successes >= 17, f"Expert only succeeded {successes}/{n_episodes} times"
+
+
+class TestScrollAndClickExpert:
+    def test_expert_completes_task(self):
+        env = ScrollAndClickEnv(num_items=15)
+        successes = 0
+        n_episodes = 20
+        for i in range(n_episodes):
+            rng = np.random.default_rng(seed=i)
+            _, _, info = run_scroll_and_click_expert_episode(env, rng, seed=i)
+            if info.get("success"):
+                successes += 1
+        env.close()
+        assert successes >= 14, f"Expert only succeeded {successes}/{n_episodes} times"
+
+
+class TestDragAndLabelExpert:
+    def test_expert_completes_task(self):
+        env = DragAndLabelEnv(num_shapes=1)
+        successes = 0
+        n_episodes = 20
+        for i in range(n_episodes):
+            rng = np.random.default_rng(seed=i)
+            _, _, info = run_drag_and_label_expert_episode(env, rng, seed=i)
+            if info.get("success"):
+                successes += 1
+        env.close()
+        assert successes >= 18, f"Expert only succeeded {successes}/{n_episodes} times"

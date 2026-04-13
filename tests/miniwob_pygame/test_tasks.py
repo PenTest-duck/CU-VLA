@@ -1,8 +1,12 @@
 """Tests for MiniWoB-Pygame task environments."""
 
-from experiments.miniwob_pygame.config import ENV, NUM_KEYS, char_to_key_index
+from experiments.miniwob_pygame.config import (
+    ENV, KEY_C, KEY_CTRL, KEY_V, NUM_KEYS, char_to_key_index,
+)
 from experiments.miniwob_pygame.tasks.click_sequence import ClickSequenceEnv
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
+from experiments.miniwob_pygame.tasks.copy_paste import CopyPasteEnv
+from experiments.miniwob_pygame.tasks.drag_and_label import DragAndLabelEnv
 from experiments.miniwob_pygame.tasks.drag_sort import DragSortEnv
 from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
 from experiments.miniwob_pygame.tasks.draw_path import DrawPathEnv
@@ -496,4 +500,209 @@ class TestFormFill:
         _, done, info = env.step(_noop(mouse_left=0))
         assert done
         assert info.get("failure") == "wrong_values"
+        env.close()
+
+
+class TestScrollAndClick:
+    def test_click_target_item_succeeds(self):
+        env = ScrollAndClickEnv(num_items=15)
+        env.reset(seed=42)
+        sl = env._scroll_list
+        assert sl is not None
+        target = env._target_item
+        target_idx = env._target_index
+
+        # Scroll so that target is visible: set scroll_offset directly
+        target_y_in_content = target_idx * sl.item_height
+        sl.scroll_offset = max(0.0, min(sl.max_scroll,
+            target_y_in_content - sl.height / 2))
+
+        # Find target item screen position
+        item_screen_y = sl.y + target_idx * sl.item_height - sl.scroll_offset
+        item_cx = sl.x + (sl.width - sl.scrollbar_width) / 2
+        item_cy = item_screen_y + sl.item_height / 2
+
+        # Teleport cursor to item and click
+        env._cursor_x = float(item_cx)
+        env._cursor_y = float(item_cy)
+        env.step(_noop(mouse_left=1))
+        _, done, info = env.step(_noop(mouse_left=0))
+        assert done
+        assert info.get("success") is True
+        env.close()
+
+    def test_click_wrong_item_fails(self):
+        env = ScrollAndClickEnv(num_items=15)
+        env.reset(seed=42)
+        sl = env._scroll_list
+        assert sl is not None
+        target_idx = env._target_index
+
+        # Pick a wrong item (first item, which is not the target since target
+        # is from bottom half)
+        wrong_idx = 0
+        assert wrong_idx != target_idx
+
+        # The first item is visible at scroll_offset=0
+        item_screen_y = sl.y + wrong_idx * sl.item_height
+        item_cx = sl.x + (sl.width - sl.scrollbar_width) / 2
+        item_cy = item_screen_y + sl.item_height / 2
+
+        # Teleport cursor and click
+        env._cursor_x = float(item_cx)
+        env._cursor_y = float(item_cy)
+        env.step(_noop(mouse_left=1))
+        _, done, info = env.step(_noop(mouse_left=0))
+        assert done
+        assert info.get("failure") == "wrong_item"
+        env.close()
+
+
+class TestDragAndLabel:
+    def test_drag_drop_and_type_succeeds(self):
+        env = DragAndLabelEnv(num_shapes=1)
+        env.reset(seed=42)
+        shape = env.shapes[0]
+        zone = env.zones[0]
+        assert shape["color"] == zone["color"]
+
+        # Teleport cursor to shape center and grab
+        env._cursor_x = shape["x"] + shape["width"] / 2
+        env._cursor_y = shape["y"] + shape["height"] / 2
+        _, done, _ = env.step(_noop(mouse_left=1))
+        assert not done
+        assert shape["grabbed"] is True
+
+        # Teleport cursor to zone center (while held)
+        zone_cx = zone["x"] + zone["width"] / 2
+        zone_cy = zone["y"] + zone["height"] / 2
+        env._cursor_x = zone_cx
+        env._cursor_y = zone_cy
+        _, done, _ = env.step(_noop(mouse_left=1))
+        assert not done
+
+        # Release mouse -> drop on correct zone
+        _, done, _ = env.step(_noop(mouse_left=0))
+        assert not done  # Not done yet — still need to type
+        assert shape["dropped"] is True
+
+        # Type label character by character
+        label = shape["label"]
+        for ch in label:
+            key_idx = char_to_key_index(ch)
+            keys = [0] * NUM_KEYS
+            keys[key_idx] = 1
+            _, done, info = env.step(_noop(keys_held=keys))
+            if done:
+                break
+            # Release key
+            _, done, info = env.step(_noop())
+            if done:
+                break
+
+        assert done
+        assert info.get("success") is True
+        assert shape["complete"] is True
+        env.close()
+
+    def test_wrong_key_fails(self):
+        env = DragAndLabelEnv(num_shapes=1)
+        env.reset(seed=42)
+        shape = env.shapes[0]
+        zone = env.zones[0]
+
+        # Teleport and drag to zone
+        env._cursor_x = shape["x"] + shape["width"] / 2
+        env._cursor_y = shape["y"] + shape["height"] / 2
+        env.step(_noop(mouse_left=1))
+        env._cursor_x = zone["x"] + zone["width"] / 2
+        env._cursor_y = zone["y"] + zone["height"] / 2
+        env.step(_noop(mouse_left=1))
+        env.step(_noop(mouse_left=0))
+        assert shape["dropped"] is True
+
+        # Type a wrong character (one that doesn't match the first char of label)
+        label = shape["label"]
+        wrong_char = "Z" if label[0] != "Z" else "A"
+        key_idx = char_to_key_index(wrong_char)
+        keys = [0] * NUM_KEYS
+        keys[key_idx] = 1
+        _, done, info = env.step(_noop(keys_held=keys))
+        # The failure is set in _handle_key_down, check_success picks it up
+        assert done
+        assert info.get("failure") == "wrong_key"
+        env.close()
+
+
+class TestCopyPaste:
+    def test_copy_paste_succeeds(self):
+        """Manually highlight source, Ctrl+C, click field, Ctrl+V -> success."""
+        env = CopyPasteEnv()
+        env.reset(seed=42)
+        tb = env._text_block
+        ti = env._text_input
+        source = env._source_text
+        assert tb is not None
+        assert ti is not None
+
+        # Set highlight to the full source text
+        bounds = tb.word_bounds(source)
+        assert bounds is not None
+        start_idx, end_idx = bounds
+        tb.set_highlight(start_idx, end_idx)
+
+        # Verify highlighted text matches source
+        assert tb.highlighted_text() == source
+
+        # Ctrl+C: press both keys simultaneously
+        keys_ctrl_c = [0] * NUM_KEYS
+        keys_ctrl_c[KEY_CTRL] = 1
+        keys_ctrl_c[KEY_C] = 1
+        _, done, _ = env.step(_noop(keys_held=keys_ctrl_c))
+        assert not done
+        assert env._clipboard == source
+
+        # Release keys
+        _, done, _ = env.step(_noop())
+        assert not done
+
+        # Click the TextInput to focus it
+        env._cursor_x = float(ti.x + ti.width / 2)
+        env._cursor_y = float(ti.y + ti.height / 2)
+        env.step(_noop(mouse_left=1))
+        _, done, _ = env.step(_noop(mouse_left=0))
+        assert not done
+        assert ti.focused
+
+        # Ctrl+V: press both keys simultaneously
+        keys_ctrl_v = [0] * NUM_KEYS
+        keys_ctrl_v[KEY_CTRL] = 1
+        keys_ctrl_v[KEY_V] = 1
+        _, done, info = env.step(_noop(keys_held=keys_ctrl_v))
+        assert done
+        assert info.get("success") is True
+        assert ti.text == source
+        env.close()
+
+    def test_paste_without_copy_empty(self):
+        """Pasting without copying first leaves the field empty."""
+        env = CopyPasteEnv()
+        env.reset(seed=42)
+        ti = env._text_input
+        assert ti is not None
+
+        # Click the TextInput to focus it
+        env._cursor_x = float(ti.x + ti.width / 2)
+        env._cursor_y = float(ti.y + ti.height / 2)
+        env.step(_noop(mouse_left=1))
+        env.step(_noop(mouse_left=0))
+        assert ti.focused
+
+        # Ctrl+V without prior Ctrl+C
+        keys_ctrl_v = [0] * NUM_KEYS
+        keys_ctrl_v[KEY_CTRL] = 1
+        keys_ctrl_v[KEY_V] = 1
+        _, done, _ = env.step(_noop(keys_held=keys_ctrl_v))
+        assert not done
+        assert ti.text == ""  # Nothing was copied, so paste is empty
         env.close()
