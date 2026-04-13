@@ -6,6 +6,9 @@ from experiments.miniwob_pygame.experts.click_sequence import (
     run_expert_episode as run_click_sequence_expert_episode,
 )
 from experiments.miniwob_pygame.experts.click_target import run_expert_episode
+from experiments.miniwob_pygame.experts.drag_sort import (
+    run_expert_episode as run_drag_sort_expert_episode,
+)
 from experiments.miniwob_pygame.experts.drag_to_zone import (
     run_expert_episode as run_drag_to_zone_expert_episode,
 )
@@ -23,6 +26,7 @@ from experiments.miniwob_pygame.experts.use_slider import (
 )
 from experiments.miniwob_pygame.tasks.click_sequence import ClickSequenceEnv
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
+from experiments.miniwob_pygame.tasks.drag_sort import DragSortEnv
 from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
 from experiments.miniwob_pygame.tasks.draw_path import DrawPathEnv
 from experiments.miniwob_pygame.tasks.highlight_text import HighlightTextEnv
@@ -126,3 +130,17 @@ class TestDrawPathExpert:
                 successes += 1
         env.close()
         assert successes >= 14, f"Expert only succeeded {successes}/{n_episodes} times"
+
+
+class TestDragSortExpert:
+    def test_expert_completes_task(self):
+        env = DragSortEnv(num_cards=4)
+        successes = 0
+        n_episodes = 20
+        for i in range(n_episodes):
+            rng = np.random.default_rng(seed=i)
+            _, _, info = run_drag_sort_expert_episode(env, rng, seed=i)
+            if info.get("success"):
+                successes += 1
+        env.close()
+        assert successes >= 15, f"Expert only succeeded {successes}/{n_episodes} times"
