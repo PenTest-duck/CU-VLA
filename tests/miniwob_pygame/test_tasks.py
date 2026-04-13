@@ -6,8 +6,10 @@ from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
 from experiments.miniwob_pygame.tasks.drag_sort import DragSortEnv
 from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
 from experiments.miniwob_pygame.tasks.draw_path import DrawPathEnv
+from experiments.miniwob_pygame.tasks.form_fill import FormFillEnv
 from experiments.miniwob_pygame.tasks.highlight_text import HighlightTextEnv
 from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
+from experiments.miniwob_pygame.tasks.scroll_and_click import ScrollAndClickEnv
 from experiments.miniwob_pygame.tasks.use_slider import UseSliderEnv
 
 
@@ -430,4 +432,68 @@ class TestDragSort:
 
         assert card_a["slot_index"] == slot_b, "card_a should now be in slot_b"
         assert card_b["slot_index"] == slot_a, "card_b should now be in slot_a"
+        env.close()
+
+
+class TestFormFill:
+    def test_correct_fill_and_submit_succeeds(self):
+        env = FormFillEnv(num_fields=2)
+        env.reset(seed=42)
+        fields = env._fields
+        targets = env._target_values
+        sx, sy, sw, sh = env._submit_rect
+
+        # Focus and type each field
+        for field, target in zip(fields, targets):
+            env._cursor_x = float(field.x + field.width / 2)
+            env._cursor_y = float(field.y + field.height / 2)
+            env.step(_noop(mouse_left=1))
+            env.step(_noop(mouse_left=0))
+            assert field.focused
+
+            for ch in target:
+                key_idx = char_to_key_index(ch)
+                keys = [0] * NUM_KEYS
+                keys[key_idx] = 1
+                env.step(_noop(keys_held=keys))
+                env.step(_noop())
+
+        # Click submit button
+        env._cursor_x = float(sx + sw / 2)
+        env._cursor_y = float(sy + sh / 2)
+        env.step(_noop(mouse_left=1))
+        _, done, info = env.step(_noop(mouse_left=0))
+        assert done
+        assert info.get("success") is True
+        env.close()
+
+    def test_submit_wrong_values_fails(self):
+        env = FormFillEnv(num_fields=2)
+        env.reset(seed=42)
+        fields = env._fields
+        targets = env._target_values
+        sx, sy, sw, sh = env._submit_rect
+
+        # Focus the first field and type a wrong value
+        field = fields[0]
+        env._cursor_x = float(field.x + field.width / 2)
+        env._cursor_y = float(field.y + field.height / 2)
+        env.step(_noop(mouse_left=1))
+        env.step(_noop(mouse_left=0))
+
+        wrong_word = "ZZZ"
+        for ch in wrong_word:
+            key_idx = char_to_key_index(ch)
+            keys = [0] * NUM_KEYS
+            keys[key_idx] = 1
+            env.step(_noop(keys_held=keys))
+            env.step(_noop())
+
+        # Click submit without filling the second field correctly
+        env._cursor_x = float(sx + sw / 2)
+        env._cursor_y = float(sy + sh / 2)
+        env.step(_noop(mouse_left=1))
+        _, done, info = env.step(_noop(mouse_left=0))
+        assert done
+        assert info.get("failure") == "wrong_values"
         env.close()

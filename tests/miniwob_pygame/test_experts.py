@@ -15,6 +15,9 @@ from experiments.miniwob_pygame.experts.drag_to_zone import (
 from experiments.miniwob_pygame.experts.draw_path import (
     run_expert_episode as run_draw_path_expert_episode,
 )
+from experiments.miniwob_pygame.experts.form_fill import (
+    run_expert_episode as run_form_fill_expert_episode,
+)
 from experiments.miniwob_pygame.experts.highlight_text import (
     run_expert_episode as run_highlight_text_expert_episode,
 )
@@ -28,6 +31,7 @@ from experiments.miniwob_pygame.tasks.click_sequence import ClickSequenceEnv
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
 from experiments.miniwob_pygame.tasks.drag_sort import DragSortEnv
 from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
+from experiments.miniwob_pygame.tasks.form_fill import FormFillEnv
 from experiments.miniwob_pygame.tasks.draw_path import DrawPathEnv
 from experiments.miniwob_pygame.tasks.highlight_text import HighlightTextEnv
 from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
@@ -144,3 +148,17 @@ class TestDragSortExpert:
                 successes += 1
         env.close()
         assert successes >= 15, f"Expert only succeeded {successes}/{n_episodes} times"
+
+
+class TestFormFillExpert:
+    def test_expert_completes_task(self):
+        env = FormFillEnv(num_fields=2)
+        successes = 0
+        n_episodes = 20
+        for i in range(n_episodes):
+            rng = np.random.default_rng(seed=i)
+            _, _, info = run_form_fill_expert_episode(env, rng, seed=i)
+            if info.get("success"):
+                successes += 1
+        env.close()
+        assert successes >= 17, f"Expert only succeeded {successes}/{n_episodes} times"
