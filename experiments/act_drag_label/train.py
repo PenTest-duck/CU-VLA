@@ -484,6 +484,18 @@ def train(
             best_val_loss = val_loss
             epochs_without_improvement = 0
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best.pt"))
+            # Upload best checkpoint immediately so it survives job timeouts
+            if hf_upload_repo:
+                from huggingface_hub import HfApi
+                api = HfApi()
+                api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
+                api.upload_file(
+                    path_or_fileobj=os.path.join(checkpoint_dir, "best.pt"),
+                    path_in_repo=f"{backbone}_chunk{chunk_size}/best.pt",
+                    repo_id=hf_upload_repo,
+                    repo_type="model",
+                )
+                print(f"    Uploaded best.pt (val={val_loss:.4f})", flush=True)
         else:
             epochs_without_improvement += 1
 
