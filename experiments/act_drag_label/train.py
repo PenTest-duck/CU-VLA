@@ -489,19 +489,27 @@ def train(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_without_improvement = 0
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best.pt"))
-            # Upload best checkpoint immediately so it survives job timeouts
+            best_pt_path = os.path.join(checkpoint_dir, "best.pt")
+            torch.save(model.state_dict(), best_pt_path)
+            # Upload best checkpoint async so training continues immediately
             if hf_upload_repo:
+                import threading
                 from huggingface_hub import HfApi
-                api = HfApi()
-                api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
-                api.upload_file(
-                    path_or_fileobj=os.path.join(checkpoint_dir, "best.pt"),
-                    path_in_repo=f"{backbone}_chunk{chunk_size}/best.pt",
-                    repo_id=hf_upload_repo,
-                    repo_type="model",
-                )
-                print(f"    Uploaded best.pt (val={val_loss:.4f})", flush=True)
+                _val = val_loss  # capture for closure
+                def _upload():
+                    try:
+                        api = HfApi()
+                        api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
+                        api.upload_file(
+                            path_or_fileobj=best_pt_path,
+                            path_in_repo=f"{backbone}_chunk{chunk_size}/best.pt",
+                            repo_id=hf_upload_repo,
+                            repo_type="model",
+                        )
+                        print(f"    Uploaded best.pt (val={_val:.4f})", flush=True)
+                    except Exception as e:
+                        print(f"    Upload failed: {e}", flush=True)
+                threading.Thread(target=_upload, daemon=True).start()
         else:
             epochs_without_improvement += 1
 
