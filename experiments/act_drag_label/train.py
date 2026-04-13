@@ -174,10 +174,20 @@ def train(
     data_dir: str | None = None,
     checkpoint_dir: str | None = None,
     device: str = "cpu",
+    hf_data_repo: str | None = None,
+    hf_upload_repo: str | None = None,
 ) -> None:
     base = os.path.dirname(__file__)
     if data_dir is None:
         data_dir = os.path.join(base, "data")
+
+    # Auto-download data from HF Hub if repo specified and local dir is empty
+    if hf_data_repo and not glob.glob(os.path.join(data_dir, "episode_*.hdf5")):
+        from huggingface_hub import snapshot_download
+        print(f"Downloading data from {hf_data_repo} ...")
+        os.makedirs(data_dir, exist_ok=True)
+        snapshot_download(repo_id=hf_data_repo, repo_type="dataset", local_dir=data_dir)
+        print("Download complete.")
     if checkpoint_dir is None:
         checkpoint_dir = os.path.join(
             base, "checkpoints", f"{backbone}_chunk{chunk_size}"
@@ -468,6 +478,20 @@ def train(
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints saved to: {checkpoint_dir}")
 
+    # Upload checkpoints to HF Hub if repo specified
+    if hf_upload_repo:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
+        print(f"Uploading checkpoints to {hf_upload_repo} ...")
+        api.upload_folder(
+            repo_id=hf_upload_repo,
+            repo_type="model",
+            folder_path=checkpoint_dir,
+            path_in_repo=f"{backbone}_chunk{chunk_size}",
+        )
+        print("Upload complete.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train ACT via behavior cloning")
@@ -488,6 +512,10 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--hf-data-repo", type=str, default=None,
+                        help="HF dataset repo to auto-download data from (e.g. PenTest-duck/cu-vla-data)")
+    parser.add_argument("--hf-upload-repo", type=str, default=None,
+                        help="HF model repo to upload checkpoints to after training")
     args = parser.parse_args()
 
     train(
@@ -500,4 +528,6 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
+        hf_data_repo=args.hf_data_repo,
+        hf_upload_repo=args.hf_upload_repo,
     )
