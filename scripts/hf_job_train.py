@@ -38,9 +38,8 @@ def main() -> None:
 
     os.chdir(WORKDIR)
 
-    # Install the project (editable so imports work)
-    print("Installing project ...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-e", "."], check=True)
+    # Add repo root to Python path so our modules are importable
+    sys.path.insert(0, WORKDIR)
 
     # Forward all CLI args to train.py, adding --device cuda
     train_args = sys.argv[1:]
