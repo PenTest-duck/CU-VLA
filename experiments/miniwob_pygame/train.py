@@ -532,11 +532,15 @@ def train(
             torch.save(model.state_dict(), best_pt_path)
             # Upload best checkpoint async so training continues immediately
             if hf_upload_repo:
+                import logging
                 import threading
                 from huggingface_hub import HfApi
                 _val = val_loss
                 def _upload():
                     try:
+                        logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+                        from huggingface_hub.utils import disable_progress_bars
+                        disable_progress_bars()
                         api = HfApi()
                         api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
                         api.upload_file(
