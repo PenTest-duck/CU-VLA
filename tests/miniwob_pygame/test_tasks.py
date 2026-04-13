@@ -3,7 +3,10 @@
 from experiments.miniwob_pygame.config import ENV, NUM_KEYS, char_to_key_index
 from experiments.miniwob_pygame.tasks.click_sequence import ClickSequenceEnv
 from experiments.miniwob_pygame.tasks.click_target import ClickTargetEnv
+from experiments.miniwob_pygame.tasks.drag_sort import DragSortEnv
 from experiments.miniwob_pygame.tasks.drag_to_zone import DragToZoneEnv
+from experiments.miniwob_pygame.tasks.draw_path import DrawPathEnv
+from experiments.miniwob_pygame.tasks.highlight_text import HighlightTextEnv
 from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
 from experiments.miniwob_pygame.tasks.use_slider import UseSliderEnv
 
@@ -281,4 +284,101 @@ class TestTypeField:
             _, done, info = env.step(_noop())
         assert done
         assert info.get("failure") == "wrong_key"
+        env.close()
+
+
+class TestHighlightText:
+    def test_correct_highlight_succeeds(self):
+        env = HighlightTextEnv()
+        env.reset(seed=42)
+        tb = env._text_block
+        target = env._target_word
+        assert tb is not None
+
+        # Get word bounds and set highlight to exactly the target word
+        bounds = tb.word_bounds(target)
+        assert bounds is not None
+        start_idx, end_idx = bounds
+        tb.set_highlight(start_idx, end_idx)
+
+        # Mark selection as made, then step to trigger check
+        env._selection_made = True
+        _, done, info = env.step(_noop())
+        assert done
+        assert info.get("success") is True
+        env.close()
+
+    def test_wrong_highlight_fails(self):
+        env = HighlightTextEnv()
+        env.reset(seed=42)
+        tb = env._text_block
+        target = env._target_word
+        assert tb is not None
+
+        # Find a word that is NOT the target
+        words = tb.text.split()
+        wrong_word = None
+        for w in words:
+            if w != target:
+                wrong_word = w
+                break
+        assert wrong_word is not None, "Need at least 2 distinct words"
+
+        # Highlight the wrong word
+        bounds = tb.word_bounds(wrong_word)
+        assert bounds is not None
+        start_idx, end_idx = bounds
+        tb.set_highlight(start_idx, end_idx)
+
+        # Mark selection as made, then step to trigger check
+        env._selection_made = True
+        _, done, info = env.step(_noop())
+        assert done
+        assert info.get("failure") == "wrong_selection"
+        assert info.get("expected") == target
+        env.close()
+
+
+class TestDrawPath:
+    def test_good_path_succeeds(self):
+        env = DrawPathEnv(path_type="line", distance_threshold=20.0)
+        env.reset(seed=42)
+        ref = env.reference_path
+        assert len(ref) >= 20
+
+        # Teleport cursor to first reference point and press mouse
+        env._cursor_x, env._cursor_y = ref[0]
+        env.step(_noop(mouse_left=1))
+
+        # Trace closely along the reference path
+        done = False
+        info = {}
+        for rx, ry in ref[1:]:
+            env._cursor_x = rx
+            env._cursor_y = ry
+            _, done, info = env.step(_noop(mouse_left=1))
+            if done:
+                break
+
+        if not done:
+            # Release mouse -> triggers evaluation
+            _, done, info = env.step(_noop(mouse_left=0))
+
+        assert done
+        assert info.get("success") is True
+        assert info["mean_distance"] <= 20.0
+        env.close()
+
+    def test_no_drawing_timeout(self):
+        env = DrawPathEnv(path_type="line")
+        env.reset(seed=42)
+        max_steps = env._get_max_steps()
+        done = False
+        info = {}
+        for _ in range(max_steps):
+            _, done, info = env.step(_noop())
+            if done:
+                break
+        assert done
+        assert info.get("timeout") is True
         env.close()
