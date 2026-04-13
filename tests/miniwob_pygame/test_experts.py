@@ -58,3 +58,17 @@ class TestDragToZoneExpert:
                 successes += 1
         env.close()
         assert successes >= 18, f"Expert only succeeded {successes}/{n_episodes} times"
+
+
+class TestTypeFieldExpert:
+    def test_expert_completes_task(self):
+        env = TypeFieldEnv()
+        successes = 0
+        n_episodes = 20
+        for i in range(n_episodes):
+            rng = np.random.default_rng(seed=i)
+            _, _, info = run_type_field_expert_episode(env, rng, seed=i)
+            if info.get("success"):
+                successes += 1
+        env.close()
+        assert successes >= 19, f"Expert only succeeded {successes}/{n_episodes} times"
