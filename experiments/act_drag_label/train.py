@@ -259,8 +259,9 @@ def train(
     # Model
     model = ACT(backbone_name=backbone, chunk_size=chunk_size).to(device)
     if use_cuda:
+        torch.set_float32_matmul_precision("high")  # enable TF32 tensor cores
         model = torch.compile(model)
-        print("Model compiled with torch.compile", flush=True)
+        print("Model compiled with torch.compile (TF32 enabled)", flush=True)
     total_params = count_parameters(model, trainable_only=False)
     trainable_params = count_parameters(model, trainable_only=True)
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
