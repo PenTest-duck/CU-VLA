@@ -1,48 +1,61 @@
 import os
 import tempfile
 
-import h5py
 import numpy as np
 import pytest
+from datasets import Dataset, Features, Image, Sequence, Value
+from PIL import Image as PILImage
+
+
+FEATURES = Features({
+    "episode_id": Value("int32"),
+    "timestep": Value("int32"),
+    "image": Image(),
+    "cursor_x": Value("float32"),
+    "cursor_y": Value("float32"),
+    "action_dx": Value("float32"),
+    "action_dy": Value("float32"),
+    "action_mouse_left": Value("int8"),
+    "action_keys_held": Sequence(Value("int8"), length=43),
+    "episode_length": Value("int32"),
+    "task_name": Value("string"),
+    "success": Value("bool"),
+})
+
+
+def _make_synthetic_rows(task: str, num_episodes: int = 4, steps_per_ep: int = 20):
+    """Generate synthetic dataset rows for testing."""
+    rng = np.random.default_rng(42)
+    rows = []
+    for ep in range(num_episodes):
+        for t in range(steps_per_ep):
+            rows.append({
+                "episode_id": ep,
+                "timestep": t,
+                "image": PILImage.fromarray(
+                    rng.integers(0, 255, (224, 224, 3), dtype=np.uint8)
+                ),
+                "cursor_x": float(rng.random()),
+                "cursor_y": float(rng.random()),
+                "action_dx": float(rng.standard_normal()),
+                "action_dy": float(rng.standard_normal()),
+                "action_mouse_left": int(rng.integers(0, 2)),
+                "action_keys_held": [int(x) for x in rng.integers(0, 2, 43)],
+                "episode_length": steps_per_ep,
+                "task_name": task,
+                "success": True,
+            })
+    return rows
 
 
 @pytest.fixture
 def synthetic_data_dir():
     with tempfile.TemporaryDirectory() as tmpdir:
         for task in ["click-target", "type-field"]:
-            task_dir = os.path.join(tmpdir, task, "000")
-            os.makedirs(task_dir)
-            for ep in range(4):
-                path = os.path.join(task_dir, f"episode_{ep:05d}.hdf5")
-                T = 20
-                with h5py.File(path, "w") as f:
-                    f.create_dataset(
-                        "observations",
-                        data=np.random.randint(0, 255, (T, 224, 224, 3), dtype=np.uint8),
-                    )
-                    f.create_dataset(
-                        "cursor_positions",
-                        data=np.random.rand(T, 2).astype(np.float32),
-                    )
-                    f.create_dataset(
-                        "actions_dx",
-                        data=np.random.randn(T).astype(np.float32),
-                    )
-                    f.create_dataset(
-                        "actions_dy",
-                        data=np.random.randn(T).astype(np.float32),
-                    )
-                    f.create_dataset(
-                        "actions_mouse_left",
-                        data=np.random.randint(0, 2, T, dtype=np.int8),
-                    )
-                    f.create_dataset(
-                        "actions_keys_held",
-                        data=np.random.randint(0, 2, (T, 43), dtype=np.int8),
-                    )
-                    f.attrs["task_name"] = task
-                    f.attrs["success"] = True
-                    f.attrs["num_steps"] = T
+            rows = _make_synthetic_rows(task)
+            ds = Dataset.from_list(rows, features=FEATURES)
+            task_dir = os.path.join(tmpdir, task)
+            ds.save_to_disk(task_dir)
         yield tmpdir
 
 

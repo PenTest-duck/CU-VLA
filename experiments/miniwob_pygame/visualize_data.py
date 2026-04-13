@@ -1,7 +1,7 @@
 """Replay recorded expert demonstrations through task environments.
 
-Loads actions from HDF5, replays through the actual Pygame env with
-a visible window. Shows HUD overlay with episode info and current action.
+Loads actions from HF datasets (Arrow), replays through the actual Pygame env
+with a visible window. Shows HUD overlay with episode info and current action.
 
 Usage:
     uv run python experiments/miniwob_pygame/visualize_data.py                          # cycle all tasks
@@ -21,11 +21,9 @@ Controls:
 """
 
 import argparse
-import glob
 import os
 import sys
 
-import h5py
 import numpy as np
 import pygame
 import pygame._freetype as _ft
@@ -35,20 +33,44 @@ if __name__ == "__main__":
 
 from experiments.miniwob_pygame.config import ENV, NUM_KEYS, key_index_to_char
 from experiments.miniwob_pygame.task_registry import get_env_class
+from experiments.miniwob_pygame.train import build_episode_offsets
 
 
-def load_episode(path: str) -> dict:
-    """Load a single episode's actions and metadata from HDF5."""
-    with h5py.File(path, "r") as f:
-        return {
-            "actions_dx": f["actions_dx"][:],
-            "actions_dy": f["actions_dy"][:],
-            "actions_mouse_left": f["actions_mouse_left"][:],
-            "actions_keys_held": f["actions_keys_held"][:],
-            "task_name": f.attrs["task_name"],
-            "success": f.attrs.get("success", False),
-            "num_steps": f.attrs.get("num_steps", len(f["actions_dx"])),
-        }
+def _discover_tasks(data_dir: str) -> list[str]:
+    """Find all task names that have generated datasets in data_dir."""
+    tasks = []
+    if not os.path.isdir(data_dir):
+        return tasks
+    for name in sorted(os.listdir(data_dir)):
+        task_dir = os.path.join(data_dir, name)
+        # Check for Arrow dataset marker file
+        if os.path.isdir(task_dir) and (
+            os.path.exists(os.path.join(task_dir, "dataset_info.json"))
+            or os.path.exists(os.path.join(task_dir, "state.json"))
+        ):
+            tasks.append(name)
+    return tasks
+
+
+def _load_task_dataset(data_dir: str, task_name: str):
+    """Load an HF dataset for a single task."""
+    from datasets import load_from_disk
+    task_dir = os.path.join(data_dir, task_name)
+    return load_from_disk(task_dir)
+
+
+def load_episode(ds, start_row: int, length: int) -> dict:
+    """Load a single episode's actions and metadata from the dataset."""
+    ep_rows = ds.select(range(start_row, start_row + length))
+    return {
+        "actions_dx": np.array(ep_rows["action_dx"], dtype=np.float32),
+        "actions_dy": np.array(ep_rows["action_dy"], dtype=np.float32),
+        "actions_mouse_left": np.array(ep_rows["action_mouse_left"], dtype=np.int8),
+        "actions_keys_held": np.array(ep_rows["action_keys_held"], dtype=np.int8),
+        "task_name": ep_rows[0]["task_name"],
+        "success": ep_rows[0]["success"],
+        "num_steps": length,
+    }
 
 
 def render_hud(
@@ -109,55 +131,38 @@ def render_hud(
         y += text_rect.height + 2
 
 
-def _discover_tasks(data_dir: str) -> list[str]:
-    """Find all task names that have generated episodes in data_dir."""
-    tasks = []
-    if not os.path.isdir(data_dir):
-        return tasks
-    for name in sorted(os.listdir(data_dir)):
-        task_dir = os.path.join(data_dir, name)
-        if os.path.isdir(task_dir) and glob.glob(
-            os.path.join(task_dir, "**", "episode_*.hdf5"), recursive=True
-        ):
-            tasks.append(name)
-    return tasks
-
-
-def _get_episode_files(data_dir: str, task_name: str) -> list[str]:
-    """Get sorted list of HDF5 episode files for a task."""
-    return sorted(
-        glob.glob(
-            os.path.join(data_dir, task_name, "**", "episode_*.hdf5"),
-            recursive=True,
-        )
-    )
-
-
 def _build_playlist(
     data_dir: str,
     task_name: str | None,
     episode: int | None,
     num_episodes: int | None,
-) -> list[tuple[str, str]]:
-    """Build a playlist of (task_name, episode_path) tuples.
+) -> list[tuple[str, int, int, int, object]]:
+    """Build playlist of (task_name, episode_id, start_row, length, ds) tuples.
 
     If task_name is None, cycle round-robin through all available tasks.
     """
     if task_name is not None:
         # Single task mode
-        files = _get_episode_files(data_dir, task_name)
-        if not files:
+        ds = _load_task_dataset(data_dir, task_name)
+        offsets = build_episode_offsets(ds)
+        eids = sorted(offsets.keys())
+
+        if not eids:
             print(f"No episodes found for task '{task_name}' in {data_dir}")
             return []
+
         if episode is not None:
-            target = f"episode_{episode:05d}.hdf5"
-            files = [f for f in files if f.endswith(target)]
-            if not files:
+            if episode not in offsets:
                 print(f"Episode {episode} not found for task '{task_name}'")
                 return []
+            eids = [episode]
         elif num_episodes is not None:
-            files = files[:num_episodes]
-        return [(task_name, f) for f in files]
+            eids = eids[:num_episodes]
+
+        return [
+            (task_name, eid, offsets[eid][0], offsets[eid][1], ds)
+            for eid in eids
+        ]
 
     # Multi-task round-robin mode
     tasks = _discover_tasks(data_dir)
@@ -167,18 +172,26 @@ def _build_playlist(
 
     print(f"Found {len(tasks)} tasks with data: {', '.join(tasks)}")
 
-    # Build per-task file lists
-    per_task = {t: _get_episode_files(data_dir, t) for t in tasks}
+    # Load per-task datasets and offsets
+    per_task: dict[str, tuple[list[int], dict, object]] = {}
+    for t in tasks:
+        ds = _load_task_dataset(data_dir, t)
+        offsets = build_episode_offsets(ds)
+        eids = sorted(offsets.keys())
+        per_task[t] = (eids, offsets, ds)
 
-    # Interleave round-robin: one episode per task, cycling
-    playlist: list[tuple[str, str]] = []
-    max_eps = max(len(v) for v in per_task.values())
+    # Interleave round-robin
+    playlist = []
+    max_eps = max(len(info[0]) for info in per_task.values())
     if num_episodes is not None:
         max_eps = min(max_eps, num_episodes)
     for i in range(max_eps):
         for t in tasks:
-            if i < len(per_task[t]):
-                playlist.append((t, per_task[t][i]))
+            eids, offsets, ds = per_task[t]
+            if i < len(eids):
+                eid = eids[i]
+                start, length = offsets[eid]
+                playlist.append((t, eid, start, length, ds))
 
     return playlist
 
@@ -199,7 +212,7 @@ def replay(
 
     total_eps = len(playlist)
     mode = f"task '{task_name}'" if task_name else "all tasks (round-robin)"
-    print(f"Loaded {total_eps} episodes — {mode}")
+    print(f"Loaded {total_eps} episodes -- {mode}")
     print("Controls: SPACE=pause, RIGHT=next, LEFT=restart, Q/ESC=quit")
 
     _ft.init()
@@ -213,7 +226,7 @@ def replay(
     running = True
 
     while running and ep_idx < total_eps:
-        pl_task, pl_path = playlist[ep_idx]
+        pl_task, pl_eid, pl_start, pl_length, pl_ds = playlist[ep_idx]
 
         # Switch env if task changed
         if pl_task != current_task:
@@ -223,12 +236,9 @@ def replay(
             env = EnvClass(visual=True, fps=int(ENV.control_hz * speed))
             current_task = pl_task
 
-        ep_data = load_episode(pl_path)
+        ep_data = load_episode(pl_ds, pl_start, pl_length)
         total_steps = ep_data["num_steps"]
-
-        # Extract episode number from filename for seed
-        fname = os.path.basename(pl_path)
-        seed = int(fname.replace("episode_", "").replace(".hdf5", ""))
+        seed = pl_eid  # episode seed = episode_id from generate_data.py
 
         env.reset(seed=seed)
         step = 0

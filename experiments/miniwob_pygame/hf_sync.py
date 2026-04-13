@@ -6,7 +6,7 @@ Usage:
     uv run python experiments/miniwob_pygame/hf_sync.py upload-checkpoints --repo PenTest-duck/cu-vla-exp3-checkpoints
     uv run python experiments/miniwob_pygame/hf_sync.py download-checkpoints --repo PenTest-duck/cu-vla-exp3-checkpoints
 
-Data layout: data/{task_name}/{shard}/episode_*.hdf5
+Data layout: data/{task_name}/ (Arrow datasets via save_to_disk)
 
 Requires: hf auth login (or HF_TOKEN env var)
 """
@@ -27,31 +27,32 @@ CHECKPOINTS_DIR = os.path.join(BASE, "checkpoints")
 
 
 def _discover_tasks(local_dir: str) -> list[str]:
-    """List task subdirectories in the data directory."""
+    """List task subdirectories that contain Arrow datasets."""
     if not os.path.isdir(local_dir):
         return []
-    return sorted(
-        d
-        for d in os.listdir(local_dir)
-        if os.path.isdir(os.path.join(local_dir, d)) and not d.startswith(".")
-    )
+    tasks = []
+    for d in sorted(os.listdir(local_dir)):
+        task_dir = os.path.join(local_dir, d)
+        if os.path.isdir(task_dir) and (
+            os.path.exists(os.path.join(task_dir, "dataset_info.json"))
+            or os.path.exists(os.path.join(task_dir, "state.json"))
+        ):
+            tasks.append(d)
+    return tasks
 
 
 def upload_data(
     local_dir: str,
     repo: str,
     task_names: list[str] | None = None,
+    num_shards: int = 10,
 ) -> None:
-    """Upload data for specified tasks (or all) to HF Hub.
-
-    Each task lives in data/{task_name}/{shard}/episode_*.hdf5.
-    """
-    api = HfApi()
-    api.create_repo(repo, repo_type="dataset", exist_ok=True)
+    """Upload task datasets to HF Hub using push_to_hub with config_name per task."""
+    from datasets import load_from_disk
 
     available = _discover_tasks(local_dir)
     if not available:
-        print(f"No task directories found in {local_dir}")
+        print(f"No task datasets found in {local_dir}")
         return
 
     tasks = task_names if task_names else available
@@ -61,14 +62,11 @@ def upload_data(
         tasks = [t for t in tasks if t in available]
 
     for task in tasks:
-        task_path = os.path.join(local_dir, task)
-        print(f"Uploading {task} from {task_path} to {repo}/data/{task} ...")
-        api.upload_folder(
-            repo_id=repo,
-            repo_type="dataset",
-            folder_path=task_path,
-            path_in_repo=f"data/{task}",
-        )
+        task_dir = os.path.join(local_dir, task)
+        print(f"Loading {task} from {task_dir} ...")
+        ds = load_from_disk(task_dir)
+        print(f"  {len(ds)} rows. Pushing to {repo} (config={task}) ...")
+        ds.push_to_hub(repo, config_name=task, num_shards=num_shards)
         print(f"  Done: {task}")
 
     print(f"All uploads complete ({len(tasks)} tasks).")
@@ -79,23 +77,29 @@ def download_data(
     local_dir: str,
     task_names: list[str] | None = None,
 ) -> None:
-    """Download data from HF Hub for specified tasks (or all)."""
+    """Download task datasets from HF Hub."""
+    from datasets import load_dataset
+
     os.makedirs(local_dir, exist_ok=True)
 
     if task_names:
-        # Download only specific task directories
-        allow_patterns = [f"data/{t}/**" for t in task_names]
+        configs = task_names
     else:
-        allow_patterns = ["data/**"]
+        # Download entire repo and let HF handle configs
+        from datasets import get_dataset_config_names
+        configs = get_dataset_config_names(repo)
+        print(f"Found configs: {configs}")
 
-    print(f"Downloading from {repo} to {local_dir} ...")
-    snapshot_download(
-        repo_id=repo,
-        repo_type="dataset",
-        local_dir=local_dir,
-        allow_patterns=allow_patterns,
-    )
-    print("Done.")
+    for config in configs:
+        print(f"Downloading {config} from {repo} ...")
+        ds = load_dataset(repo, name=config, split="train")
+        dest = os.path.join(local_dir, config)
+        os.makedirs(dest, exist_ok=True)
+        ds.save_to_disk(dest)
+        n_eps = len(set(ds["episode_id"]))
+        print(f"  Done: {n_eps} episodes saved to {dest}")
+
+    print("All downloads complete.")
 
 
 def upload_checkpoints(
@@ -153,6 +157,7 @@ if __name__ == "__main__":
         default=None,
         help="Task names to upload (default: all)",
     )
+    p.add_argument("--num-shards", type=int, default=10)
 
     # download-data
     p = sub.add_parser("download-data", help="Download task data from HF Hub")
@@ -180,7 +185,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "upload-data":
-        upload_data(args.local_dir, args.repo, args.tasks)
+        upload_data(args.local_dir, args.repo, args.tasks, args.num_shards)
     elif args.command == "download-data":
         download_data(args.repo, args.local_dir, args.tasks)
     elif args.command == "upload-checkpoints":

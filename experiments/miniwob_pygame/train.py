@@ -2,7 +2,7 @@
 
 Adapted from Experiment 2 for the multi-binary held-state action space.
 Key differences from Exp 2:
-  - Loads HDF5 episodes from data/{task_name}/{shard}/episode_*.hdf5
+  - Loads HF datasets per task from data/{task_name}/, concatenates them
   - Proprio: [cursor_x, cursor_y, mouse_left, keys_held_0..42] = 46 dims
   - CVAE action vector: [dx, dy, mouse_left, keys_held_0..42] = 46 dims
   - Loss: masked BCE for mouse_left, sum-of-BCE for 43 independent keys
@@ -11,12 +11,10 @@ Saves checkpoints + training history.
 """
 
 import argparse
-import glob
 import os
 import sys
 import time
 
-import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,52 +28,77 @@ from experiments.miniwob_pygame.model import ACT, count_parameters
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Episode offset table
 # ---------------------------------------------------------------------------
 
-def _auto_cache_size() -> int:
-    """Pick a reasonable HDF5 chunk cache size based on available RAM."""
-    try:
-        import psutil
-        avail = psutil.virtual_memory().available
-        return min(avail // 4, 4 * 1024**3)  # 25% of free RAM, cap 4 GB
-    except ImportError:
-        return 512 * 1024**2  # 512 MB fallback
+def build_episode_offsets(
+    ds,
+) -> dict[int, tuple[int, int]]:
+    """Scan the episode_id column and return {episode_id: (start_row, length)}.
+
+    Assumes the dataset is sorted by (episode_id, timestep) — which is the
+    natural output order from generate_data.py / Dataset.from_generator().
+    """
+    ep_col = ds["episode_id"]
+    offsets: dict[int, tuple[int, int]] = {}
+    cur_ep = ep_col[0]
+    cur_start = 0
+    for i in range(1, len(ep_col)):
+        if ep_col[i] != cur_ep:
+            offsets[cur_ep] = (cur_start, i - cur_start)
+            cur_ep = ep_col[i]
+            cur_start = i
+    offsets[cur_ep] = (cur_start, len(ep_col) - cur_start)
+    return offsets
 
 
-def discover_episodes(
+def load_task_datasets(
     data_dir: str,
     tasks: list[str] | None = None,
-) -> list[str]:
-    """Find all episode HDF5 files under data_dir/{task_name}/**/*.hdf5.
+):
+    """Load and concatenate HF datasets from data/{task_name}/ directories.
 
     Args:
-        data_dir: Root data directory.
-        tasks: Optional list of task names to include. If None, all tasks found.
+        data_dir: Root data directory containing task subdirectories.
+        tasks: Optional list of task names. If None, auto-discover all.
 
     Returns:
-        Sorted list of absolute paths to episode files.
+        Concatenated HF dataset.
     """
+    from datasets import concatenate_datasets, load_from_disk
+
     if tasks is not None:
-        # Only look in specified task directories
-        task_dirs = [os.path.join(data_dir, t) for t in tasks]
+        task_names = tasks
     else:
-        # Auto-discover: every subdirectory of data_dir that contains episodes
-        task_dirs = []
-        for entry in sorted(os.listdir(data_dir)):
-            candidate = os.path.join(data_dir, entry)
-            if os.path.isdir(candidate):
-                task_dirs.append(candidate)
+        # Auto-discover task directories
+        task_names = sorted(
+            d for d in os.listdir(data_dir)
+            if os.path.isdir(os.path.join(data_dir, d)) and not d.startswith(".")
+        )
 
-    paths: list[str] = []
-    for td in task_dirs:
-        if not os.path.isdir(td):
+    if not task_names:
+        raise ValueError(f"No task directories found in {data_dir}")
+
+    datasets = []
+    for task_name in task_names:
+        task_dir = os.path.join(data_dir, task_name)
+        if not os.path.isdir(task_dir):
+            print(f"Warning: task directory not found, skipping: {task_dir}")
             continue
-        found = glob.glob(os.path.join(td, "**", "episode_*.hdf5"), recursive=True)
-        paths.extend(found)
+        print(f"  Loading {task_name} from {task_dir} ...")
+        ds = load_from_disk(task_dir)
+        print(f"    {len(ds)} rows")
+        datasets.append(ds)
 
-    paths.sort()
-    return paths
+    if not datasets:
+        raise ValueError(f"No datasets loaded from {data_dir} (tasks={tasks})")
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    combined = concatenate_datasets(datasets)
+    print(f"  Combined: {len(combined)} rows from {len(datasets)} tasks")
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -83,30 +106,43 @@ def discover_episodes(
 # ---------------------------------------------------------------------------
 
 class ChunkDataset(Dataset):
-    """HDF5-backed dataset that samples (obs, proprio, action_chunk, ...) tuples.
+    """Arrow-backed dataset that samples (obs, proprio, action_chunk, ...) tuples.
 
     Every timestep t in every episode is a valid start index.
     Action chunks are zero-padded when near the episode end.
+
+    Action columns are pre-extracted to numpy arrays to avoid
+    expensive per-sample Arrow reads. Only the image column is
+    read from Arrow at __getitem__ time (single decode per sample).
     """
 
     def __init__(
         self,
-        episode_paths: list[str],
+        ds,
+        episode_offsets: dict[int, tuple[int, int]],
+        episode_ids: set[int],
         chunk_size: int,
+        action_arrays: dict[str, np.ndarray],
     ) -> None:
-        self.episode_paths = episode_paths
+        self.ds = ds
         self.chunk_size = chunk_size
+        self.episode_offsets = {
+            eid: episode_offsets[eid] for eid in episode_ids
+            if eid in episode_offsets
+        }
+        self.action_dx = action_arrays["action_dx"]
+        self.action_dy = action_arrays["action_dy"]
+        self.action_mouse_left = action_arrays["action_mouse_left"]
+        self.action_keys_held = action_arrays["action_keys_held"]
+        self.cursor_x = action_arrays["cursor_x"]
+        self.cursor_y = action_arrays["cursor_y"]
 
-        # Build flat index: (episode_idx, timestep)
+        # Build flat index: every timestep in the selected episodes
         self.index: list[tuple[int, int]] = []
-        self.episode_lengths: list[int] = []
-
-        for ep_idx, path in enumerate(episode_paths):
-            with h5py.File(path, "r") as f:
-                T = f["observations"].shape[0]
-            self.episode_lengths.append(T)
-            for t in range(T):
-                self.index.append((ep_idx, t))
+        for eid in sorted(self.episode_offsets):
+            _, length = self.episode_offsets[eid]
+            for t in range(length):
+                self.index.append((eid, t))
 
     def __len__(self) -> int:
         return len(self.index)
@@ -123,42 +159,44 @@ class ChunkDataset(Dataset):
         torch.Tensor,  # keys_chunk (chunk, 43)
         torch.Tensor,  # pad_mask (chunk,) — 1 where padded, 0 where real
     ]:
-        ep_idx, t = self.index[idx]
+        eid, t = self.index[idx]
+        start_row, ep_len = self.episode_offsets[eid]
         C = self.chunk_size
-        ep_len = self.episode_lengths[ep_idx]
+        row_idx = start_row + t
 
-        with h5py.File(self.episode_paths[ep_idx], "r") as f:
-            # --- Observation at time t ---
-            obs_np = f["observations"][t]  # (224, 224, 3) uint8
-            obs = torch.from_numpy(obs_np).permute(2, 0, 1).float() / 255.0
+        # --- Observation at time t (single image decode from Arrow) ---
+        row = self.ds[row_idx]
+        obs = torch.from_numpy(np.array(row["image"])).permute(2, 0, 1).float() / 255.0
 
-            # --- Proprioception at time t ---
-            cursor_xy = f["cursor_positions"][t]  # (2,) float32, already normalized
-            mouse_t = float(f["actions_mouse_left"][t])
-            keys_t = f["actions_keys_held"][t].astype(np.float32)  # (43,)
+        # --- Proprioception at time t (from pre-extracted numpy) ---
+        cursor_x = float(self.cursor_x[row_idx])
+        cursor_y = float(self.cursor_y[row_idx])
+        mouse_t = float(self.action_mouse_left[row_idx])
+        keys_t = self.action_keys_held[row_idx].astype(np.float32)  # (43,)
 
-            proprio = np.zeros(2 + 1 + ACTION.num_keys, dtype=np.float32)
-            proprio[0] = cursor_xy[0]
-            proprio[1] = cursor_xy[1]
-            proprio[2] = mouse_t
-            proprio[3:] = keys_t
-            proprio = torch.from_numpy(proprio)
+        proprio = np.zeros(2 + 1 + ACTION.num_keys, dtype=np.float32)
+        proprio[0] = cursor_x
+        proprio[1] = cursor_y
+        proprio[2] = mouse_t
+        proprio[3:] = keys_t
+        proprio = torch.from_numpy(proprio)
 
-            # --- Action chunk [t:t+C], zero-padded if near end ---
-            end_t = min(t + C, ep_len)
-            real_len = end_t - t
+        # --- Action chunk [t:t+C], zero-padded if near end ---
+        end_t = min(t + C, ep_len)
+        real_len = end_t - t
+        sl = slice(row_idx, row_idx + real_len)
 
-            dx_chunk = np.zeros(C, dtype=np.float32)
-            dy_chunk = np.zeros(C, dtype=np.float32)
-            mouse_chunk = np.zeros(C, dtype=np.float32)
-            keys_chunk = np.zeros((C, ACTION.num_keys), dtype=np.float32)
-            pad_mask = np.ones(C, dtype=np.float32)  # 1=padded, 0=real
+        dx_chunk = np.zeros(C, dtype=np.float32)
+        dy_chunk = np.zeros(C, dtype=np.float32)
+        mouse_chunk = np.zeros(C, dtype=np.float32)
+        keys_chunk = np.zeros((C, ACTION.num_keys), dtype=np.float32)
+        pad_mask = np.ones(C, dtype=np.float32)  # 1=padded, 0=real
 
-            dx_chunk[:real_len] = f["actions_dx"][t:end_t]
-            dy_chunk[:real_len] = f["actions_dy"][t:end_t]
-            mouse_chunk[:real_len] = f["actions_mouse_left"][t:end_t].astype(np.float32)
-            keys_chunk[:real_len] = f["actions_keys_held"][t:end_t].astype(np.float32)
-            pad_mask[:real_len] = 0.0
+        dx_chunk[:real_len] = self.action_dx[sl]
+        dy_chunk[:real_len] = self.action_dy[sl]
+        mouse_chunk[:real_len] = self.action_mouse_left[sl].astype(np.float32)
+        keys_chunk[:real_len] = self.action_keys_held[sl].astype(np.float32)
+        pad_mask[:real_len] = 0.0
 
         dx_chunk = torch.from_numpy(dx_chunk)
         dy_chunk = torch.from_numpy(dy_chunk)
@@ -199,16 +237,10 @@ def train(
     if data_dir is None:
         data_dir = os.path.join(base, "data")
 
-    # Discover episodes
-    episode_paths = discover_episodes(data_dir, tasks=tasks)
-    if not episode_paths:
-        raise ValueError(f"No episodes found in {data_dir} (tasks={tasks})")
-
-    print(f"Discovered {len(episode_paths)} episodes in {data_dir}")
-
-    if max_episodes is not None and max_episodes < len(episode_paths):
-        episode_paths = episode_paths[:max_episodes]
-        print(f"Capped to {max_episodes} episodes")
+    # Load and concatenate task datasets
+    print(f"Loading datasets from {data_dir} ...")
+    ds = load_task_datasets(data_dir, tasks=tasks)
+    print(f"Dataset: {ds}", flush=True)
 
     if checkpoint_dir is None:
         checkpoint_dir = os.path.join(
@@ -216,26 +248,50 @@ def train(
         )
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # Build episode offset table
+    t_init = time.perf_counter()
+    episode_offsets = build_episode_offsets(ds)
+    print(f"Episode offsets built in {time.perf_counter() - t_init:.2f}s", flush=True)
+    all_episode_ids = sorted(episode_offsets.keys())
+
+    if max_episodes is not None and max_episodes < len(all_episode_ids):
+        all_episode_ids = all_episode_ids[:max_episodes]
+
+    print(f"Using {len(all_episode_ids)} episodes")
+
+    # Pre-extract action columns to numpy (avoids per-sample Arrow reads)
+    t_extract = time.perf_counter()
+    action_arrays = {
+        "action_dx": np.array(ds["action_dx"], dtype=np.float32),
+        "action_dy": np.array(ds["action_dy"], dtype=np.float32),
+        "action_mouse_left": np.array(ds["action_mouse_left"], dtype=np.int8),
+        "action_keys_held": np.array(ds["action_keys_held"], dtype=np.int8),
+        "cursor_x": np.array(ds["cursor_x"], dtype=np.float32),
+        "cursor_y": np.array(ds["cursor_y"], dtype=np.float32),
+    }
+    extract_mb = sum(a.nbytes for a in action_arrays.values()) / 1024 / 1024
+    print(
+        f"Action columns extracted to numpy in {time.perf_counter() - t_extract:.2f}s "
+        f"({extract_mb:.1f}MB)",
+        flush=True,
+    )
+
     # Train/val split by episode
     rng = np.random.default_rng(42)
-    n_eps = len(episode_paths)
-    indices = rng.permutation(n_eps)
-    val_count = max(1, int(n_eps * TRAIN.val_fraction))
-    val_indices = set(indices[:val_count].tolist())
-    train_indices = set(indices[val_count:].tolist())
+    indices = rng.permutation(len(all_episode_ids))
+    val_count = max(1, int(len(all_episode_ids) * TRAIN.val_fraction))
+    val_ids = set(all_episode_ids[i] for i in indices[:val_count])
+    train_ids = set(all_episode_ids[i] for i in indices[val_count:])
 
-    train_paths = [episode_paths[i] for i in sorted(train_indices)]
-    val_paths = [episode_paths[i] for i in sorted(val_indices)]
-
-    print(f"Train: {len(train_paths)} episodes, Val: {len(val_paths)} episodes")
+    print(f"Train: {len(train_ids)} episodes, Val: {len(val_ids)} episodes")
 
     # Default num_workers
     if num_workers is None:
         num_workers = 4 if device.startswith("cuda") else 0
     print(f"DataLoader workers: {num_workers}")
 
-    train_dataset = ChunkDataset(train_paths, chunk_size)
-    val_dataset = ChunkDataset(val_paths, chunk_size)
+    train_dataset = ChunkDataset(ds, episode_offsets, train_ids, chunk_size, action_arrays)
+    val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size, action_arrays)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     train_loader = DataLoader(
