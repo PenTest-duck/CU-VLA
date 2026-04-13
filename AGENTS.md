@@ -34,6 +34,9 @@ Serves as a high-level table of contents.
 | `docs/plans/2026-04-13-act-drag-and-label-design.md` | Experiment 2 full design doc — ACT architecture, drag-and-label task, vision backbone + chunk size ablations |
 | `docs/plans/2026-04-13-act-drag-and-label-implementation.md` | Experiment 2 implementation plan — 12-task breakdown |
 | `experiments/act_drag_label/` | Experiment 2 code (see below) |
+| `docs/experiments/3-miniwob-pygame.md` | Experiment 3 design doc — MiniWoB-Pygame unified task suite |
+| `docs/plans/2026-04-13-miniwob-pygame-implementation.md` | Experiment 3 implementation plan |
+| `experiments/miniwob_pygame/` | Experiment 3 code (see below) |
 | `scripts/launch_hf_job.py` | Launcher for HF Jobs training (calls `run_uv_job()`) |
 | `scripts/hf_job_train.py` | UV script that runs inside HF Jobs (clones repo, runs train.py) |
 | `scripts/migrate_hdf5_to_parquet.py` | One-shot migration from HDF5 episodes to parquet |
@@ -96,6 +99,75 @@ uv run python experiments/act_drag_label/evaluate.py --visual            # with 
 uv run python scripts/launch_hf_job.py --flavor t4-medium --timeout 4h \
   -- --backbone resnet18 --chunk-size 10 --hf-upload-repo PenTest-duck/cu-vla-checkpoints
 ```
+
+## Experiment 3: MiniWoB-Pygame
+
+Unified multi-task Pygame environment suite with 12 computer use tasks. Tests whether a single ACT model can generalize across click, drag, type, scroll, and copy-paste primitives using a multi-binary held-state action space at 30Hz.
+
+**Key design:** All inputs (mouse, keyboard) represented as binary held state — the physical ground truth of input devices. No high-level abstractions. The env detects transitions (press/release) from state changes. 43 independent key channels support simultaneous key combos (Ctrl+C, Shift+A).
+
+**Run sequence:**
+```bash
+# Generate expert demos for Phase 1 (MVP)
+uv run python experiments/miniwob_pygame/generate_data.py \
+    --tasks click-target drag-to-zone use-slider type-field -n 5000
+
+# Train multi-task ACT on Phase 1
+uv run python experiments/miniwob_pygame/train.py \
+    --backbone resnet18 --chunk-size 10 --device mps \
+    --tasks click-target drag-to-zone use-slider type-field
+
+# Evaluate
+uv run python experiments/miniwob_pygame/evaluate.py \
+    --backbone resnet18 --chunk-size 10 --device mps \
+    --tasks click-target drag-to-zone use-slider type-field
+
+# Visual evaluation
+uv run python experiments/miniwob_pygame/evaluate.py --visual --tasks click-target
+
+# Generate all 12 tasks
+uv run python experiments/miniwob_pygame/generate_data.py --tasks all -n 5000
+```
+
+**Code layout:**
+| File | Purpose |
+|------|---------|
+| `config.py` | All hyperparameters, 43 key constants, action space definition |
+| `base_env.py` | `BaseTaskEnv` — shared Pygame rendering, cursor, held-state edge detection |
+| `widgets.py` | Reusable widgets: TextInput, Slider, ScrollableList, TextBlock |
+| `task_registry.py` | Task name → env class + expert function mapping |
+| `tasks/*.py` | 12 task environments (Phase 1-3) |
+| `experts/common.py` | Fitts's Law trajectory, shared expert utilities |
+| `experts/*.py` | 12 scripted expert policies |
+| `model.py` | `ACT` — CVAE + transformer, multi-binary action heads (~33M params) |
+| `baseline_cnn.py` | `BaselineCNN` — 4-conv single-step baseline (~6.5M params) |
+| `backbones.py` | ResNet18, DINOv2 ViT-S/14, SigLIP2 vision backbones |
+| `generate_data.py` | Multi-task HDF5 expert demonstration generation |
+| `train.py` | Behavior cloning: chunk sampling, multi-head BCE loss, KL annealing |
+| `evaluate.py` | Per-task and aggregate metrics, temporal ensemble inference |
+| `hf_sync.py` | Upload/download data and checkpoints to HuggingFace Hub |
+
+**Action space (multi-binary held state):**
+```python
+action = {
+    "dx": float,           # cursor delta, continuous
+    "dy": float,           # cursor delta, continuous
+    "mouse_left": int,     # 0=released, 1=pressed
+    "keys_held": [43],     # binary per key: A-Z(0-25), space(26), enter(27),
+                           # backspace(28), tab(29), 0-9(30-39), ctrl(40),
+                           # shift(41), alt(42)
+}
+```
+
+**12 Tasks (3 phases):**
+| Phase | Tasks |
+|-------|-------|
+| 1: Core Primitives | click-target, drag-to-zone, use-slider, type-field |
+| 2: Compositions | click-sequence, draw-path, highlight-text, drag-sort |
+| 3: Multi-Primitive | form-fill, drag-and-label, scroll-and-click, copy-paste |
+
+**Design doc:** `docs/experiments/3-miniwob-pygame.md`
+**Implementation plan:** `docs/plans/2026-04-13-miniwob-pygame-implementation.md`
 
 ## Key Technical Decisions (from research)
 
