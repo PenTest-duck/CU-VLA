@@ -42,7 +42,8 @@ def main() -> None:
     sys.path.insert(0, WORKDIR)
 
     # Forward all CLI args to train.py, adding --device cuda
-    train_args = sys.argv[1:]
+    # Filter out non-breaking spaces that can sneak in from copy-paste
+    train_args = [a for a in sys.argv[1:] if a.strip()]
     if "--device" not in train_args:
         train_args.extend(["--device", "cuda"])
 
