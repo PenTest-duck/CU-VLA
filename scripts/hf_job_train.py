@@ -7,7 +7,6 @@
 #     "numpy>=2.0",
 #     "h5py>=3.12",
 #     "huggingface-hub>=0.30",
-#     "pygame>=2.6",
 #     "matplotlib>=3.10",
 # ]
 # ///
