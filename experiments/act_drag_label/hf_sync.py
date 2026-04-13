@@ -11,7 +11,6 @@ Requires: hf auth login (or HF_TOKEN env var)
 
 import argparse
 import os
-import sys
 
 from huggingface_hub import HfApi, snapshot_download
 
@@ -25,30 +24,26 @@ DATA_DIR = os.path.join(BASE, "data")
 CHECKPOINTS_DIR = os.path.join(BASE, "checkpoints")
 
 
-def upload_data(repo: str) -> None:
-    api = HfApi()
-    api.create_repo(repo, repo_type="dataset", exist_ok=True)
-    print(f"Uploading data from {DATA_DIR} to {repo} ...")
-    api.upload_large_folder(
-        repo_id=repo,
-        repo_type="dataset",
-        folder_path=DATA_DIR,
-    )
+def upload_data(repo: str, num_shards: int = 10) -> None:
+    from datasets import load_from_disk
+    print(f"Loading dataset from {DATA_DIR} ...")
+    ds = load_from_disk(DATA_DIR)
+    print(f"Dataset: {ds}")
+    print(f"Pushing to {repo} ({num_shards} shards)...")
+    ds.push_to_hub(repo, num_shards=num_shards)
     print("Done.")
 
 
 def download_data(repo: str, local_dir: str | None = None) -> None:
+    from datasets import load_dataset
     dest = local_dir or DATA_DIR
+    print(f"Downloading dataset from {repo} ...")
+    ds = load_dataset(repo, split="train")
+    print(f"Dataset: {ds}")
     os.makedirs(dest, exist_ok=True)
-    print(f"Downloading data from {repo} to {dest} ...")
-    snapshot_download(
-        repo_id=repo,
-        repo_type="dataset",
-        local_dir=dest,
-    )
-    import glob
-    n_files = len(glob.glob(os.path.join(dest, "**", "episode_*.hdf5"), recursive=True))
-    print(f"Done. {n_files} episodes downloaded.")
+    ds.save_to_disk(dest)
+    n_episodes = len(set(ds["episode_id"]))
+    print(f"Done. {n_episodes} episodes saved to {dest}")
 
 
 def upload_checkpoints(repo: str) -> None:

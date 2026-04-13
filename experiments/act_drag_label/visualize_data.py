@@ -1,8 +1,8 @@
 """Replay recorded expert demonstrations live through the environment.
 
-Loads actions from HDF5, replays them through DragLabelEnv with a visible
-Pygame window. This shows the true environment state including the terminal
-frame (which isn't saved in the data since it has no action pair).
+Loads actions from HF datasets (parquet), replays them through DragLabelEnv
+with a visible Pygame window. This shows the true environment state including
+the terminal frame (which isn't saved in the data since it has no action pair).
 
 Usage:
     uv run python experiments/act_drag_label/visualize_data.py              # replay all episodes
@@ -18,11 +18,9 @@ Controls:
 """
 
 import argparse
-import glob
 import os
 import sys
 
-import h5py
 import numpy as np
 import pygame
 import pygame._freetype as _ft
@@ -32,24 +30,24 @@ if __name__ == "__main__":
 
 from experiments.act_drag_label.config import ENV
 from experiments.act_drag_label.env import DragLabelEnv
+from experiments.act_drag_label.train import build_episode_offsets
 
 
-def load_actions(path: str) -> dict:
-    """Load actions and metadata from an HDF5 episode."""
-    with h5py.File(path, "r") as f:
-        return {
-            "actions_dx": f["actions_dx"][:],
-            "actions_dy": f["actions_dy"][:],
-            "actions_click": f["actions_click"][:],
-            "actions_key": f["actions_key"][:],
-            "attrs": dict(f.attrs),
-        }
-
-
-def extract_seed(path: str) -> int:
-    """Extract episode seed from filename (episode_NNNNN.hdf5 -> NNNNN)."""
-    basename = os.path.basename(path)
-    return int(basename.replace("episode_", "").replace(".hdf5", ""))
+def load_actions(ds, start_row: int, length: int) -> dict:
+    """Load actions and metadata for a single episode from the dataset."""
+    ep_rows = ds.select(range(start_row, start_row + length))
+    return {
+        "actions_dx": np.array(ep_rows["action_dx"], dtype=np.float32),
+        "actions_dy": np.array(ep_rows["action_dy"], dtype=np.float32),
+        "actions_click": np.array(ep_rows["action_click"], dtype=np.int8),
+        "actions_key": np.array(ep_rows["action_key"], dtype=np.int8),
+        "attrs": {
+            "num_shapes": ep_rows[0]["num_shapes"],
+            "success": ep_rows[0]["success"],
+            "num_steps": length,
+            "shapes_completed": ep_rows[0]["shapes_completed"],
+        },
+    }
 
 
 def render_hud(surface: pygame.Surface, font: _ft.Font,
@@ -83,29 +81,38 @@ def render_hud(surface: pygame.Surface, font: _ft.Font,
 
 def replay(
     data_dir: str | None = None,
+    hf_data_repo: str | None = None,
     episode: int | None = None,
     num_episodes: int | None = None,
     speed: float = 1.0,
 ) -> None:
-    if data_dir is None:
-        data_dir = os.path.join(os.path.dirname(__file__), "data")
+    from datasets import load_dataset, load_from_disk
 
-    episode_files = sorted(glob.glob(os.path.join(data_dir, "**", "episode_*.hdf5"), recursive=True))
-    if not episode_files:
-        print(f"No episodes found in {data_dir}")
+    if hf_data_repo:
+        print(f"Loading dataset from {hf_data_repo} ...")
+        ds = load_dataset(hf_data_repo, split="train")
+    else:
+        if data_dir is None:
+            data_dir = os.path.join(os.path.dirname(__file__), "data")
+        print(f"Loading dataset from {data_dir} ...")
+        ds = load_from_disk(data_dir)
+
+    episode_offsets = build_episode_offsets(ds)
+    all_episode_ids = sorted(episode_offsets.keys())
+
+    if not all_episode_ids:
+        print("No episodes found in dataset")
         return
 
     if episode is not None:
-        pattern = f"episode_{episode:05d}.hdf5"
-        matches = [f for f in episode_files if f.endswith(pattern)]
-        if not matches:
+        if episode not in episode_offsets:
             print(f"Episode {episode} not found")
             return
-        episode_files = matches
+        all_episode_ids = [episode]
     elif num_episodes is not None:
-        episode_files = episode_files[:num_episodes]
+        all_episode_ids = all_episode_ids[:num_episodes]
 
-    print(f"Loaded {len(episode_files)} episodes from {data_dir}")
+    print(f"Loaded {len(all_episode_ids)} episodes")
     print("Controls: SPACE=pause, RIGHT=next, LEFT=restart, Q/ESC=quit")
 
     env = DragLabelEnv(visual=True, fps=int(ENV.control_hz * speed))
@@ -115,10 +122,12 @@ def replay(
     ep_idx = 0
     running = True
 
-    while running and ep_idx < len(episode_files):
-        ep_data = load_actions(episode_files[ep_idx])
-        seed = extract_seed(episode_files[ep_idx])
-        total_steps = len(ep_data["actions_dx"])
+    while running and ep_idx < len(all_episode_ids):
+        eid = all_episode_ids[ep_idx]
+        start_row, length = episode_offsets[eid]
+        ep_data = load_actions(ds, start_row, length)
+        seed = eid  # episode seed = episode_id in generate_data.py
+        total_steps = length
 
         # Reset env with same seed used during generation
         env.reset(seed=seed)
@@ -155,26 +164,26 @@ def replay(
                     step += 1
 
                     # Draw HUD on top of env's rendered frame
-                    render_hud(env._surface, font, ep_idx, len(episode_files),
+                    render_hud(env._surface, font, ep_idx, len(all_episode_ids),
                                step, total_steps, ep_data, paused, done)
                     pygame.display.flip()
 
                 elif done or step >= total_steps:
                     # Show final state for a moment, then advance
-                    render_hud(env._surface, font, ep_idx, len(episode_files),
+                    render_hud(env._surface, font, ep_idx, len(all_episode_ids),
                                step, total_steps, ep_data, paused, True)
                     pygame.display.flip()
                     pygame.time.wait(800)
                     break
 
                 elif paused:
-                    render_hud(env._surface, font, ep_idx, len(episode_files),
+                    render_hud(env._surface, font, ep_idx, len(all_episode_ids),
                                step, total_steps, ep_data, paused, done)
                     pygame.display.flip()
                     pygame.time.wait(33)
 
                 continue
-            # Break from event loop (RIGHT key) → next episode
+            # Break from event loop (RIGHT key) -> next episode
             break
 
         ep_idx += 1
@@ -186,6 +195,8 @@ def replay(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Replay expert demonstrations")
     parser.add_argument("-d", "--data-dir", type=str, default=None)
+    parser.add_argument("--hf-data-repo", type=str, default=None,
+                        help="HF dataset repo (e.g. PenTest-duck/cu-vla-data)")
     parser.add_argument("--episode", type=int, default=None, help="Replay specific episode index")
     parser.add_argument("-n", "--num-episodes", type=int, default=None, help="Max episodes to replay")
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.5=slow, 2=fast)")
@@ -193,6 +204,7 @@ if __name__ == "__main__":
 
     replay(
         data_dir=args.data_dir,
+        hf_data_repo=args.hf_data_repo,
         episode=args.episode,
         num_episodes=args.num_episodes,
         speed=args.speed,

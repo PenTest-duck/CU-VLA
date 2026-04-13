@@ -1,6 +1,6 @@
 """Behavior cloning training loop for the ACT policy.
 
-Loads HDF5 expert demonstrations, trains with:
+Loads expert demonstrations from HF datasets (parquet), trains with:
 - Masked L1 loss on dx, dy (continuous pixel deltas)
 - Masked BCE loss on click (binary)
 - Masked CE loss on key (28-class classification)
@@ -10,16 +10,12 @@ Saves checkpoints + training history.
 """
 
 import argparse
-import collections
-import glob
 import os
 import sys
 import time
 
-import h5py
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
@@ -30,68 +26,62 @@ from experiments.act_drag_label.config import ACTION, CHUNK, TRAIN
 from experiments.act_drag_label.model import ACT, count_parameters
 
 
-def _auto_cache_size(num_workers: int = 0) -> int:
-    """Pick LRU cache size based on system RAM. ~5MB per cached episode."""
-    try:
-        total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        total_gb = total_bytes / (1024 ** 3)
-    except (ValueError, OSError):
-        total_gb = 8  # conservative fallback
+# ---------------------------------------------------------------------------
+# Episode offset table — shared by ChunkDataset and external callers
+# ---------------------------------------------------------------------------
 
-    if total_gb > 24:
-        limit = 999_999  # effectively unlimited
-    elif total_gb > 12:
-        limit = 2000
-    else:
-        limit = 100  # 8GB M1 range
+def build_episode_offsets(
+    ds,
+) -> dict[int, tuple[int, int]]:
+    """Scan the episode_id column and return {episode_id: (start_row, length)}.
 
-    # Each DataLoader worker gets its own cache via fork
-    effective_processes = max(1, num_workers + 1)
-    return max(10, limit // effective_processes)
+    Assumes the dataset is sorted by (episode_id, timestep) — which is the
+    natural output order from generate_data.py / Dataset.from_generator().
+    """
+    ep_col = ds["episode_id"]
+    offsets: dict[int, tuple[int, int]] = {}
+    cur_ep = ep_col[0]
+    cur_start = 0
+    for i in range(1, len(ep_col)):
+        if ep_col[i] != cur_ep:
+            offsets[cur_ep] = (cur_start, i - cur_start)
+            cur_ep = ep_col[i]
+            cur_start = i
+    offsets[cur_ep] = (cur_start, len(ep_col) - cur_start)
+    return offsets
 
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 
 class ChunkDataset(Dataset):
-    """Loads HDF5 episodes and samples (obs, proprio, action_chunk, ...) tuples.
+    """Arrow-backed dataset that samples (obs, proprio, action_chunk, ...) tuples.
 
     Every timestep t in every episode is a valid start index.
     Action chunks are zero-padded when near the episode end.
     """
 
-    def __init__(self, episode_files: list[str], chunk_size: int,
-                 cache_max: int | None = None) -> None:
+    def __init__(
+        self,
+        ds,
+        episode_offsets: dict[int, tuple[int, int]],
+        episode_ids: set[int],
+        chunk_size: int,
+    ) -> None:
+        self.ds = ds
         self.chunk_size = chunk_size
-        self._cache_max = cache_max if cache_max is not None else _auto_cache_size()
-        self._cache: collections.OrderedDict[str, dict[str, np.ndarray]] = (
-            collections.OrderedDict()
-        )
-        self.index: list[tuple[str, int]] = []
+        self.episode_offsets = {
+            eid: episode_offsets[eid] for eid in episode_ids
+            if eid in episode_offsets
+        }
 
-        for path in episode_files:
-            with h5py.File(path, "r") as f:
-                n_steps = len(f["actions_dx"])
-            # Every timestep is a valid start
-            for t in range(n_steps):
-                self.index.append((path, t))
-
-    def _load_episode(self, path: str) -> dict[str, np.ndarray]:
-        if path in self._cache:
-            self._cache.move_to_end(path)
-            return self._cache[path]
-
-        with h5py.File(path, "r") as f:
-            data = {
-                "observations": f["observations"][:],
-                "actions_dx": f["actions_dx"][:],
-                "actions_dy": f["actions_dy"][:],
-                "actions_click": f["actions_click"][:],
-                "actions_key": f["actions_key"][:],
-            }
-
-        self._cache[path] = data
-        while len(self._cache) > self._cache_max:
-            self._cache.popitem(last=False)  # evict oldest
-
-        return data
+        # Build flat index: every timestep in the selected episodes
+        self.index: list[tuple[int, int]] = []
+        for eid in sorted(self.episode_offsets):
+            _, length = self.episode_offsets[eid]
+            for t in range(length):
+                self.index.append((eid, t))
 
     def __len__(self) -> int:
         return len(self.index)
@@ -108,18 +98,17 @@ class ChunkDataset(Dataset):
         torch.Tensor,  # key_chunk (chunk,)
         torch.Tensor,  # pad_mask (chunk,) — 1 where padded, 0 where real
     ]:
-        path, t = self.index[idx]
-        ep = self._load_episode(path)
-        T = len(ep["actions_dx"])
+        eid, t = self.index[idx]
+        start_row, ep_len = self.episode_offsets[eid]
         C = self.chunk_size
 
-        # --- Observation at time t ---
-        obs = torch.from_numpy(ep["observations"][t]).permute(2, 0, 1).float() / 255.0
+        # --- Observation at time t (single PNG decode) ---
+        row = self.ds[start_row + t]
+        obs = torch.from_numpy(np.array(row["image"])).permute(2, 0, 1).float() / 255.0
 
         # --- Proprioception at time t ---
-        # Placeholder mouse position (0.5, 0.5), plus click and key from actions
-        click_t = float(ep["actions_click"][t])
-        key_t = int(ep["actions_key"][t])
+        click_t = float(row["action_click"])
+        key_t = int(row["action_key"])
         key_onehot = np.zeros(ACTION.num_key_classes, dtype=np.float32)
         key_onehot[key_t] = 1.0
         proprio = np.zeros(31, dtype=np.float32)
@@ -130,8 +119,11 @@ class ChunkDataset(Dataset):
         proprio = torch.from_numpy(proprio)
 
         # --- Action chunk [t:t+C], zero-padded if near end ---
-        end = min(t + C, T)
-        real_len = end - t
+        end_t = min(t + C, ep_len)
+        real_len = end_t - t
+
+        # Columnar access — no image decode for action columns
+        chunk_rows = self.ds.select(range(start_row + t, start_row + end_t))
 
         dx_chunk = np.zeros(C, dtype=np.float32)
         dy_chunk = np.zeros(C, dtype=np.float32)
@@ -139,10 +131,10 @@ class ChunkDataset(Dataset):
         key_chunk = np.zeros(C, dtype=np.int64)
         pad_mask = np.ones(C, dtype=np.float32)  # 1=padded, 0=real
 
-        dx_chunk[:real_len] = ep["actions_dx"][t:end]
-        dy_chunk[:real_len] = ep["actions_dy"][t:end]
-        click_chunk[:real_len] = ep["actions_click"][t:end].astype(np.float32)
-        key_chunk[:real_len] = ep["actions_key"][t:end].astype(np.int64)
+        dx_chunk[:real_len] = chunk_rows["action_dx"]
+        dy_chunk[:real_len] = chunk_rows["action_dy"]
+        click_chunk[:real_len] = np.array(chunk_rows["action_click"], dtype=np.float32)
+        key_chunk[:real_len] = np.array(chunk_rows["action_key"], dtype=np.int64)
         pad_mask[:real_len] = 0.0
 
         dx_chunk = torch.from_numpy(dx_chunk)
@@ -170,57 +162,63 @@ def train(
     batch_size: int = TRAIN.batch_size,
     max_episodes: int | None = None,
     num_workers: int | None = None,
-    cache_episodes: int | None = None,
     data_dir: str | None = None,
     checkpoint_dir: str | None = None,
     device: str = "cpu",
     hf_data_repo: str | None = None,
     hf_upload_repo: str | None = None,
 ) -> None:
-    base = os.path.dirname(__file__)
-    if data_dir is None:
-        data_dir = os.path.join(base, "data")
+    from datasets import load_dataset, load_from_disk
 
-    # Auto-download data from HF Hub if repo specified and local dir is empty
-    if hf_data_repo and not glob.glob(os.path.join(data_dir, "**", "episode_*.hdf5"), recursive=True):
-        from huggingface_hub import snapshot_download
-        print(f"Downloading data from {hf_data_repo} ...")
-        os.makedirs(data_dir, exist_ok=True)
-        snapshot_download(repo_id=hf_data_repo, repo_type="dataset", local_dir=data_dir)
-        print("Download complete.")
+    base = os.path.dirname(__file__)
+
+    # Load dataset from HF Hub or local disk
+    if hf_data_repo:
+        print(f"Loading dataset from {hf_data_repo} ...")
+        ds = load_dataset(hf_data_repo, split="train")
+        print("Dataset loaded.")
+    elif data_dir:
+        print(f"Loading dataset from {data_dir} ...")
+        ds = load_from_disk(data_dir)
+    else:
+        default_dir = os.path.join(base, "data")
+        print(f"Loading dataset from {default_dir} ...")
+        ds = load_from_disk(default_dir)
+
+    print(f"Dataset: {ds}")
+
     if checkpoint_dir is None:
         checkpoint_dir = os.path.join(
             base, "checkpoints", f"{backbone}_chunk{chunk_size}"
         )
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Find episodes (supports both flat and sharded subdirectory layouts)
-    episode_files = sorted(glob.glob(os.path.join(data_dir, "**", "episode_*.hdf5"), recursive=True))
-    if not episode_files:
-        print(f"No episodes found in {data_dir}. Run generate_data.py first.")
-        return
-    if max_episodes is not None and max_episodes < len(episode_files):
-        episode_files = episode_files[:max_episodes]
-    print(f"Using {len(episode_files)} episodes")
+    # Build episode offset table
+    episode_offsets = build_episode_offsets(ds)
+    all_episode_ids = sorted(episode_offsets.keys())
+
+    if max_episodes is not None and max_episodes < len(all_episode_ids):
+        all_episode_ids = all_episode_ids[:max_episodes]
+
+    print(f"Using {len(all_episode_ids)} episodes")
 
     # Train/val split by episode
     rng = np.random.default_rng(42)
-    indices = rng.permutation(len(episode_files))
-    val_count = max(1, int(len(episode_files) * TRAIN.val_fraction))
-    val_files = [episode_files[i] for i in indices[:val_count]]
-    train_files = [episode_files[i] for i in indices[val_count:]]
+    indices = rng.permutation(len(all_episode_ids))
+    val_count = max(1, int(len(all_episode_ids) * TRAIN.val_fraction))
+    val_ids = set(all_episode_ids[i] for i in indices[:val_count])
+    train_ids = set(all_episode_ids[i] for i in indices[val_count:])
 
-    print(f"Train: {len(train_files)} episodes, Val: {len(val_files)} episodes")
+    print(f"Train: {len(train_ids)} episodes, Val: {len(val_ids)} episodes")
 
     # Default num_workers: 4 for CUDA (overlap data loading with GPU), 0 for MPS/CPU
     if num_workers is None:
         num_workers = 4 if device.startswith("cuda") else 0
 
-    cache_max = cache_episodes if cache_episodes is not None else _auto_cache_size(num_workers)
-    print(f"DataLoader workers: {num_workers}, Episode cache: {cache_max}")
+    print(f"DataLoader workers: {num_workers}")
 
-    train_dataset = ChunkDataset(train_files, chunk_size, cache_max=cache_max)
-    val_dataset = ChunkDataset(val_files, chunk_size, cache_max=cache_max)
+    train_dataset = ChunkDataset(ds, episode_offsets, train_ids, chunk_size)
+    val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     train_loader = DataLoader(
@@ -371,7 +369,7 @@ def train(
         train_loss = train_loss_sum / max(train_total, 1)
 
         # --- Validate ---
-        model.eval()
+        model.train(False)
         val_loss_sum = 0.0
         val_total = 0
 
@@ -507,13 +505,12 @@ if __name__ == "__main__":
                         help="Cap number of episodes to load (default: all)")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="DataLoader workers (default: 4 for CUDA, 0 for MPS/CPU)")
-    parser.add_argument("--cache-episodes", type=int, default=None,
-                        help="LRU cache size per worker (default: auto based on RAM)")
-    parser.add_argument("--data-dir", type=str, default=None)
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Local dataset directory (save_to_disk format)")
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--hf-data-repo", type=str, default=None,
-                        help="HF dataset repo to auto-download data from (e.g. PenTest-duck/cu-vla-data)")
+                        help="HF dataset repo to load data from (e.g. PenTest-duck/cu-vla-data)")
     parser.add_argument("--hf-upload-repo", type=str, default=None,
                         help="HF model repo to upload checkpoints to after training")
     args = parser.parse_args()
@@ -524,7 +521,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         max_episodes=args.max_episodes,
         num_workers=args.num_workers,
-        cache_episodes=args.cache_episodes,
         data_dir=args.data_dir,
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,

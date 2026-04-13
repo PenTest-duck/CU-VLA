@@ -5,7 +5,8 @@
 #     "torchvision>=0.22",
 #     "transformers>=4.52",
 #     "numpy>=2.0",
-#     "h5py>=3.12",
+#     "datasets>=3.0",
+#     "Pillow>=10.0",
 #     "huggingface-hub>=0.30",
 #     "matplotlib>=3.10",
 # ]
@@ -13,8 +14,8 @@
 """Self-contained training script for HuggingFace Jobs.
 
 Clones the repo, installs it, and runs train.py with forwarded args.
-The dataset should be volume-mounted at /data by the launcher script.
-Falls back to --hf-data-repo snapshot_download if /data is empty.
+The dataset is loaded via load_dataset() inside train.py — no volume
+mounting or snapshot_download needed.
 
 Launch via the companion script:
     uv run python scripts/launch_hf_job.py \
@@ -28,7 +29,7 @@ import sys
 
 REPO_URL = "https://github.com/PenTest-duck/CU-VLA.git"
 WORKDIR = "/tmp/cu-vla"
-MOUNTED_DATA_DIR = "/data"
+DEFAULT_DATA_REPO = "PenTest-duck/cu-vla-data"
 
 
 def main() -> None:
@@ -48,12 +49,9 @@ def main() -> None:
     if "--device" not in train_args:
         train_args.extend(["--device", "cuda"])
 
-    # Use mounted dataset volume if available and populated
-    import glob
-    mounted_episodes = glob.glob(os.path.join(MOUNTED_DATA_DIR, "**", "episode_*.hdf5"), recursive=True)
-    if mounted_episodes and "--data-dir" not in train_args:
-        print(f"Found {len(mounted_episodes)} episodes in mounted volume {MOUNTED_DATA_DIR}")
-        train_args.extend(["--data-dir", MOUNTED_DATA_DIR])
+    # Default to loading data from HF Hub if no data source specified
+    if "--hf-data-repo" not in train_args and "--data-dir" not in train_args:
+        train_args.extend(["--hf-data-repo", DEFAULT_DATA_REPO])
 
     print(f"Running train.py with args: {train_args}")
     cmd = [sys.executable, "experiments/act_drag_label/train.py"] + train_args

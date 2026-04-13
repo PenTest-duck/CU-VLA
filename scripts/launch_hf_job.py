@@ -1,4 +1,4 @@
-"""Launch an HF Jobs training run with dataset volume mounting.
+"""Launch an HF Jobs training run.
 
 Usage:
     uv run python scripts/launch_hf_job.py \
@@ -10,31 +10,29 @@ Usage:
       -- --backbone resnet18 --chunk-size 10 \
          --hf-upload-repo PenTest-duck/cu-vla-checkpoints
 
-The dataset (PenTest-duck/cu-vla-data) is volume-mounted at /data inside the
-job container, so no snapshot_download is needed.
+The dataset is loaded via load_dataset() inside the training script —
+no volume mounting needed.
 """
 
 import argparse
+import os
 import sys
 
-from huggingface_hub import run_uv_job, Volume
+from huggingface_hub import run_uv_job
 
 
-SCRIPT_URL = "https://raw.githubusercontent.com/PenTest-duck/CU-VLA/main/scripts/hf_job_train.py"
-DEFAULT_DATA_REPO = "PenTest-duck/cu-vla-data"
+SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "hf_job_train.py")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Launch HF Jobs training with volume-mounted dataset",
+        description="Launch HF Jobs training",
         usage="%(prog)s [launcher-options] -- [train.py options]",
     )
     parser.add_argument("--flavor", type=str, default="t4-medium",
                         help="HF Jobs hardware flavor (default: t4-medium)")
     parser.add_argument("--timeout", type=str, default="4h",
                         help="Job timeout (default: 4h)")
-    parser.add_argument("--data-repo", type=str, default=DEFAULT_DATA_REPO,
-                        help="HF dataset repo to mount (default: %(default)s)")
     parser.add_argument("--namespace", type=str, default=None,
                         help="HF namespace to run the job in")
     parser.add_argument("--detach", action="store_true",
@@ -52,16 +50,10 @@ def main() -> None:
 
     args = parser.parse_args(launcher_argv)
 
-    # Mount the dataset repo at /data (read-only)
-    volumes = [
-        Volume(type="dataset", source=args.data_repo, mount_path="/data"),
-    ]
-
     print(f"Launching HF Job:")
     print(f"  Flavor:  {args.flavor}")
     print(f"  Timeout: {args.timeout}")
-    print(f"  Dataset: {args.data_repo} -> /data")
-    print(f"  Script:  {SCRIPT_URL}")
+    print(f"  Script:  {SCRIPT_PATH}")
     print(f"  Args:    {train_argv}")
 
     kwargs = {}
@@ -78,11 +70,10 @@ def main() -> None:
         print("  WARNING: No HF token found. Run `huggingface-cli login` first.")
 
     job = run_uv_job(
-        SCRIPT_URL,
+        SCRIPT_PATH,
         script_args=train_argv,
         flavor=args.flavor,
         timeout=args.timeout,
-        volumes=volumes,
         secrets=secrets,
         **kwargs,
     )

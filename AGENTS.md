@@ -4,7 +4,7 @@ Research project: high-frequency VLA (Vision-Language-Action) models for compute
 
 ## Persona
 
-Be a thoughtful, innovative researcher. Apply first-principles thinking.
+Be a thoughtful, innovative, expert researcher. Apply first-principles thinking.
 
 Feel free to challenge/critique/push back on the user, e.g. if they have made false assumptions, sub-optimal suggestions, wrong decisions etc.. They are not perfect. But also you are also not perfect. Be cognizant of this.
 
@@ -34,8 +34,9 @@ Serves as a high-level table of contents.
 | `docs/plans/2026-04-13-act-drag-and-label-design.md` | Experiment 2 full design doc — ACT architecture, drag-and-label task, vision backbone + chunk size ablations |
 | `docs/plans/2026-04-13-act-drag-and-label-implementation.md` | Experiment 2 implementation plan — 12-task breakdown |
 | `experiments/act_drag_label/` | Experiment 2 code (see below) |
-| `scripts/launch_hf_job.py` | Launcher for HF Jobs training (volume-mounts dataset, calls `run_uv_job()`) |
+| `scripts/launch_hf_job.py` | Launcher for HF Jobs training (calls `run_uv_job()`) |
 | `scripts/hf_job_train.py` | UV script that runs inside HF Jobs (clones repo, runs train.py) |
+| `scripts/migrate_hdf5_to_parquet.py` | One-shot migration from HDF5 episodes to parquet |
 
 ## Experiment 1: Reactive Clicks
 
@@ -67,8 +68,9 @@ Validates ACT (Action Chunking with Transformers) for desktop interaction: drag 
 
 **Run sequence:**
 ```bash
-uv run python experiments/act_drag_label/generate_data.py -n 10000       # generate expert demos
+uv run python experiments/act_drag_label/generate_data.py -n 10000       # generate expert demos (parquet)
 uv run python experiments/act_drag_label/train.py --backbone resnet18 --chunk-size 10 --device mps
+uv run python experiments/act_drag_label/train.py --hf-data-repo PenTest-duck/cu-vla-data --device mps  # from HF Hub
 uv run python experiments/act_drag_label/evaluate.py --backbone resnet18 --chunk-size 10
 uv run python experiments/act_drag_label/evaluate.py --visual            # with Pygame window
 ```
@@ -82,19 +84,14 @@ uv run python experiments/act_drag_label/evaluate.py --visual            # with 
 | `backbones.py` | ResNet18, DINOv2 ViT-S/14, SigLIP2 base — all output (B, 49, 256) |
 | `model.py` | `ACT` — CVAE + transformer encoder-decoder + action heads (~33M params) |
 | `baseline_cnn.py` | `BaselineCNN` — extended TinyCNN, single-step no-chunking baseline |
-| `generate_data.py` | Runs expert, saves HDF5 episodes to `data/<shard>/` (1000 per shard) |
+| `generate_data.py` | Runs expert, saves parquet dataset via HF `datasets` library |
 | `train.py` | BC training: chunk sampling, multi-head loss, KL annealing, AMP |
 | `evaluate.py` | Runs all agents, temporal ensemble, decomposed metrics by phase |
 | `hf_sync.py` | Upload/download data and checkpoints to/from HuggingFace Hub |
 
-**Dataset layout:** Episodes are sharded into subdirectories of 1000 to stay under HF's 10k files/directory limit:
-```
-data/000/episode_00000.hdf5 ... episode_00999.hdf5
-data/001/episode_01000.hdf5 ... episode_01999.hdf5
-...
-```
+**Dataset format:** Parquet via HF `datasets` library (~10 shards). One row per timestep with columns: `episode_id`, `timestep`, `image` (PNG), `action_dx/dy/click/key`, episode metadata. Loaded via `load_dataset("PenTest-duck/cu-vla-data")` or `load_from_disk("data/")`.
 
-**HF Jobs training** (uses volume-mounted dataset, no snapshot_download needed):
+**HF Jobs training** (dataset loaded via `load_dataset()` — no volume mounting needed):
 ```bash
 uv run python scripts/launch_hf_job.py --flavor t4-medium --timeout 4h \
   -- --backbone resnet18 --chunk-size 10 --hf-upload-repo PenTest-duck/cu-vla-checkpoints
