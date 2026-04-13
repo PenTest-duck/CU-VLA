@@ -6,6 +6,9 @@ from experiments.miniwob_pygame.experts.click_sequence import (
     run_expert_episode as run_click_sequence_expert_episode,
 )
 from experiments.miniwob_pygame.experts.click_target import run_expert_episode
+from experiments.miniwob_pygame.experts.copy_paste import (
+    run_expert_episode as run_copy_paste_expert_episode,
+)
 from experiments.miniwob_pygame.experts.drag_and_label import (
     run_expert_episode as run_drag_and_label_expert_episode,
 )
@@ -43,6 +46,7 @@ from experiments.miniwob_pygame.tasks.draw_path import DrawPathEnv
 from experiments.miniwob_pygame.tasks.scroll_and_click import ScrollAndClickEnv
 from experiments.miniwob_pygame.tasks.highlight_text import HighlightTextEnv
 from experiments.miniwob_pygame.tasks.type_field import TypeFieldEnv
+from experiments.miniwob_pygame.tasks.copy_paste import CopyPasteEnv
 from experiments.miniwob_pygame.tasks.use_slider import UseSliderEnv
 
 
@@ -198,3 +202,17 @@ class TestDragAndLabelExpert:
                 successes += 1
         env.close()
         assert successes >= 18, f"Expert only succeeded {successes}/{n_episodes} times"
+
+
+class TestCopyPasteExpert:
+    def test_expert_completes_task(self):
+        env = CopyPasteEnv()
+        successes = 0
+        n_episodes = 20
+        for i in range(n_episodes):
+            rng = np.random.default_rng(seed=i)
+            _, _, info = run_copy_paste_expert_episode(env, rng, seed=i)
+            if info.get("success"):
+                successes += 1
+        env.close()
+        assert successes >= 14, f"Expert only succeeded {successes}/{n_episodes} times"
