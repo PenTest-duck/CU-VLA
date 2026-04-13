@@ -155,12 +155,12 @@ class ChunkConfig:
 @dataclass(frozen=True)
 class TrainConfig:
     num_episodes_per_task: int = 5000
-    batch_size: int = 64
+    batch_size: int = 256
     lr: float = 1e-4
     backbone_lr: float = 1e-5
     weight_decay: float = 1e-4
-    epochs: int = 500
-    early_stop_patience: int = 50
+    epochs: int = 100
+    early_stop_patience: int = 15
     val_fraction: float = 0.2
     kl_weight_max: float = 0.1
     kl_anneal_fraction: float = 0.2

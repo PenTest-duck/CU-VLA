@@ -32,23 +32,19 @@ from experiments.miniwob_pygame.model import ACT, count_parameters
 # ---------------------------------------------------------------------------
 
 def build_episode_offsets(
-    ds,
+    ep_ids: np.ndarray,
 ) -> dict[int, tuple[int, int]]:
-    """Scan the episode_id column and return {episode_id: (start_row, length)}.
+    """Return {episode_id: (start_row, length)} from a sorted episode_id array.
 
-    Assumes the dataset is sorted by (episode_id, timestep) — which is the
+    Assumes the array is sorted by (episode_id, timestep) — which is the
     natural output order from generate_data.py / Dataset.from_generator().
     """
-    ep_col = ds["episode_id"]
+    changes = np.where(np.diff(ep_ids) != 0)[0] + 1
+    starts = np.concatenate([[0], changes])
+    ends = np.concatenate([changes, [len(ep_ids)]])
     offsets: dict[int, tuple[int, int]] = {}
-    cur_ep = ep_col[0]
-    cur_start = 0
-    for i in range(1, len(ep_col)):
-        if ep_col[i] != cur_ep:
-            offsets[cur_ep] = (cur_start, i - cur_start)
-            cur_ep = ep_col[i]
-            cur_start = i
-    offsets[cur_ep] = (cur_start, len(ep_col) - cur_start)
+    for s, e in zip(starts, ends):
+        offsets[int(ep_ids[s])] = (int(s), int(e - s))
     return offsets
 
 
@@ -248,19 +244,9 @@ def train(
         )
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Build episode offset table
-    t_init = time.perf_counter()
-    episode_offsets = build_episode_offsets(ds)
-    print(f"Episode offsets built in {time.perf_counter() - t_init:.2f}s", flush=True)
-    all_episode_ids = sorted(episode_offsets.keys())
-
-    if max_episodes is not None and max_episodes < len(all_episode_ids):
-        all_episode_ids = all_episode_ids[:max_episodes]
-
-    print(f"Using {len(all_episode_ids)} episodes")
-
-    # Pre-extract action columns to numpy (avoids per-sample Arrow reads)
+    # Pre-extract scalar columns to numpy (avoids per-sample Arrow access)
     t_extract = time.perf_counter()
+    ep_ids_np = np.array(ds["episode_id"], dtype=np.int32)
     action_arrays = {
         "action_dx": np.array(ds["action_dx"], dtype=np.float32),
         "action_dy": np.array(ds["action_dy"], dtype=np.float32),
@@ -269,12 +255,23 @@ def train(
         "cursor_x": np.array(ds["cursor_x"], dtype=np.float32),
         "cursor_y": np.array(ds["cursor_y"], dtype=np.float32),
     }
-    extract_mb = sum(a.nbytes for a in action_arrays.values()) / 1024 / 1024
+    extract_mb = (ep_ids_np.nbytes + sum(a.nbytes for a in action_arrays.values())) / 1024 / 1024
     print(
-        f"Action columns extracted to numpy in {time.perf_counter() - t_extract:.2f}s "
+        f"Scalar columns extracted to numpy in {time.perf_counter() - t_extract:.2f}s "
         f"({extract_mb:.1f}MB)",
         flush=True,
     )
+
+    # Build episode offset table
+    t_init = time.perf_counter()
+    episode_offsets = build_episode_offsets(ep_ids_np)
+    print(f"Episode offsets built in {time.perf_counter() - t_init:.2f}s", flush=True)
+    all_episode_ids = sorted(episode_offsets.keys())
+
+    if max_episodes is not None and max_episodes < len(all_episode_ids):
+        all_episode_ids = all_episode_ids[:max_episodes]
+
+    print(f"Using {len(all_episode_ids)} episodes")
 
     # Train/val split by episode
     rng = np.random.default_rng(42)
@@ -294,17 +291,23 @@ def train(
     val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size, action_arrays)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
+    use_cuda = device.startswith("cuda")
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, persistent_workers=num_workers > 0,
+        pin_memory=use_cuda,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, persistent_workers=num_workers > 0,
+        pin_memory=use_cuda,
     )
 
     # Model
     model = ACT(backbone_name=backbone, chunk_size=chunk_size).to(device)
+    if use_cuda:
+        model = torch.compile(model)
+        print("Model compiled with torch.compile", flush=True)
     total_params = count_parameters(model, trainable_only=False)
     trainable_params = count_parameters(model, trainable_only=True)
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
@@ -340,7 +343,7 @@ def train(
     amp_dtype = torch.float16 if use_amp else torch.float32
 
     print(f"AMP: {'enabled' if use_amp else 'disabled (GradScaler requires CUDA)'}")
-    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}")
+    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}", flush=True)
 
     # Training loop
     history: dict[str, list] = {
@@ -364,8 +367,9 @@ def train(
         model.train()
         train_loss_sum = 0.0
         train_total = 0
+        n_batches = len(train_loader)
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             (obs, proprio, actions_cvae, dx_gt, dy_gt, mouse_gt, keys_gt, pad_gt) = batch
             obs = obs.to(device)
             proprio = proprio.to(device)
@@ -437,6 +441,16 @@ def train(
             bs = obs.size(0)
             train_loss_sum += total_loss.item() * bs
             train_total += bs
+
+            # Debug: log progress during first epoch to diagnose throughput
+            if epoch == 0 and (batch_idx == 0 or (batch_idx + 1) % 100 == 0):
+                elapsed_batch = time.perf_counter() - t0
+                print(
+                    f"    batch {batch_idx+1}/{n_batches} | "
+                    f"loss={total_loss.item():.4f} | "
+                    f"{elapsed_batch:.1f}s elapsed",
+                    flush=True,
+                )
 
         scheduler.step()
         train_loss = train_loss_sum / max(train_total, 1)
@@ -513,7 +527,27 @@ def train(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_without_improvement = 0
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best.pt"))
+            best_pt_path = os.path.join(checkpoint_dir, "best.pt")
+            torch.save(model.state_dict(), best_pt_path)
+            # Upload best checkpoint async so training continues immediately
+            if hf_upload_repo:
+                import threading
+                from huggingface_hub import HfApi
+                _val = val_loss
+                def _upload():
+                    try:
+                        api = HfApi()
+                        api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
+                        api.upload_file(
+                            path_or_fileobj=best_pt_path,
+                            path_in_repo=f"{backbone}_chunk{chunk_size}/best.pt",
+                            repo_id=hf_upload_repo,
+                            repo_type="model",
+                        )
+                        print(f"    Uploaded best.pt (val={_val:.4f})", flush=True)
+                    except Exception as e:
+                        print(f"    Upload failed: {e}", flush=True)
+                threading.Thread(target=_upload, daemon=True).start()
         else:
             epochs_without_improvement += 1
 
@@ -524,7 +558,8 @@ def train(
             f"train={train_loss:.4f} val={val_loss:.4f} | "
             f"kl_w={kl_weight:.4f} | "
             f"lr={scheduler.get_last_lr()[0]:.6f} | "
-            f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min"
+            f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min",
+            flush=True,
         )
 
         # Early stopping
