@@ -382,3 +382,52 @@ class TestDrawPath:
         assert done
         assert info.get("timeout") is True
         env.close()
+
+
+class TestDragSort:
+    def test_already_sorted(self):
+        """If cards happen to start sorted, success is immediate."""
+        env = DragSortEnv(num_cards=4)
+        # Try seeds until we find one that starts sorted, or manually sort
+        env.reset(seed=0)
+        # Manually place cards in sorted order
+        for card in env.cards:
+            target_slot = card["value"] - 1
+            card["slot_index"] = target_slot
+            card["x"] = env.slots[target_slot] - card["width"] // 2
+        # Step with noop — check_success should fire
+        _, done, info = env.step(_noop())
+        assert done
+        assert info.get("success") is True
+        env.close()
+
+    def test_drag_swaps_cards(self):
+        """Grabbing a card and dropping on another slot swaps the two cards."""
+        env = DragSortEnv(num_cards=4)
+        env.reset(seed=42)
+        cards = env.cards
+
+        # Pick two cards in different slots
+        card_a = cards[0]
+        card_b = cards[1]
+        slot_a = card_a["slot_index"]
+        slot_b = card_b["slot_index"]
+        assert slot_a != slot_b
+
+        # Teleport cursor to card_a center and grab
+        env._cursor_x = float(card_a["x"] + card_a["width"] / 2)
+        env._cursor_y = float(card_a["y"] + card_a["height"] / 2)
+        env.step(_noop(mouse_left=1))
+        assert env._grabbed_card == 0
+
+        # Drag to card_b's slot center
+        env._cursor_x = float(env.slots[slot_b])
+        env._cursor_y = float(card_b["y"] + card_b["height"] / 2)
+        env.step(_noop(mouse_left=1))
+
+        # Release — should swap
+        env.step(_noop(mouse_left=0))
+
+        assert card_a["slot_index"] == slot_b, "card_a should now be in slot_b"
+        assert card_b["slot_index"] == slot_a, "card_b should now be in slot_a"
+        env.close()
