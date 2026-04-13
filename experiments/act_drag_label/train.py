@@ -246,17 +246,23 @@ def train(
     val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size, action_arrays)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}", flush=True)
 
+    use_cuda = device.startswith("cuda")
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, persistent_workers=num_workers > 0,
+        pin_memory=use_cuda,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, persistent_workers=num_workers > 0,
+        pin_memory=use_cuda,
     )
 
     # Model
     model = ACT(backbone_name=backbone, chunk_size=chunk_size).to(device)
+    if use_cuda:
+        model = torch.compile(model)
+        print("Model compiled with torch.compile", flush=True)
     total_params = count_parameters(model, trainable_only=False)
     trainable_params = count_parameters(model, trainable_only=True)
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
