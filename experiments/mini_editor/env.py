@@ -527,33 +527,26 @@ class MiniEditorEnv:
         self._rewrap()
 
     def _rewrap(self) -> None:
-        """Re-wrap self._text into self._lines using word wrapping."""
-        if self._chars_per_line <= 0:
-            self._lines = [self._text]
-            return
+        """Re-wrap self._text into self._lines based on rendered pixel width."""
+        max_width = ENV.window_w - 2 * ENV.margin
 
         self._lines = []
-        # First split by actual newlines
         paragraphs = self._text.split("\n")
         for para in paragraphs:
             if not para:
                 self._lines.append("")
                 continue
-            # Word wrap each paragraph
-            remaining = para
-            while len(remaining) > self._chars_per_line:
-                # Try to break at a space (include the boundary position)
-                break_at = remaining.rfind(" ", 0, self._chars_per_line + 1)
-                if break_at <= 0:
-                    # No space found, hard break
-                    break_at = self._chars_per_line
-                self._lines.append(remaining[:break_at])
-                # Skip the space if we broke at one
-                if break_at < len(remaining) and remaining[break_at] == " ":
-                    remaining = remaining[break_at + 1 :]
+            # Greedy word-wrap by measuring actual rendered width
+            words = para.split(" ")
+            current_line = words[0]
+            for word in words[1:]:
+                candidate = current_line + " " + word
+                if self._text_width(candidate) <= max_width:
+                    current_line = candidate
                 else:
-                    remaining = remaining[break_at:]
-            self._lines.append(remaining)
+                    self._lines.append(current_line)
+                    current_line = word
+            self._lines.append(current_line)
 
     # ------------------------------------------------------------------
     # Properties
