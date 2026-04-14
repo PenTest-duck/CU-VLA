@@ -227,11 +227,29 @@ def train(
     tasks: list[str] | None = None,
     max_epochs: int | None = None,
     hf_upload_repo: str | None = None,
+    hf_data_repo: str | None = None,
 ) -> None:
     base = os.path.dirname(__file__)
 
     if data_dir is None:
         data_dir = os.path.join(base, "data")
+
+    # Auto-download data from HF Hub if specified and local dir is empty
+    if hf_data_repo:
+        has_local = os.path.isdir(data_dir) and any(
+            os.path.isdir(os.path.join(data_dir, d))
+            for d in os.listdir(data_dir)
+            if not d.startswith(".")
+        ) if os.path.isdir(data_dir) else False
+
+        if not has_local:
+            from huggingface_hub import snapshot_download
+            print(f"Downloading data from {hf_data_repo} ...")
+            os.makedirs(data_dir, exist_ok=True)
+            snapshot_download(
+                repo_id=hf_data_repo, repo_type="dataset", local_dir=data_dir
+            )
+            print("Download complete.")
 
     # Load and concatenate task datasets
     print(f"Loading datasets from {data_dir} ...")
@@ -622,6 +640,8 @@ if __name__ == "__main__":
                         help="Override number of epochs (useful for smoke tests)")
     parser.add_argument("--hf-upload-repo", type=str, default=None,
                         help="HF model repo to upload checkpoints to after training")
+    parser.add_argument("--hf-data-repo", type=str, default=None,
+                        help="HF dataset repo to auto-download data from (e.g. PenTest-duck/cu-vla-exp3-data)")
     args = parser.parse_args()
 
     train(
@@ -636,4 +656,5 @@ if __name__ == "__main__":
         tasks=args.tasks,
         max_epochs=args.max_epochs,
         hf_upload_repo=args.hf_upload_repo,
+        hf_data_repo=args.hf_data_repo,
     )

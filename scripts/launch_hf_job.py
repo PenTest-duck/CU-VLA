@@ -1,17 +1,19 @@
 """Launch an HF Jobs training run.
 
-Usage:
+Usage (Exp 3 — default):
     uv run python scripts/launch_hf_job.py \
       --flavor t4-medium --timeout 4h \
-      -- --backbone resnet18 --chunk-size 10
-
-    uv run python scripts/launch_hf_job.py \
-      --flavor a10g-small --timeout 6h \
       -- --backbone resnet18 --chunk-size 10 \
-         --hf-upload-repo PenTest-duck/cu-vla-checkpoints
+         --hf-upload-repo PenTest-duck/cu-vla-exp3-checkpoints
 
-The dataset is loaded via load_dataset() inside the training script —
-no volume mounting needed.
+Usage (Exp 2):
+    uv run python scripts/launch_hf_job.py \
+      --flavor t4-medium --timeout 4h \
+      -- --experiment exp2 --backbone resnet18 --chunk-size 10
+
+The dataset is auto-downloaded from HF Hub inside the training script.
+Pass --experiment exp2|exp3 after -- to select which experiment to train.
+Defaults to exp3 (MiniWoB-Pygame).
 """
 
 import argparse
