@@ -9,6 +9,7 @@
 #     "Pillow>=10.0",
 #     "huggingface-hub>=0.30",
 #     "matplotlib>=3.10",
+#     "psutil>=5.9",
 # ]
 # ///
 """Self-contained training script for HuggingFace Jobs.

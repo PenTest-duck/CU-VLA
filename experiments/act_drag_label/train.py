@@ -220,26 +220,48 @@ def train(
         flush=True,
     )
 
-    # Pre-decode all images to numpy (eliminates PNG decode during training)
+    # Pre-decode all images to disk-backed memmap (eliminates PNG decode during training)
     n_samples = len(ds)
     obs_size = ENV.obs_size
+    img_shape = (n_samples, obs_size, obs_size, 3)
+    memmap_path = os.path.join(checkpoint_dir, "images_cache.dat")
     t_decode = time.perf_counter()
-    images = np.zeros((n_samples, obs_size, obs_size, 3), dtype=np.uint8)
-    for i in range(n_samples):
-        images[i] = np.array(ds[i]["image"])
-        if (i + 1) % 50000 == 0 or i == 0:
-            elapsed_decode = time.perf_counter() - t_decode
+
+    if os.path.exists(memmap_path):
+        # Check if existing cache matches expected size
+        expected_bytes = int(np.prod(img_shape))
+        actual_bytes = os.path.getsize(memmap_path)
+        if actual_bytes == expected_bytes:
+            images = np.memmap(memmap_path, dtype=np.uint8, mode="r", shape=img_shape)
             print(
-                f"  Pre-decoded {i+1}/{n_samples} images "
-                f"({elapsed_decode:.1f}s elapsed)",
+                f"Image cache loaded from {memmap_path} "
+                f"({actual_bytes / 1024**3:.1f}GB)",
                 flush=True,
             )
-    images_gb = images.nbytes / 1024**3
-    print(
-        f"Images pre-decoded in {time.perf_counter() - t_decode:.1f}s "
-        f"({images_gb:.1f}GB, {n_samples/( time.perf_counter() - t_decode):.0f} img/s)",
-        flush=True,
-    )
+        else:
+            os.remove(memmap_path)
+            images = None
+    else:
+        images = None
+
+    if images is None:
+        images = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=img_shape)
+        for i in range(n_samples):
+            images[i] = np.array(ds[i]["image"])
+            if (i + 1) % 50000 == 0 or i == 0:
+                elapsed_decode = time.perf_counter() - t_decode
+                print(
+                    f"  Pre-decoded {i+1}/{n_samples} images "
+                    f"({elapsed_decode:.1f}s elapsed)",
+                    flush=True,
+                )
+        images.flush()
+        images_gb = images.nbytes / 1024**3
+        print(
+            f"Images pre-decoded to {memmap_path} in {time.perf_counter() - t_decode:.1f}s "
+            f"({images_gb:.1f}GB, {n_samples / (time.perf_counter() - t_decode):.0f} img/s)",
+            flush=True,
+        )
 
     # Build episode offset table
     t_init = time.perf_counter()
@@ -365,8 +387,27 @@ def train(
         train_total = 0
         n_batches = len(train_loader)
 
+        # First-epoch diagnostics: per-phase timing accumulators
+        diag = epoch == 0
+        if diag:
+            t_data_total = 0.0   # time waiting for DataLoader
+            t_xfer_total = 0.0   # time in .to(device) transfers
+            t_fwd_total = 0.0    # time in forward pass
+            t_loss_total = 0.0   # time computing losses
+            t_bwd_total = 0.0    # time in backward pass
+            t_opt_total = 0.0    # time in optimizer step
+            grad_norms = []      # gradient L2 norms (sampled)
+
+        t_data_start = time.perf_counter()
+
         for batch_idx, batch in enumerate(train_loader):
+            if diag:
+                t_data_total += time.perf_counter() - t_data_start
+
             (obs, proprio, actions_cvae, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = batch
+
+            if diag:
+                t_xfer_start = time.perf_counter()
             obs = obs.to(device, non_blocking=True)
             proprio = proprio.to(device, non_blocking=True)
             actions_cvae = actions_cvae.to(device, non_blocking=True)
@@ -375,11 +416,25 @@ def train(
             click_gt = click_gt.to(device, non_blocking=True)
             key_gt = key_gt.to(device, non_blocking=True)
             pad_gt = pad_gt.to(device, non_blocking=True)
+            if diag:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t_xfer_total += time.perf_counter() - t_xfer_start
 
             with torch.amp.autocast(
                 device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp
             ):
+                if diag:
+                    if use_cuda:
+                        torch.cuda.synchronize()
+                    t_fwd_start = time.perf_counter()
                 out = model(obs, proprio, actions_cvae)
+                if diag:
+                    if use_cuda:
+                        torch.cuda.synchronize()
+                    t_fwd_total += time.perf_counter() - t_fwd_start
+
+                    t_loss_start = time.perf_counter()
 
                 # Mask: 1 where real, 0 where padded
                 mask = 1.0 - pad_gt  # (B, chunk)
@@ -432,10 +487,38 @@ def train(
                     + kl_weight * kl
                 )
 
+            if diag:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t_loss_total += time.perf_counter() - t_loss_start
+
+                t_bwd_start = time.perf_counter()
+
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
+
+            if diag:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t_bwd_total += time.perf_counter() - t_bwd_start
+
+                # Sample gradient norm every 10 batches
+                if batch_idx % 10 == 0:
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.data.float().norm(2).item() ** 2
+                    grad_norms.append(total_norm ** 0.5)
+
+                t_opt_start = time.perf_counter()
+
             scaler.step(optimizer)
             scaler.update()
+
+            if diag:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t_opt_total += time.perf_counter() - t_opt_start
 
             bs = obs.size(0)
             train_loss_sum += total_loss.item() * bs
@@ -447,21 +530,83 @@ def train(
             head_sums_train["kl"] += kl.item() * bs
             train_total += bs
 
-            # Debug: log progress during first epoch to diagnose throughput
-            if epoch == 0 and (batch_idx == 0 or (batch_idx + 1) % 100 == 0):
+            # First epoch: periodic progress with VRAM
+            if diag and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
                 elapsed_batch = time.perf_counter() - t0
                 vram_str = ""
                 if use_cuda:
                     alloc = torch.cuda.memory_allocated() / 1024**3
                     reserved = torch.cuda.memory_reserved() / 1024**3
                     peak = torch.cuda.max_memory_allocated() / 1024**3
-                    vram_str = f" | VRAM: {alloc:.1f}GB alloc, {reserved:.1f}GB reserved, {peak:.1f}GB peak"
+                    vram_str = (f" | VRAM: {alloc:.1f}/{reserved:.1f}/{peak:.1f}GB"
+                                f" (alloc/reserved/peak)")
                 print(
                     f"    batch {batch_idx+1}/{n_batches} | "
                     f"loss={total_loss.item():.4f} | "
                     f"{elapsed_batch:.1f}s elapsed{vram_str}",
                     flush=True,
                 )
+
+            if diag:
+                t_data_start = time.perf_counter()
+
+        # End of epoch 1: print comprehensive diagnostics
+        if diag:
+            t_train_wall = time.perf_counter() - t0
+            t_accounted = t_data_total + t_xfer_total + t_fwd_total + t_loss_total + t_bwd_total + t_opt_total
+            t_overhead = t_train_wall - t_accounted
+            samples_per_sec = train_total / t_train_wall
+
+            print(f"\n{'='*70}")
+            print(f"  EPOCH 1 TRAINING DIAGNOSTICS")
+            print(f"{'='*70}")
+            print(f"  Wall time:         {t_train_wall:.1f}s ({n_batches} batches × {batch_size} samples)")
+            print(f"  Throughput:        {samples_per_sec:.0f} samples/sec")
+            print(f"")
+            print(f"  --- Time breakdown (training only, excludes validation) ---")
+            print(f"  DataLoader wait:   {t_data_total:6.1f}s ({t_data_total/t_train_wall*100:4.1f}%)  ← data loading bottleneck?")
+            print(f"  CPU→GPU transfer:  {t_xfer_total:6.1f}s ({t_xfer_total/t_train_wall*100:4.1f}%)")
+            print(f"  Forward pass:      {t_fwd_total:6.1f}s ({t_fwd_total/t_train_wall*100:4.1f}%)")
+            print(f"  Loss computation:  {t_loss_total:6.1f}s ({t_loss_total/t_train_wall*100:4.1f}%)")
+            print(f"  Backward pass:     {t_bwd_total:6.1f}s ({t_bwd_total/t_train_wall*100:4.1f}%)")
+            print(f"  Optimizer step:    {t_opt_total:6.1f}s ({t_opt_total/t_train_wall*100:4.1f}%)")
+            print(f"  Other overhead:    {t_overhead:6.1f}s ({t_overhead/t_train_wall*100:4.1f}%)")
+            print(f"  GPU compute total: {t_fwd_total+t_loss_total+t_bwd_total:6.1f}s ({(t_fwd_total+t_loss_total+t_bwd_total)/t_train_wall*100:4.1f}%)  ← GPU utilization")
+            print(f"")
+            print(f"  --- Per-batch averages ---")
+            print(f"  DataLoader:  {t_data_total/n_batches*1000:6.1f}ms/batch")
+            print(f"  Transfer:    {t_xfer_total/n_batches*1000:6.1f}ms/batch")
+            print(f"  Forward:     {t_fwd_total/n_batches*1000:6.1f}ms/batch")
+            print(f"  Loss:        {t_loss_total/n_batches*1000:6.1f}ms/batch")
+            print(f"  Backward:    {t_bwd_total/n_batches*1000:6.1f}ms/batch")
+            print(f"  Optimizer:   {t_opt_total/n_batches*1000:6.1f}ms/batch")
+            print(f"")
+            if use_cuda:
+                peak = torch.cuda.max_memory_allocated() / 1024**3
+                total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                print(f"  --- VRAM ---")
+                print(f"  Peak allocated:  {peak:.1f}GB / {total_vram:.1f}GB ({peak/total_vram*100:.0f}%)")
+                print(f"  Headroom:        {total_vram-peak:.1f}GB")
+                # Estimate max batch size
+                vram_per_sample = (peak - 0.9) / batch_size  # subtract ~0.9GB static
+                max_batch = int((total_vram * 0.9 - 0.9) / vram_per_sample)  # 90% safety margin
+                print(f"  Est. VRAM/sample: {vram_per_sample*1024:.1f}MB")
+                print(f"  Est. max batch:   ~{max_batch} (at 90% VRAM)")
+            print(f"")
+            if grad_norms:
+                gn = np.array(grad_norms)
+                print(f"  --- Gradient norms (sampled every 10 batches) ---")
+                print(f"  Mean: {gn.mean():.2f}  Std: {gn.std():.2f}  Min: {gn.min():.2f}  Max: {gn.max():.2f}")
+                if gn.max() > 100:
+                    print(f"  ⚠ Large gradient norms detected — consider gradient clipping")
+            print(f"  --- RAM ---")
+            import psutil
+            ram = psutil.virtual_memory()
+            print(f"  Used: {ram.used/1024**3:.1f}GB / {ram.total/1024**3:.1f}GB ({ram.percent}%)")
+            disk = shutil.disk_usage("/")
+            print(f"  --- Disk ---")
+            print(f"  Used: {disk.used/1024**3:.1f}GB / {disk.total/1024**3:.1f}GB ({disk.free/1024**3:.1f}GB free)")
+            print(f"{'='*70}\n", flush=True)
 
         scheduler.step()
         train_loss = train_loss_sum / max(train_total, 1)
