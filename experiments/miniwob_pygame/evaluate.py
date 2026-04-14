@@ -260,7 +260,8 @@ def run_agent(
 
     is_expert = isinstance(agent, ExpertAgent)
 
-    for ep in range(num_episodes):
+    from tqdm import tqdm
+    for ep in tqdm(range(num_episodes), desc="  Episodes", leave=False):
         seed = ep + 10000
 
         if is_expert:

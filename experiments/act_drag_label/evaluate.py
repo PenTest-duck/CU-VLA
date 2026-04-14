@@ -242,7 +242,8 @@ def run_agent(
         "loop_times_ms": [],
     }
 
-    for ep in range(num_episodes):
+    from tqdm import tqdm
+    for ep in tqdm(range(num_episodes), desc="  Episodes", leave=False):
         obs = env.reset(seed=ep + 10000)
 
         if hasattr(agent, "bind_env"):
