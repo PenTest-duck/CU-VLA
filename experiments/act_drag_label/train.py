@@ -18,7 +18,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -85,12 +85,16 @@ class ChunkDataset(Dataset):
         self.action_click = action_arrays["action_click"]
         self.action_key = action_arrays["action_key"]
 
-        # Build flat index: every timestep in the selected episodes
+        # Build flat index grouped by episode (sequential within each episode
+        # for memmap-friendly access patterns)
         self.index: list[tuple[int, int]] = []
+        self.episode_ranges: list[tuple[int, int]] = []  # (start_idx, length) per episode
         for eid in sorted(self.episode_offsets):
             _, length = self.episode_offsets[eid]
+            start = len(self.index)
             for t in range(length):
                 self.index.append((eid, t))
+            self.episode_ranges.append((start, length))
 
     def __len__(self) -> int:
         return len(self.index)
@@ -163,6 +167,32 @@ class ChunkDataset(Dataset):
         return obs, proprio, actions_cvae, dx_chunk, dy_chunk, click_chunk, key_chunk, pad_mask
 
 
+class EpisodeSequentialSampler(Sampler[int]):
+    """Shuffle episode order each epoch, but iterate timesteps within each
+    episode sequentially. This produces near-sequential memmap reads
+    (kernel readahead works) while still randomizing training order.
+    """
+
+    def __init__(self, dataset: ChunkDataset, seed: int = 0) -> None:
+        self.episode_ranges = dataset.episode_ranges
+        self.total = len(dataset)
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        ep_order = rng.permutation(len(self.episode_ranges))
+        for ep_idx in ep_order:
+            start, length = self.episode_ranges[ep_idx]
+            yield from range(start, start + length)
+
+    def __len__(self) -> int:
+        return self.total
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+
 # ---------------------------------------------------------------------------
 # Data loading and pre-processing
 # ---------------------------------------------------------------------------
@@ -177,10 +207,10 @@ def load_dataset_splits(
     max_episodes: int | None,
     num_workers: int,
     use_cuda: bool,
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[DataLoader, EpisodeSequentialSampler, DataLoader]:
     """Load dataset, pre-decode images, build DataLoaders.
 
-    Returns (train_loader, val_loader).
+    Returns (train_loader, train_sampler, val_loader).
     """
     from datasets import load_dataset, load_from_disk
 
@@ -241,8 +271,9 @@ def load_dataset_splits(
     val_dataset = ChunkDataset(images, episode_offsets, val_ids, chunk_size, action_arrays)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}", flush=True)
 
+    train_sampler = EpisodeSequentialSampler(train_dataset)
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
+        train_dataset, batch_size=batch_size, sampler=train_sampler,
         num_workers=num_workers, persistent_workers=num_workers > 0,
         pin_memory=use_cuda, prefetch_factor=4 if num_workers > 0 else None,
     )
@@ -251,7 +282,7 @@ def load_dataset_splits(
         num_workers=num_workers, persistent_workers=num_workers > 0,
         pin_memory=use_cuda, prefetch_factor=4 if num_workers > 0 else None,
     )
-    return train_loader, val_loader
+    return train_loader, train_sampler, val_loader
 
 
 def predecode_images(ds) -> np.ndarray:
@@ -679,7 +710,7 @@ def train(
         num_workers = 0
 
     # --- Data ---
-    train_loader, val_loader = load_dataset_splits(
+    train_loader, train_sampler, val_loader = load_dataset_splits(
         hf_data_repo, data_dir, base, checkpoint_dir, chunk_size,
         batch_size, max_episodes, num_workers, use_cuda,
     )
@@ -742,6 +773,7 @@ def train(
     for epoch in range(TRAIN.epochs):
         t0 = time.perf_counter()
         diag = epoch == 0
+        train_sampler.set_epoch(epoch)
 
         # KL weight annealing
         if kl_anneal_epochs > 0:
