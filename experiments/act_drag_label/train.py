@@ -245,16 +245,36 @@ def train(
         images = None
 
     if images is None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         images = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=img_shape)
-        for i in range(n_samples):
-            images[i] = np.array(ds[i]["image"])
-            if (i + 1) % 50000 == 0 or i == 0:
-                elapsed_decode = time.perf_counter() - t_decode
+
+        def _decode_range(start: int, end: int) -> int:
+            """Decode images[start:end] from Arrow into the memmap."""
+            for i in range(start, end):
+                images[i] = np.array(ds[i]["image"])
+            return end - start
+
+        # Split work across threads (PIL PNG decode releases the GIL)
+        n_threads = min(8, os.cpu_count() or 1)
+        chunk = (n_samples + n_threads - 1) // n_threads
+        futures = []
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            for t in range(n_threads):
+                start = t * chunk
+                end = min(start + chunk, n_samples)
+                if start < end:
+                    futures.append(pool.submit(_decode_range, start, end))
+
+            done = 0
+            for future in as_completed(futures):
+                done += future.result()
                 print(
-                    f"  Pre-decoded {i+1}/{n_samples} images "
-                    f"({elapsed_decode:.1f}s elapsed)",
+                    f"  Pre-decoded {done}/{n_samples} images "
+                    f"({time.perf_counter() - t_decode:.1f}s elapsed)",
                     flush=True,
                 )
+
         images.flush()
         images_gb = images.nbytes / 1024**3
         print(
