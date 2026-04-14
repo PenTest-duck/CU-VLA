@@ -144,8 +144,8 @@ class ChunkDataset(Dataset):
         key_chunk = np.zeros(C, dtype=np.int64)
         pad_mask = np.ones(C, dtype=np.float32)  # 1=padded, 0=real
 
-        dx_chunk[:real_len] = self.action_dx[sl]
-        dy_chunk[:real_len] = self.action_dy[sl]
+        dx_chunk[:real_len] = self.action_dx[sl] / ACTION.max_delta_px
+        dy_chunk[:real_len] = self.action_dy[sl] / ACTION.max_delta_px
         click_chunk[:real_len] = self.action_click[sl].astype(np.float32)
         key_chunk[:real_len] = self.action_key[sl].astype(np.int64)
         pad_mask[:real_len] = 0.0
@@ -159,8 +159,8 @@ class ChunkDataset(Dataset):
         # --- Actions for CVAE encoder: (chunk, action_dim) ---
         # action_dim = 2 (dx,dy) + 1 (click) + 28 (key onehot) = 31
         actions_cvae = torch.zeros(C, 2 + 1 + ACTION.num_key_classes)
-        actions_cvae[:real_len, 0] = dx_chunk[:real_len]
-        actions_cvae[:real_len, 1] = dy_chunk[:real_len]
+        actions_cvae[:real_len, 0] = dx_chunk[:real_len]  # already normalized
+        actions_cvae[:real_len, 1] = dy_chunk[:real_len]  # already normalized
         actions_cvae[:real_len, 2] = click_chunk[:real_len]
         actions_cvae[torch.arange(real_len), 3 + key_chunk[:real_len]] = 1.0
 
@@ -735,7 +735,16 @@ def train(
         ],
         weight_decay=TRAIN.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TRAIN.epochs)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-3, total_iters=TRAIN.warmup_epochs,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=TRAIN.epochs - TRAIN.warmup_epochs,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[TRAIN.warmup_epochs],
+    )
 
     # --- AMP ---
     use_amp = TRAIN.use_amp and use_cuda

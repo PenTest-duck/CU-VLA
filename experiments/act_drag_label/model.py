@@ -80,6 +80,7 @@ class ACT(nn.Module):
                 dropout=MODEL.dropout,
                 activation="relu",
                 batch_first=True,
+                norm_first=True,
             ),
             num_layers=MODEL.encoder_layers,
         )
@@ -97,6 +98,7 @@ class ACT(nn.Module):
                 dropout=MODEL.dropout,
                 activation="relu",
                 batch_first=True,
+                norm_first=True,
             ),
             num_layers=MODEL.encoder_layers,
         )
@@ -111,6 +113,7 @@ class ACT(nn.Module):
                 dropout=MODEL.dropout,
                 activation="relu",
                 batch_first=True,
+                norm_first=True,
             ),
             num_layers=MODEL.decoder_layers,
         )
@@ -211,9 +214,9 @@ class ACT(nn.Module):
         queries = self.decoder_pos_enc(queries)  # (B, chunk, d)
         decoded = self.decoder(queries, memory)  # (B, chunk, d)
 
-        # Action heads
-        dx = (self.head_dx(decoded).squeeze(-1)).tanh() * ACTION.max_delta_px
-        dy = (self.head_dy(decoded).squeeze(-1)).tanh() * ACTION.max_delta_px
+        # Action heads — dx/dy in [-1, 1] normalized space (multiply by max_delta_px at inference)
+        dx = self.head_dx(decoded).squeeze(-1).tanh()
+        dy = self.head_dy(decoded).squeeze(-1).tanh()
         click = self.head_click(decoded).squeeze(-1)
         key_logits = self.head_key(decoded)
         pad_logits = self.head_pad(decoded).squeeze(-1)

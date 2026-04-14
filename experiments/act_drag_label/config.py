@@ -79,7 +79,8 @@ class TrainConfig:
     loss_weight_click: float = 5.0
     loss_weight_key: float = 5.0
     loss_weight_pad: float = 1.0
-    grad_clip_norm: float = 10.0
+    grad_clip_norm: float = 100.0
+    warmup_epochs: int = 5
     use_amp: bool = True
 
 @dataclass(frozen=True)

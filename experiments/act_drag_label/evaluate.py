@@ -84,9 +84,9 @@ class ACTAgent:
         # Forward (inference: no actions, z=0)
         out = self.model(x, p, actions=None)
 
-        # Extract new chunk as numpy arrays
-        dx_chunk = out["dx"][0].cpu().numpy()          # (chunk_size,)
-        dy_chunk = out["dy"][0].cpu().numpy()          # (chunk_size,)
+        # Extract new chunk as numpy arrays (denormalize dx/dy from [-1,1] to pixels)
+        dx_chunk = out["dx"][0].cpu().numpy() * ACTION.max_delta_px  # (chunk_size,)
+        dy_chunk = out["dy"][0].cpu().numpy() * ACTION.max_delta_px  # (chunk_size,)
         click_chunk = torch.sigmoid(out["click"][0]).cpu().numpy()  # (chunk_size,)
         key_chunk = out["key_logits"][0].cpu().numpy()  # (chunk_size, 28)
 
