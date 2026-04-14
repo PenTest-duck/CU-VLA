@@ -63,9 +63,9 @@ class ACTAgent:
             backbone_name=backbone,
             chunk_size=chunk_size,
         ).to(self.device)
-        self.model.load_state_dict(
-            torch.load(checkpoint, map_location=self.device, weights_only=True)
-        )
+        state = torch.load(checkpoint, map_location=self.device, weights_only=True)
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        self.model.load_state_dict(state)
         self.model.eval()
         self.active_chunks: list[dict] = []
 
@@ -147,9 +147,9 @@ class BaselineCNNAgent:
     def __init__(self, checkpoint: str, device: str = "cpu") -> None:
         self.device = torch.device(device)
         self.model = BaselineCNN().to(self.device)
-        self.model.load_state_dict(
-            torch.load(checkpoint, map_location=self.device, weights_only=True)
-        )
+        state = torch.load(checkpoint, map_location=self.device, weights_only=True)
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        self.model.load_state_dict(state)
         self.model.eval()
 
     def reset(self) -> None:

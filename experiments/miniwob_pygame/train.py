@@ -529,7 +529,8 @@ def train(
             best_val_loss = val_loss
             epochs_without_improvement = 0
             best_pt_path = os.path.join(checkpoint_dir, "best.pt")
-            torch.save(model.state_dict(), best_pt_path)
+            state = {k.removeprefix("_orig_mod."): v for k, v in model.state_dict().items()}
+            torch.save(state, best_pt_path)
             # Upload best checkpoint async so training continues immediately
             if hf_upload_repo:
                 import logging
@@ -576,7 +577,8 @@ def train(
             break
 
     # Save final
-    torch.save(model.state_dict(), os.path.join(checkpoint_dir, "final.pt"))
+    state = {k.removeprefix("_orig_mod."): v for k, v in model.state_dict().items()}
+    torch.save(state, os.path.join(checkpoint_dir, "final.pt"))
     torch.save(history, os.path.join(checkpoint_dir, "history.pt"))
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints saved to: {checkpoint_dir}")
