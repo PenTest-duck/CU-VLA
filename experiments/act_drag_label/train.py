@@ -522,6 +522,8 @@ def _run_train_epoch(
         # --- Backward ---
         optimizer.zero_grad()
         scaler.scale(total_loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TRAIN.grad_clip_norm)
 
         if diag:
             if use_cuda:
