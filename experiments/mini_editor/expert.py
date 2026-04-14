@@ -1,4 +1,8 @@
-"""Expert movement primitives with human-like variance for Experiment 5."""
+"""Expert policy for Experiment 5: Mini Text Editor.
+
+Contains both low-level movement primitives (Fitts's Law with human variance)
+and the high-level episode state machine for all 4 edit operations.
+"""
 
 from __future__ import annotations
 
@@ -443,3 +447,248 @@ def shift_click_actions(
     actions.append(noop_action())
 
     return actions
+
+
+# -----------------------------------------------------------------------
+# Episode state machine — generates full trajectories for 4 operations
+# -----------------------------------------------------------------------
+
+
+def simulate_cursor(actions: list[dict], start_x: float, start_y: float) -> tuple[float, float]:
+    """Simulate final cursor position after replaying a sequence of actions."""
+    x, y = start_x, start_y
+    for a in actions:
+        x = float(np.clip(x + a["dx"], 0, ENV.window_w - 1))
+        y = float(np.clip(y + a["dy"], 0, ENV.window_h - 1))
+    return x, y
+
+
+def generate_episode_trajectory(
+    env,
+    instruction,
+    rng: np.random.Generator,
+) -> list[dict]:
+    """Generate a complete expert trajectory for one episode.
+
+    Args:
+        env: A MiniEditorEnv that has been reset() with the episode text.
+        instruction: An EditInstruction with target word positions and operation.
+        rng: Numpy random generator.
+
+    Returns:
+        List of action dicts for the full episode.
+    """
+    op = instruction.operation
+    cx, cy = env.cursor_pos
+
+    # Pixel positions of target word boundaries
+    word_start_px = env._char_pos_to_pixel(instruction.target_word_start)
+    word_end_px = env._char_pos_to_pixel(instruction.target_word_end)
+    word_width_px = abs(word_end_px[0] - word_start_px[0])
+    target_width = max(word_width_px, 10.0)  # minimum target width for Fitts
+
+    trajectory: list[dict] = []
+
+    # --- Phase 0: Reading pause ---
+    trajectory.extend(
+        pause_actions(rng, EXPERT.reading_pause_lo, EXPERT.reading_pause_hi)
+    )
+    cx, cy = simulate_cursor(trajectory, *env.cursor_pos)
+
+    if op == "click":
+        trajectory.extend(
+            _trajectory_click(cx, cy, word_end_px, target_width, rng)
+        )
+
+    elif op == "click_type":
+        # Click after word, then type new text
+        click_traj = _trajectory_click(cx, cy, word_end_px, target_width, rng)
+        trajectory.extend(click_traj)
+        cx, cy = simulate_cursor(click_traj, cx, cy)
+
+        # Pause before typing
+        pause = pause_actions(rng, EXPERT.post_click_pause_lo, EXPERT.post_click_pause_hi)
+        trajectory.extend(pause)
+
+        # Type the new text
+        speed_mult = float(rng.uniform(EXPERT.typing_speed_lo, EXPERT.typing_speed_hi))
+        trajectory.extend(type_string_actions(instruction.new_text, rng, speed_mult))
+
+    elif op == "select_delete":
+        select_traj = _trajectory_select_word(
+            cx, cy, word_start_px, word_end_px, target_width, rng
+        )
+        trajectory.extend(select_traj)
+
+        # Pause before delete
+        pause = pause_actions(rng, EXPERT.post_select_pause_lo, EXPERT.post_select_pause_hi)
+        trajectory.extend(pause)
+
+        # Press Delete
+        trajectory.extend(_delete_key_actions())
+
+    elif op == "replace":
+        select_traj = _trajectory_select_word(
+            cx, cy, word_start_px, word_end_px, target_width, rng
+        )
+        trajectory.extend(select_traj)
+
+        # Pause before typing replacement
+        pause = pause_actions(rng, EXPERT.post_select_pause_lo, EXPERT.post_select_pause_hi)
+        trajectory.extend(pause)
+
+        # Type replacement (first char replaces selection)
+        speed_mult = float(rng.uniform(EXPERT.typing_speed_lo, EXPERT.typing_speed_hi))
+        trajectory.extend(type_string_actions(instruction.new_text, rng, speed_mult))
+
+    return trajectory
+
+
+def _trajectory_click(
+    cx: float, cy: float,
+    target_px: tuple[float, float],
+    target_width: float,
+    rng: np.random.Generator,
+) -> list[dict]:
+    """Move to target position and click.
+
+    After the Fitts trajectory, a correction nudge is appended to ensure
+    the cursor is within ``click_scatter_px`` of the target. The dwell
+    frames in ``click_actions`` give the env a clean click position.
+    """
+    actions: list[dict] = []
+
+    # Move to target
+    move = fitts_trajectory_human(
+        cx, cy, target_px[0], target_px[1], target_width, rng
+    )
+    actions.extend(move)
+    cur_x, cur_y = simulate_cursor(move, cx, cy)
+
+    # Correction nudge: ensure we're close enough to the target pixel
+    err_x = target_px[0] - cur_x
+    err_y = target_px[1] - cur_y
+    if abs(err_x) > 2.0 or abs(err_y) > 2.0:
+        actions.append({
+            "dx": float(np.clip(err_x, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "dy": float(np.clip(err_y, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "mouse_left": 0,
+            "keys_held": [0] * NUM_KEYS,
+        })
+
+    # Click
+    actions.extend(click_actions(rng))
+
+    return actions
+
+
+def _trajectory_select_word(
+    cx: float, cy: float,
+    word_start_px: tuple[float, float],
+    word_end_px: tuple[float, float],
+    target_width: float,
+    rng: np.random.Generator,
+) -> list[dict]:
+    """Move to word start, click, then shift+click at word end to select."""
+    actions: list[dict] = []
+
+    # Move to word start + correction nudge
+    move_start = fitts_trajectory_human(
+        cx, cy, word_start_px[0], word_start_px[1], target_width, rng
+    )
+    actions.extend(move_start)
+    cx, cy = simulate_cursor(move_start, cx, cy)
+
+    # Correction nudge for start position
+    err_x = word_start_px[0] - cx
+    err_y = word_start_px[1] - cy
+    if abs(err_x) > 2.0 or abs(err_y) > 2.0:
+        nudge = {
+            "dx": float(np.clip(err_x, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "dy": float(np.clip(err_y, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "mouse_left": 0,
+            "keys_held": [0] * NUM_KEYS,
+        }
+        actions.append(nudge)
+        cx, cy = simulate_cursor([nudge], cx, cy)
+
+    # Click at word start (sets text cursor)
+    actions.extend(click_actions(rng))
+
+    # Pause
+    actions.extend(pause_actions(rng, EXPERT.pause_min, EXPERT.pause_max))
+
+    # Move to word end + correction nudge
+    move_end = fitts_trajectory_human(
+        cx, cy, word_end_px[0], word_end_px[1], target_width, rng
+    )
+    actions.extend(move_end)
+    cx, cy = simulate_cursor(move_end, cx, cy)
+
+    # Correction nudge for end position
+    err_x = word_end_px[0] - cx
+    err_y = word_end_px[1] - cy
+    if abs(err_x) > 2.0 or abs(err_y) > 2.0:
+        nudge = {
+            "dx": float(np.clip(err_x, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "dy": float(np.clip(err_y, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "mouse_left": 0,
+            "keys_held": [0] * NUM_KEYS,
+        }
+        actions.append(nudge)
+
+    # Shift+click at word end (extends selection)
+    actions.extend(shift_click_actions(KEY_LSHIFT, rng))
+
+    return actions
+
+
+def _delete_key_actions() -> list[dict]:
+    """Press and release the Delete key."""
+    k_down = [0] * NUM_KEYS
+    k_down[KEY_DELETE] = 1
+    return [
+        {"dx": 0.0, "dy": 0.0, "mouse_left": 0, "keys_held": k_down},
+        noop_action(),
+    ]
+
+
+# -----------------------------------------------------------------------
+# Episode replay — runs trajectory through env, records observations
+# -----------------------------------------------------------------------
+
+
+def run_episode(
+    env,
+    trajectory: list[dict],
+) -> tuple[list[dict], list[dict], dict]:
+    """Replay a pre-computed trajectory in an already-reset environment.
+
+    Args:
+        env: A MiniEditorEnv that has been reset().
+        trajectory: List of action dicts to replay.
+
+    Returns:
+        observations: List of obs dicts (obs[t] = state when action[t] was chosen).
+        actions: List of action dicts that were executed.
+        final_info: Info dict from the terminal step.
+    """
+    obs = env._get_observation()
+    observations = [obs]
+    actions: list[dict] = []
+    final_info: dict = {}
+
+    for action in trajectory:
+        obs, done, info = env.step(action)
+        observations.append(obs)
+        actions.append(action)
+        if done:
+            final_info = info
+            break
+
+    if not final_info and actions:
+        final_info = info  # type: ignore[possibly-undefined]
+
+    # Trim: obs[t] is the state when action[t] was chosen
+    observations = observations[: len(actions)]
+    return observations, actions, final_info
