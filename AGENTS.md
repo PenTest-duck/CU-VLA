@@ -14,7 +14,7 @@ When asking questions or brainstorming or making decisions, use AskUserQuestion 
 
 Don't be lazy whenever you perform a task.
 
-When you perform some major task, made some big decision, or wrote significant plan, get a comprehensive, critical review from a second AI model by running `agent --model=auto --output-format=text --mode=ask -p "<prompt>"`. Then look through the results and ask the user on flagged areas and whether/how to incorporate them. You must get explicit approval for every feedback item you wish to incorporate.
+When you perform some major task, made some big decision, or wrote significant plan, get a comprehensive, critical review from a second AI model by running `agent --model=gpt-5.4-xhigh --output-format=text --mode=ask -p "<prompt>"`. Then look through the results and ask the user on flagged areas and whether/how to incorporate them. You must get explicit approval for every feedback item you wish to incorporate.
 
 You are encouraged to perform web research to ground yourself in latest literature/information/documentation using tools e.g. WebFetch, WebSearch, Firecrawl, Exa, context7.
 
@@ -39,6 +39,8 @@ Serves as a high-level table of contents.
 | `docs/experiments/3-miniwob-pygame.md` | Experiment 3 design doc — MiniWoB-Pygame unified task suite |
 | `docs/plans/2026-04-13-miniwob-pygame-implementation.md` | Experiment 3 implementation plan |
 | `experiments/miniwob_pygame/` | Experiment 3 code (see below) |
+| `docs/plans/2026-04-14-mini-editor-design.md` | Experiment 5 full design doc — mini text editor task for V+L+A |
+| `experiments/mini_editor/` | Experiment 5 code (see below) |
 | `scripts/launch_hf_job.py` | Launcher for HF Jobs training (calls `run_uv_job()`) |
 | `scripts/hf_job_train.py` | UV script that runs inside HF Jobs (clones repo, runs train.py) |
 | `scripts/migrate_hdf5_to_parquet.py` | One-shot migration from HDF5 episodes to parquet |
@@ -142,12 +144,12 @@ uv run python experiments/miniwob_pygame/generate_data.py --tasks all -n 5000
 | `tasks/*.py` | 12 task environments (Phase 1-3) |
 | `experts/common.py` | Fitts's Law trajectory, shared expert utilities |
 | `experts/*.py` | 12 scripted expert policies |
-| `model.py` | `ACT` — CVAE + transformer, multi-binary action heads (~33M params) |
+| `model.py` | `ACT` — FiLM + transformer encoder-decoder, 49-bin discrete dx/dy + multi-binary key heads (~28M params) |
 | `baseline_cnn.py` | `BaselineCNN` — 4-conv single-step baseline (~6.5M params) |
 | `backbones.py` | ResNet18, DINOv2 ViT-S/14, SigLIP2 vision backbones |
-| `generate_data.py` | Multi-task HDF5 expert demonstration generation |
-| `train.py` | Behavior cloning: chunk sampling, multi-head BCE loss, KL annealing |
-| `evaluate.py` | Per-task and aggregate metrics, temporal ensemble inference |
+| `generate_data.py` | Multi-task expert demonstration generation (parquet via HF datasets) |
+| `train.py` | BC training: soft CE on bins + EV L1 + BCE for mouse/keys, warmup+cosine LR, grad clip, memmap image cache |
+| `evaluate.py` | Per-task and aggregate metrics, probability-ensemble temporal smoothing, HF checkpoint download |
 | `hf_sync.py` | Upload/download data and checkpoints to HuggingFace Hub |
 
 **Action space (multi-binary held state):**
@@ -171,6 +173,52 @@ action = {
 
 **Design doc:** `docs/experiments/3-miniwob-pygame.md`
 **Implementation plan:** `docs/plans/2026-04-13-miniwob-pygame-implementation.md`
+
+## Experiment 5: Mini Text Editor
+
+First V+L+A task: a Pygame text editor where the model must execute natural language edit instructions using low-level mouse + keyboard primitives at 30 Hz. Tests vision (locate words), language (parse instruction), and action (multi-step motor sequences) simultaneously.
+
+**Run sequence:**
+```bash
+uv run python -m experiments.mini_editor.generate_data -n 100 -o data/mini_editor_test  # small test
+uv run python -m experiments.mini_editor.generate_data -n 10000 -o data/mini_editor       # full dataset
+```
+
+**Code layout:**
+| File | Purpose |
+|------|---------|
+| `config.py` | 53-key Mac keyboard constants, shift mapping tables, env/expert/train configs |
+| `corpus.py` | Load + filter `agentlans/high-quality-english-sentences`, word extraction, passage assembly |
+| `instructions.py` | 4 edit operations (click, click+type, select+delete, replace), template phrasings |
+| `env.py` | `MiniEditorEnv` — 640×480 Pygame editor, physical keyboard edge detection, 512×384 obs |
+| `expert.py` | Fitts's Law + human variance (curvature, overshoot, typing rhythm), episode state machine |
+| `generate_data.py` | Expert demo generation → HF Dataset (parquet), JPEG q=95 screenshots |
+
+**Action space (53-key physical Mac keyboard held-state):**
+```python
+action = {
+    "dx": float,           # cursor delta, 49 discrete exponential bins
+    "dy": float,           # cursor delta, 49 discrete exponential bins
+    "mouse_left": int,     # 0=released, 1=held
+    "keys_held": [53],     # binary per physical key:
+                           #   0-25: A-Z, 26-35: 0-9, 36-46: symbol keys,
+                           #   47: LShift, 48: RShift, 49: Space,
+                           #   50: Delete, 51: Return, 52: Tab
+}
+```
+
+**Observation space:**
+```python
+observation = {
+    "screenshot": np.ndarray,  # (384, 512, 3) uint8 RGB
+    "proprio": np.ndarray,     # (56,) float32: cursor_xy(2) + mouse_left(1) + keys_held(53)
+    "instruction": str,        # NL instruction (NOT rendered on screen)
+}
+```
+
+**4 operations:** click-to-position, click+type, select+delete (shift+click), replace
+
+**Design doc:** `docs/plans/2026-04-14-mini-editor-design.md`
 
 ## Key Technical Decisions (from research)
 
