@@ -29,8 +29,8 @@ def main() -> None:
         description="Launch HF Jobs training",
         usage="%(prog)s [launcher-options] -- [train.py options]",
     )
-    parser.add_argument("--flavor", type=str, default="1x-l4",
-                        help="HF Jobs hardware flavor (default: 1x-l4)")
+    parser.add_argument("--flavor", type=str, default="l4x1",
+                        help="HF Jobs hardware flavor (default: l4x1)")
     parser.add_argument("--timeout", type=str, default="12h",
                         help="Job timeout (default: 12h)")
     parser.add_argument("--namespace", type=str, default=None,
