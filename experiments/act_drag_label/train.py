@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from experiments.act_drag_label.config import ACTION, BIN_CENTERS, CHUNK, ENV, NUM_BINS, TRAIN
+from experiments.act_drag_label.config import ACTION, BIN_CENTERS, CHUNK, ENV, NUM_BINS, SOFT_BIN_TARGETS, TRAIN
 from experiments.act_drag_label.model import ACT, count_parameters
 
 
@@ -368,25 +368,51 @@ def compute_losses(
     click_gt: torch.Tensor,
     key_gt: torch.Tensor,
     pad_gt: torch.Tensor,
+    _soft_targets: torch.Tensor | None = None,
+    _bin_centers: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute all loss components from model output and ground truth.
 
     Returns (total_loss, head_losses) where head_losses has keys:
-    dx, dy, click, key, pad (raw, before weighting).
-    dx/dy use cross-entropy over NUM_BINS=49 discrete bin logits.
+    dx, dy, click, key, pad, ev (raw, before weighting).
+    dx/dy use Gaussian-smoothed soft CE + expected-value L1 loss.
     """
     mask = 1.0 - pad_gt
     mask_sum = mask.sum().clamp(min=1)
     B, C_chunk = dx_gt.shape
     mask_flat = mask.reshape(B * C_chunk)
+    mask_flat_sum = mask_flat.sum().clamp(min=1)
 
-    loss_dx = (
-        F.cross_entropy(out["dx_logits"].reshape(B * C_chunk, -1), dx_gt.reshape(B * C_chunk), reduction="none") * mask_flat
-    ).sum() / mask_flat.sum().clamp(min=1)
+    # Lazy-init soft targets and bin centers on correct device
+    if _soft_targets is None:
+        _soft_targets = torch.from_numpy(SOFT_BIN_TARGETS).to(dx_gt.device)
+    if _bin_centers is None:
+        _bin_centers = torch.from_numpy(BIN_CENTERS).to(dx_gt.device)
 
-    loss_dy = (
-        F.cross_entropy(out["dy_logits"].reshape(B * C_chunk, -1), dy_gt.reshape(B * C_chunk), reduction="none") * mask_flat
-    ).sum() / mask_flat.sum().clamp(min=1)
+    # dx/dy: Gaussian-smoothed soft cross-entropy
+    dx_logits_flat = out["dx_logits"].reshape(B * C_chunk, -1)  # (N, 49)
+    dy_logits_flat = out["dy_logits"].reshape(B * C_chunk, -1)
+    dx_gt_flat = dx_gt.reshape(B * C_chunk)
+    dy_gt_flat = dy_gt.reshape(B * C_chunk)
+
+    dx_soft = _soft_targets[dx_gt_flat]  # (N, 49) soft target distributions
+    dy_soft = _soft_targets[dy_gt_flat]
+    dx_log_probs = F.log_softmax(dx_logits_flat, dim=-1)
+    dy_log_probs = F.log_softmax(dy_logits_flat, dim=-1)
+    loss_dx = (-(dx_soft * dx_log_probs).sum(dim=-1) * mask_flat).sum() / mask_flat_sum
+    loss_dy = (-(dy_soft * dy_log_probs).sum(dim=-1) * mask_flat).sum() / mask_flat_sum
+
+    # dx/dy: expected-value L1 loss (pixel accuracy)
+    dx_probs = F.softmax(dx_logits_flat, dim=-1)
+    dy_probs = F.softmax(dy_logits_flat, dim=-1)
+    dx_ev = (dx_probs * _bin_centers).sum(dim=-1)  # predicted px
+    dy_ev = (dy_probs * _bin_centers).sum(dim=-1)
+    dx_gt_px = _bin_centers[dx_gt_flat]  # ground truth px
+    dy_gt_px = _bin_centers[dy_gt_flat]
+    loss_ev = (
+        (F.l1_loss(dx_ev, dx_gt_px, reduction="none") * mask_flat).sum()
+        + (F.l1_loss(dy_ev, dy_gt_px, reduction="none") * mask_flat).sum()
+    ) / mask_flat_sum
 
     loss_click = (
         F.binary_cross_entropy_with_logits(out["click"], click_gt, reduction="none") * mask
@@ -396,18 +422,22 @@ def compute_losses(
     key_gt_flat = key_gt.reshape(B * C_chunk)
     loss_key = (
         F.cross_entropy(key_logits_flat, key_gt_flat, reduction="none") * mask_flat
-    ).sum() / mask_flat.sum().clamp(min=1)
+    ).sum() / mask_flat_sum
 
     loss_pad = F.binary_cross_entropy_with_logits(out["pad_logits"], pad_gt)
 
     total_loss = (
         loss_dx + loss_dy
+        + TRAIN.loss_weight_ev * loss_ev
         + TRAIN.loss_weight_click * loss_click
         + TRAIN.loss_weight_key * loss_key
         + TRAIN.loss_weight_pad * loss_pad
     )
 
-    head_losses = {"dx": loss_dx, "dy": loss_dy, "click": loss_click, "key": loss_key, "pad": loss_pad}
+    head_losses = {
+        "dx": loss_dx, "dy": loss_dy, "ev": loss_ev,
+        "click": loss_click, "key": loss_key, "pad": loss_pad,
+    }
     return total_loss, head_losses
 
 
@@ -499,7 +529,7 @@ def _run_train_epoch(
     """Run one training epoch. Returns (avg_loss, head_sums, total_samples)."""
     model.train()
     loss_sum = 0.0
-    head_sums = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0}
+    head_sums = {"dx": 0.0, "dy": 0.0, "ev": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0}
     total = 0
     n_batches = len(train_loader)
 
@@ -624,7 +654,7 @@ def _run_val_epoch(
     """Run one validation epoch. Returns (avg_loss, head_sums, total_samples)."""
     model.train(False)
     loss_sum = 0.0
-    head_sums = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0}
+    head_sums = {"dx": 0.0, "dy": 0.0, "ev": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0}
     total = 0
 
     with torch.no_grad():
@@ -773,7 +803,7 @@ def train(
           f"({disk.free/1024**3:.1f}GB free)", flush=True)
 
     # --- Training loop ---
-    head_names = ["dx", "dy", "click", "key", "pad"]
+    head_names = ["dx", "dy", "ev", "click", "key", "pad"]
     history: dict[str, list] = {
         "train_loss": [], "val_loss": [],
         **{f"train_{h}": [] for h in head_names},

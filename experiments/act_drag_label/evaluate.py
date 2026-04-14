@@ -69,9 +69,11 @@ class ACTAgent:
         self.model.load_state_dict(state)
         self.model.train(False)  # put model in inference mode
         self.active_chunks: list[dict] = []
+        self._last_key: int = 0  # for duplicate suppression (edge detection)
 
     def reset(self) -> None:
         self.active_chunks = []
+        self._last_key = 0
 
     @torch.no_grad()
     def act(self, obs: np.ndarray, proprio: np.ndarray) -> dict:
@@ -104,28 +106,41 @@ class ACTAgent:
         blended_click = 0.0
         blended_key = np.zeros(ACTION.num_key_classes, dtype=np.float32)
 
+        key_decay = 0.5  # much faster decay for keys (vs 0.01 for dx/dy)
+        total_w_key = 0.0
+
         for chunk in self.active_chunks:
             age = chunk["age"]
             if age >= self.chunk_size:
                 continue
             w = np.exp(-CHUNK.ensemble_decay * age)
+            w_key = np.exp(-key_decay * age)
             total_w += w
+            total_w_key += w_key
             blended_dx += w * chunk["dx_probs"][age]
             blended_dy += w * chunk["dy_probs"][age]
             blended_click += w * chunk["click"][age]
-            blended_key += w * chunk["key_probs"][age]
+            blended_key += w_key * chunk["key_probs"][age]
 
         if total_w > 0:
             blended_dx /= total_w
             blended_dy /= total_w
             blended_click /= total_w
-            blended_key /= total_w
+        if total_w_key > 0:
+            blended_key /= total_w_key
 
         # Expected value: dot product of blended distribution with bin centers
         dx_out = float(np.dot(blended_dx, BIN_CENTERS))
         dy_out = float(np.dot(blended_dy, BIN_CENTERS))
         click_out = 1 if blended_click > 0.5 else 0
-        key_out = int(np.argmax(blended_key))
+        # Key: type if model assigns meaningful probability to any key.
+        # Duplicate suppression: only register on transition (none→letter),
+        # simulating held-state edge detection like a physical keyboard.
+        p_none = blended_key[0]
+        best_key = int(np.argmax(blended_key[1:])) + 1
+        raw_key = best_key if p_none < 0.9 else 0
+        key_out = raw_key if raw_key != self._last_key else 0
+        self._last_key = raw_key
 
         # Increment ages and prune
         for chunk in self.active_chunks:

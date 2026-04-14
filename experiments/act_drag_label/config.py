@@ -79,6 +79,8 @@ class TrainConfig:
     loss_weight_click: float = 2.0
     loss_weight_key: float = 2.0
     loss_weight_pad: float = 1.0
+    bin_smooth_sigma: float = 1.5  # Gaussian label smoothing σ in bin units
+    loss_weight_ev: float = 1.0    # weight for expected-value L1 loss on dx/dy
     grad_clip_norm: float = 100.0
     warmup_epochs: int = 5
     use_amp: bool = True
@@ -124,3 +126,19 @@ def build_bin_centers() -> np.ndarray:
 
 BIN_CENTERS = build_bin_centers()  # (49,) — shared constant
 NUM_BINS = 2 * ACTION.num_bins_per_side + 1  # 49
+
+def build_soft_bin_targets(sigma: float) -> np.ndarray:
+    """Precompute Gaussian-smoothed soft targets for each bin.
+
+    Returns: (49, 49) array where row i is the soft target distribution
+    when the true bin is i. Respects bin ordering — adjacent bins get
+    more credit than distant bins.
+    """
+    arange = np.arange(NUM_BINS, dtype=np.float64)
+    # Gaussian kernel: soft_targets[i, j] = exp(-0.5 * ((i-j)/sigma)^2)
+    diff = arange[None, :] - arange[:, None]
+    soft = np.exp(-0.5 * (diff / sigma) ** 2)
+    soft /= soft.sum(axis=1, keepdims=True)
+    return soft.astype(np.float32)
+
+SOFT_BIN_TARGETS = build_soft_bin_targets(TRAIN.bin_smooth_sigma)  # (49, 49)
