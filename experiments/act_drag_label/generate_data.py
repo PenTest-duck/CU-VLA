@@ -23,6 +23,10 @@ FEATURES = Features(
         "episode_id": Value("int32"),
         "timestep": Value("int32"),
         "image": Image(),
+        "cursor_x": Value("float32"),
+        "cursor_y": Value("float32"),
+        "state_click": Value("int8"),
+        "state_key": Value("int8"),
         "action_dx": Value("float32"),
         "action_dy": Value("float32"),
         "action_click": Value("int8"),
@@ -47,7 +51,7 @@ def _episode_generator(
     t0 = time.perf_counter()
 
     for ep in range(num_episodes):
-        observations, actions, info = run_episode(env, seed=ep, rng=rng)
+        observations, actions, states, info = run_episode(env, seed=ep, rng=rng)
 
         if not info:
             continue
@@ -66,6 +70,10 @@ def _episode_generator(
                 "episode_id": ep,
                 "timestep": t,
                 "image": PILImage.fromarray(observations[t]),
+                "cursor_x": float(states[t]["cursor_x"]),
+                "cursor_y": float(states[t]["cursor_y"]),
+                "state_click": int(states[t]["click_state"]),
+                "state_key": int(states[t]["key_state"]),
                 "action_dx": float(actions[t]["dx"]),
                 "action_dy": float(actions[t]["dy"]),
                 "action_click": int(actions[t]["click"]),

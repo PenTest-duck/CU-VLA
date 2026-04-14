@@ -79,6 +79,8 @@ class ChunkDataset(Dataset):
         }
         self.cursor_x = action_arrays["cursor_x"]
         self.cursor_y = action_arrays["cursor_y"]
+        self.state_click = action_arrays["state_click"]
+        self.state_key = action_arrays["state_key"]
         self.action_dx = action_arrays["action_dx"]
         self.action_dy = action_arrays["action_dy"]
         self.action_click = action_arrays["action_click"]
@@ -115,11 +117,11 @@ class ChunkDataset(Dataset):
         row = self.ds[row_idx]
         obs = torch.from_numpy(np.array(row["image"])).permute(2, 0, 1).float() / 255.0
 
-        # --- Proprioception at time t (from pre-extracted numpy) ---
+        # --- Proprioception at time t (env state before action, matches eval) ---
         cx_norm = float(self.cursor_x[row_idx]) / ENV.window_size
         cy_norm = float(self.cursor_y[row_idx]) / ENV.window_size
-        click_t = float(self.action_click[row_idx])
-        key_t = int(self.action_key[row_idx])
+        click_t = float(self.state_click[row_idx])
+        key_t = int(self.state_key[row_idx])
         key_onehot = np.zeros(ACTION.num_key_classes, dtype=np.float32)
         key_onehot[key_t] = 1.0
         proprio = np.zeros(31, dtype=np.float32)
@@ -208,6 +210,8 @@ def train(
     action_arrays = {
         "cursor_x": np.array(ds["cursor_x"], dtype=np.float32),
         "cursor_y": np.array(ds["cursor_y"], dtype=np.float32),
+        "state_click": np.array(ds["state_click"], dtype=np.int8),
+        "state_key": np.array(ds["state_key"], dtype=np.int8),
         "action_dx": np.array(ds["action_dx"], dtype=np.float32),
         "action_dy": np.array(ds["action_dy"], dtype=np.float32),
         "action_click": np.array(ds["action_click"], dtype=np.int8),

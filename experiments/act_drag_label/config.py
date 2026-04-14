@@ -17,7 +17,7 @@ class EnvConfig:
     obs_size: int = 224
     bg_color: tuple[int, int, int] = (30, 30, 30)
     cursor_color: tuple[int, int, int] = (255, 255, 255)
-    cursor_radius: int = 3
+    cursor_radius: int = 10
     shape_width_min: int = 60
     shape_width_max: int = 80
     shape_height: int = 50

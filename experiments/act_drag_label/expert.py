@@ -203,7 +203,7 @@ def run_episode(
     env,
     seed: int | None = None,
     rng: np.random.Generator | None = None,
-) -> tuple[list[np.ndarray], list[dict], dict]:
+) -> tuple[list[np.ndarray], list[dict], list[dict], dict]:
     """Run a full expert episode in the environment.
 
     Args:
@@ -214,6 +214,8 @@ def run_episode(
     Returns:
         observations: List of numpy observation arrays.
         actions: List of action dicts.
+        states: List of state dicts with cursor_x, cursor_y, click_state, key_state
+                — the env state when each action was chosen.
         final_info: Info dict from the terminal step.
     """
     if rng is None:
@@ -224,13 +226,24 @@ def run_episode(
         *env.cursor_pos, env.shapes, env.zones, rng=rng
     )
 
+    def _capture_state():
+        cx, cy = env.cursor_pos
+        return {
+            "cursor_x": cx,
+            "cursor_y": cy,
+            "click_state": env._click_state,
+            "key_state": env._current_key,
+        }
+
     observations = [obs]
+    states = [_capture_state()]
     actions = []
     final_info = {}
 
     for action in trajectory:
         obs, done, info = env.step(action)
         observations.append(obs)
+        states.append(_capture_state())
         actions.append(action)
         if done:
             final_info = info
@@ -242,4 +255,5 @@ def run_episode(
     # Trim to T observations for T actions: obs[t] is the state when action[t] was chosen.
     # The terminal observation (after last action) is discarded — it has no action pair.
     observations = observations[:len(actions)]
-    return observations, actions, final_info
+    states = states[:len(actions)]
+    return observations, actions, states, final_info

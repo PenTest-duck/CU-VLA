@@ -30,3 +30,9 @@ How to have continuous memory window over past states?
 Take inspiration from other uses like gaming, e.g. JARVIS-VLA
 
 Frequency domain
+
+FAST tokeniser
+
+Typing test
+
+Don't clip cursor delta_x, delta_y at 50px/frame?

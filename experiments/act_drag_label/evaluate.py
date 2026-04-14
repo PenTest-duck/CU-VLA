@@ -18,6 +18,7 @@ if __name__ == "__main__":
 from experiments.act_drag_label.config import (
     ACTION, CHUNK, ENV, EVAL_CFG,
 )
+
 from experiments.act_drag_label.env import DragLabelEnv
 from experiments.act_drag_label.model import ACT
 from experiments.act_drag_label.baseline_cnn import BaselineCNN
@@ -38,7 +39,7 @@ def build_proprio(env: DragLabelEnv) -> np.ndarray:
     key_oh = np.zeros(28, dtype=np.float32)
     key_oh[key] = 1.0
     return np.concatenate([
-        [cx / 400.0, cy / 400.0, float(click)],
+        [cx / ENV.window_size, cy / ENV.window_size, float(click)],
         key_oh,
     ])
 

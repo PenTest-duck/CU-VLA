@@ -14,7 +14,7 @@ When asking questions or brainstorming or making decisions, use AskUserQuestion 
 
 Don't be lazy whenever you perform a task.
 
-When you perform some major task, made some big decision, or wrote significant plan, get a comprehensive, critical review from a second AI model by running `agent --model=auto --output-format=text --mode=ask -p "<prompt>"`. Then look through the results and ask the user on flagged areas and whether/how to incorporate them.
+When you perform some major task, made some big decision, or wrote significant plan, get a comprehensive, critical review from a second AI model by running `agent --model=auto --output-format=text --mode=ask -p "<prompt>"`. Then look through the results and ask the user on flagged areas and whether/how to incorporate them. You must get explicit approval for every feedback item you wish to incorporate.
 
 You are encouraged to perform web research to ground yourself in latest literature/information/documentation using tools e.g. WebFetch, WebSearch, Firecrawl, Exa, context7.
 
