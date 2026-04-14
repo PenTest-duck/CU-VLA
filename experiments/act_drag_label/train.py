@@ -224,7 +224,7 @@ def train(
     n_samples = len(ds)
     obs_size = ENV.obs_size
     img_shape = (n_samples, obs_size, obs_size, 3)
-    memmap_path = os.path.join(checkpoint_dir, "images_cache.dat")
+    memmap_path = os.path.join("/tmp", "images_cache.dat")
     t_decode = time.perf_counter()
 
     if os.path.exists(memmap_path):
