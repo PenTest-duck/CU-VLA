@@ -618,7 +618,7 @@ def _run_val_epoch(
     return loss_sum / max(total, 1), head_sums, total
 
 
-def _upload_checkpoint_async(hf_upload_repo, path, backbone, chunk_size, val_loss):
+def _upload_checkpoint_async(hf_upload_repo, path, repo_prefix, val_loss):
     """Upload best.pt to HF Hub in a background thread."""
     import logging
     import threading
@@ -634,7 +634,7 @@ def _upload_checkpoint_async(hf_upload_repo, path, backbone, chunk_size, val_los
             api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
             api.upload_file(
                 path_or_fileobj=path,
-                path_in_repo=f"{backbone}_chunk{chunk_size}/best.pt",
+                path_in_repo=f"{repo_prefix}/best.pt",
                 repo_id=hf_upload_repo,
                 repo_type="model",
             )
@@ -660,7 +660,10 @@ def train(
     hf_data_repo: str | None = None,
     hf_upload_repo: str | None = None,
 ) -> None:
+    from datetime import datetime, timezone
     base = os.path.dirname(__file__)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    repo_prefix = f"{backbone}_chunk{chunk_size}/{run_id}"
 
     if checkpoint_dir is None:
         checkpoint_dir = os.path.join(base, "checkpoints", f"{backbone}_chunk{chunk_size}")
@@ -770,7 +773,7 @@ def train(
             state = {k.removeprefix("_orig_mod."): v for k, v in model.state_dict().items()}
             torch.save(state, best_pt_path)
             if hf_upload_repo:
-                _upload_checkpoint_async(hf_upload_repo, best_pt_path, backbone, chunk_size, val_loss)
+                _upload_checkpoint_async(hf_upload_repo, best_pt_path, repo_prefix, val_loss)
         else:
             epochs_without_improvement += 1
 
@@ -805,11 +808,11 @@ def train(
         from huggingface_hub import HfApi
         api = HfApi()
         api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
-        print(f"Uploading checkpoints to {hf_upload_repo} ...")
+        print(f"Uploading checkpoints to {hf_upload_repo}/{repo_prefix} ...")
         api.upload_folder(
             repo_id=hf_upload_repo, repo_type="model",
             folder_path=checkpoint_dir,
-            path_in_repo=f"{backbone}_chunk{chunk_size}",
+            path_in_repo=repo_prefix,
         )
         print("Upload complete.")
 

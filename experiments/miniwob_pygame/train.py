@@ -229,7 +229,10 @@ def train(
     hf_upload_repo: str | None = None,
     hf_data_repo: str | None = None,
 ) -> None:
+    from datetime import datetime, timezone
     base = os.path.dirname(__file__)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    repo_prefix = f"{backbone}_chunk{chunk_size}/{run_id}"
 
     if data_dir is None:
         data_dir = os.path.join(base, "data")
@@ -571,7 +574,7 @@ def train(
                         api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
                         api.upload_file(
                             path_or_fileobj=best_pt_path,
-                            path_in_repo=f"{backbone}_chunk{chunk_size}/best.pt",
+                            path_in_repo=f"{repo_prefix}/best.pt",
                             repo_id=hf_upload_repo,
                             repo_type="model",
                         )
@@ -613,12 +616,12 @@ def train(
         from huggingface_hub import HfApi
         api = HfApi()
         api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
-        print(f"Uploading checkpoints to {hf_upload_repo} ...")
+        print(f"Uploading checkpoints to {hf_upload_repo}/{repo_prefix} ...")
         api.upload_folder(
             repo_id=hf_upload_repo,
             repo_type="model",
             folder_path=checkpoint_dir,
-            path_in_repo=f"{backbone}_chunk{chunk_size}",
+            path_in_repo=repo_prefix,
         )
         print("Upload complete.")
 
