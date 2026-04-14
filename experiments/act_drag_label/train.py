@@ -1,11 +1,10 @@
 """Behavior cloning training loop for the ACT policy.
 
 Loads expert demonstrations from HF datasets (parquet), trains with:
-- Masked L1 loss on dx, dy (continuous pixel deltas)
+- Masked CE loss on dx, dy (discrete bin indices — 49-bin exponential grid)
 - Masked BCE loss on click (binary)
 - Masked CE loss on key (28-class classification)
 - Unmasked BCE loss on pad prediction
-- KL divergence from CVAE encoder (annealed)
 Saves checkpoints + training history.
 """
 
@@ -23,8 +22,25 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from experiments.act_drag_label.config import ACTION, CHUNK, ENV, TRAIN
+from experiments.act_drag_label.config import ACTION, BIN_CENTERS, CHUNK, ENV, NUM_BINS, TRAIN
 from experiments.act_drag_label.model import ACT, count_parameters
+
+
+# ---------------------------------------------------------------------------
+# Bin quantisation helper
+# ---------------------------------------------------------------------------
+
+def _delta_to_bin(raw_delta: np.ndarray) -> np.ndarray:
+    """Convert raw pixel deltas to closest bin indices.
+
+    BIN_CENTERS is a sorted (49,) float32 array of exponential bin centers.
+    Returns int64 indices in [0, NUM_BINS-1].
+    """
+    idx = np.searchsorted(BIN_CENTERS, raw_delta, side='left')
+    idx = np.clip(idx, 0, NUM_BINS - 1)
+    left = np.clip(idx - 1, 0, NUM_BINS - 1)
+    closer_left = np.abs(raw_delta - BIN_CENTERS[left]) < np.abs(raw_delta - BIN_CENTERS[idx])
+    return np.where(closer_left, left, idx).astype(np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -104,11 +120,10 @@ class ChunkDataset(Dataset):
     ) -> tuple[
         torch.Tensor,  # obs (3, 224, 224)
         torch.Tensor,  # proprio (31,)
-        torch.Tensor,  # actions_cvae (chunk, 31) for CVAE encoder
-        torch.Tensor,  # dx_chunk (chunk,)
-        torch.Tensor,  # dy_chunk (chunk,)
-        torch.Tensor,  # click_chunk (chunk,)
-        torch.Tensor,  # key_chunk (chunk,)
+        torch.Tensor,  # dx_chunk (chunk,) int64 bin indices
+        torch.Tensor,  # dy_chunk (chunk,) int64 bin indices
+        torch.Tensor,  # click_chunk (chunk,) float32
+        torch.Tensor,  # key_chunk (chunk,) int64
         torch.Tensor,  # pad_mask (chunk,) — 1 where padded, 0 where real
     ]:
         eid, t = self.index[idx]
@@ -138,14 +153,15 @@ class ChunkDataset(Dataset):
         real_len = end_t - t
         sl = slice(row_idx, row_idx + real_len)
 
-        dx_chunk = np.zeros(C, dtype=np.float32)
-        dy_chunk = np.zeros(C, dtype=np.float32)
+        center_bin = ACTION.num_bins_per_side  # 24 — index of the zero-movement bin
+        dx_chunk = np.full(C, center_bin, dtype=np.int64)
+        dy_chunk = np.full(C, center_bin, dtype=np.int64)
         click_chunk = np.zeros(C, dtype=np.float32)
         key_chunk = np.zeros(C, dtype=np.int64)
         pad_mask = np.ones(C, dtype=np.float32)  # 1=padded, 0=real
 
-        dx_chunk[:real_len] = self.action_dx[sl] / ACTION.max_delta_px
-        dy_chunk[:real_len] = self.action_dy[sl] / ACTION.max_delta_px
+        dx_chunk[:real_len] = _delta_to_bin(self.action_dx[sl])
+        dy_chunk[:real_len] = _delta_to_bin(self.action_dy[sl])
         click_chunk[:real_len] = self.action_click[sl].astype(np.float32)
         key_chunk[:real_len] = self.action_key[sl].astype(np.int64)
         pad_mask[:real_len] = 0.0
@@ -156,15 +172,7 @@ class ChunkDataset(Dataset):
         key_chunk = torch.from_numpy(key_chunk)
         pad_mask = torch.from_numpy(pad_mask)
 
-        # --- Actions for CVAE encoder: (chunk, action_dim) ---
-        # action_dim = 2 (dx,dy) + 1 (click) + 28 (key onehot) = 31
-        actions_cvae = torch.zeros(C, 2 + 1 + ACTION.num_key_classes)
-        actions_cvae[:real_len, 0] = dx_chunk[:real_len]  # already normalized
-        actions_cvae[:real_len, 1] = dy_chunk[:real_len]  # already normalized
-        actions_cvae[:real_len, 2] = click_chunk[:real_len]
-        actions_cvae[torch.arange(real_len), 3 + key_chunk[:real_len]] = 1.0
-
-        return obs, proprio, actions_cvae, dx_chunk, dy_chunk, click_chunk, key_chunk, pad_mask
+        return obs, proprio, dx_chunk, dy_chunk, click_chunk, key_chunk, pad_mask
 
 
 class EpisodeSequentialSampler(Sampler[int]):
@@ -355,53 +363,51 @@ def predecode_images(ds) -> np.ndarray:
 
 def compute_losses(
     out: dict[str, torch.Tensor],
-    dx_gt: torch.Tensor,
-    dy_gt: torch.Tensor,
+    dx_gt: torch.Tensor,    # (B, chunk) int64 bin indices
+    dy_gt: torch.Tensor,    # (B, chunk) int64 bin indices
     click_gt: torch.Tensor,
     key_gt: torch.Tensor,
     pad_gt: torch.Tensor,
-    kl_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute all loss components from model output and ground truth.
 
     Returns (total_loss, head_losses) where head_losses has keys:
-    dx, dy, click, key, pad, kl (raw, before weighting).
+    dx, dy, click, key, pad (raw, before weighting).
+    dx/dy use cross-entropy over NUM_BINS=49 discrete bin logits.
     """
     mask = 1.0 - pad_gt
     mask_sum = mask.sum().clamp(min=1)
+    B, C_chunk = dx_gt.shape
+    mask_flat = mask.reshape(B * C_chunk)
 
-    loss_dx = (F.l1_loss(out["dx"], dx_gt, reduction="none") * mask).sum() / mask_sum
-    loss_dy = (F.l1_loss(out["dy"], dy_gt, reduction="none") * mask).sum() / mask_sum
+    loss_dx = (
+        F.cross_entropy(out["dx_logits"].reshape(B * C_chunk, -1), dx_gt.reshape(B * C_chunk), reduction="none") * mask_flat
+    ).sum() / mask_flat.sum().clamp(min=1)
+
+    loss_dy = (
+        F.cross_entropy(out["dy_logits"].reshape(B * C_chunk, -1), dy_gt.reshape(B * C_chunk), reduction="none") * mask_flat
+    ).sum() / mask_flat.sum().clamp(min=1)
 
     loss_click = (
         F.binary_cross_entropy_with_logits(out["click"], click_gt, reduction="none") * mask
     ).sum() / mask_sum
 
-    B, C_chunk = key_gt.shape
     key_logits_flat = out["key_logits"].reshape(B * C_chunk, -1)
     key_gt_flat = key_gt.reshape(B * C_chunk)
-    mask_flat = mask.reshape(B * C_chunk)
     loss_key = (
         F.cross_entropy(key_logits_flat, key_gt_flat, reduction="none") * mask_flat
     ).sum() / mask_flat.sum().clamp(min=1)
 
     loss_pad = F.binary_cross_entropy_with_logits(out["pad_logits"], pad_gt)
 
-    mu, logvar = out["mu"], out["logvar"]
-    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
     total_loss = (
         loss_dx + loss_dy
         + TRAIN.loss_weight_click * loss_click
         + TRAIN.loss_weight_key * loss_key
         + TRAIN.loss_weight_pad * loss_pad
-        + kl_weight * kl
     )
 
-    head_losses = {
-        "dx": loss_dx, "dy": loss_dy, "click": loss_click,
-        "key": loss_key, "pad": loss_pad, "kl": kl,
-    }
+    head_losses = {"dx": loss_dx, "dy": loss_dy, "click": loss_click, "key": loss_key, "pad": loss_pad}
     return total_loss, head_losses
 
 
@@ -488,12 +494,12 @@ def print_epoch1_diagnostics(
 
 def _run_train_epoch(
     model, train_loader, optimizer, scaler, device, use_cuda, use_amp,
-    amp_dtype, kl_weight, batch_size, diag, t0,
+    amp_dtype, batch_size, diag, t0,
 ) -> tuple[float, dict[str, float], int]:
     """Run one training epoch. Returns (avg_loss, head_sums, total_samples)."""
     model.train()
     loss_sum = 0.0
-    head_sums = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0, "kl": 0.0}
+    head_sums = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0}
     total = 0
     n_batches = len(train_loader)
 
@@ -507,14 +513,13 @@ def _run_train_epoch(
         if diag:
             timings["data"] += time.perf_counter() - t_data_start
 
-        (obs, proprio, actions_cvae, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = batch
+        (obs, proprio, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = batch
 
         # --- Transfer to GPU ---
         if diag:
             t_mark = time.perf_counter()
         obs = obs.to(device, non_blocking=True)
         proprio = proprio.to(device, non_blocking=True)
-        actions_cvae = actions_cvae.to(device, non_blocking=True)
         dx_gt = dx_gt.to(device, non_blocking=True)
         dy_gt = dy_gt.to(device, non_blocking=True)
         click_gt = click_gt.to(device, non_blocking=True)
@@ -533,7 +538,7 @@ def _run_train_epoch(
                 if use_cuda:
                     torch.cuda.synchronize()
                 t_mark = time.perf_counter()
-            out = model(obs, proprio, actions_cvae)
+            out = model(obs, proprio)
             if diag:
                 if use_cuda:
                     torch.cuda.synchronize()
@@ -541,7 +546,7 @@ def _run_train_epoch(
                 t_mark = time.perf_counter()
 
             total_loss, head_losses = compute_losses(
-                out, dx_gt, dy_gt, click_gt, key_gt, pad_gt, kl_weight,
+                out, dx_gt, dy_gt, click_gt, key_gt, pad_gt,
             )
 
         if diag:
@@ -614,20 +619,19 @@ def _run_train_epoch(
 
 
 def _run_val_epoch(
-    model, val_loader, device, use_cuda, use_amp, amp_dtype, kl_weight,
+    model, val_loader, device, use_cuda, use_amp, amp_dtype,
 ) -> tuple[float, dict[str, float], int]:
     """Run one validation epoch. Returns (avg_loss, head_sums, total_samples)."""
     model.train(False)
     loss_sum = 0.0
-    head_sums = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0, "kl": 0.0}
+    head_sums = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0}
     total = 0
 
     with torch.no_grad():
         for batch in val_loader:
-            (obs, proprio, actions_cvae, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = batch
+            (obs, proprio, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = batch
             obs = obs.to(device, non_blocking=True)
             proprio = proprio.to(device, non_blocking=True)
-            actions_cvae = actions_cvae.to(device, non_blocking=True)
             dx_gt = dx_gt.to(device, non_blocking=True)
             dy_gt = dy_gt.to(device, non_blocking=True)
             click_gt = click_gt.to(device, non_blocking=True)
@@ -637,9 +641,9 @@ def _run_val_epoch(
             with torch.amp.autocast(
                 device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp
             ):
-                out = model(obs, proprio, actions_cvae)
+                out = model(obs, proprio)
                 total_loss, head_losses = compute_losses(
-                    out, dx_gt, dy_gt, click_gt, key_gt, pad_gt, kl_weight,
+                    out, dx_gt, dy_gt, click_gt, key_gt, pad_gt,
                 )
 
             bs = obs.size(0)
@@ -769,7 +773,7 @@ def train(
           f"({disk.free/1024**3:.1f}GB free)", flush=True)
 
     # --- Training loop ---
-    head_names = ["dx", "dy", "click", "key", "pad", "kl"]
+    head_names = ["dx", "dy", "click", "key", "pad"]
     history: dict[str, list] = {
         "train_loss": [], "val_loss": [],
         **{f"train_{h}": [] for h in head_names},
@@ -777,29 +781,22 @@ def train(
     }
     best_val_loss = float("inf")
     epochs_without_improvement = 0
-    kl_anneal_epochs = int(TRAIN.epochs * TRAIN.kl_anneal_fraction)
 
     for epoch in range(TRAIN.epochs):
         t0 = time.perf_counter()
         diag = epoch == 0
         train_sampler.set_epoch(epoch)
 
-        # KL weight annealing
-        if kl_anneal_epochs > 0:
-            kl_weight = min(1.0, epoch / kl_anneal_epochs) * TRAIN.kl_weight_max
-        else:
-            kl_weight = TRAIN.kl_weight_max
-
         # Train
         train_loss, head_sums_train, train_total = _run_train_epoch(
             model, train_loader, optimizer, scaler, device, use_cuda, use_amp,
-            amp_dtype, kl_weight, batch_size, diag, t0,
+            amp_dtype, batch_size, diag, t0,
         )
         scheduler.step()
 
         # Validate
         val_loss, head_sums_val, val_total = _run_val_epoch(
-            model, val_loader, device, use_cuda, use_amp, amp_dtype, kl_weight,
+            model, val_loader, device, use_cuda, use_amp, amp_dtype,
         )
 
         elapsed = time.perf_counter() - t0
@@ -831,7 +828,6 @@ def train(
             f"  Epoch {epoch+1:3d}/{TRAIN.epochs} | "
             f"train={train_loss:.4f} val={val_loss:.4f} | "
             f"val_heads: {head_str} | "
-            f"kl_w={kl_weight:.4f} | "
             f"lr={scheduler.get_last_lr()[0]:.6f} | "
             f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min",
             flush=True,
