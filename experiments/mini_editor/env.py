@@ -63,6 +63,7 @@ class MiniEditorEnv:
         # Edge detection state
         self._prev_mouse_left: int = 0
         self._prev_keys_held: list[int] = [0] * NUM_KEYS
+        self._drag_anchor: int | None = None
 
         # Episode state
         self._step_count: int = 0
@@ -161,17 +162,38 @@ class MiniEditorEnv:
             )
             click_pos = self._pixel_to_char_pos(self._cursor_x, self._cursor_y)
             if shift_held and self._text_cursor is not None:
-                # Extend selection
+                # Shift+click: extend selection
                 if self._selection_start is None:
                     self._selection_start = self._text_cursor
                 self._selection_end = click_pos
                 self._text_cursor = click_pos
             else:
-                # Set cursor, clear selection
+                # Regular click: set cursor, start potential drag selection
                 self._text_cursor = click_pos
+                self._selection_start = click_pos
+                self._selection_end = click_pos  # will extend on drag
+                self._drag_anchor = click_pos
+        elif prev_ml == 1 and mouse_left == 1:
+            # Drag: mouse held across frames — extend selection
+            if hasattr(self, "_drag_anchor") and self._drag_anchor is not None:
+                drag_pos = self._pixel_to_char_pos(self._cursor_x, self._cursor_y)
+                if drag_pos != self._drag_anchor:
+                    self._selection_start = self._drag_anchor
+                    self._selection_end = drag_pos
+                    self._text_cursor = drag_pos
+                else:
+                    # Cursor hasn't moved to a new char pos — no selection yet
+                    self._selection_start = None
+                    self._selection_end = None
+        elif prev_ml == 1 and mouse_left == 0:
+            # mouseUp: finalize. If start == end, clear selection (was just a click)
+            if (
+                self._selection_start is not None
+                and self._selection_start == self._selection_end
+            ):
                 self._selection_start = None
                 self._selection_end = None
-        # mouseUp: no action needed
+            self._drag_anchor = None
 
         self._prev_mouse_left = mouse_left
 
