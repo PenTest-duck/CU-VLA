@@ -338,6 +338,31 @@ def print_metrics(results: dict, name: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def resolve_checkpoint(
+    local_path: str,
+    hf_repo: str | None,
+    path_in_repo: str,
+) -> str | None:
+    """Return a local checkpoint path, downloading from HF Hub if needed.
+
+    Downloads if: local file doesn't exist, or HF Hub has a newer version.
+    Returns None if the checkpoint isn't available locally or on Hub.
+    """
+    if hf_repo is None:
+        return local_path if os.path.exists(local_path) else None
+
+    from huggingface_hub import hf_hub_download
+    try:
+        downloaded = hf_hub_download(
+            hf_repo, path_in_repo, repo_type="model",
+            local_dir=os.path.dirname(local_path),
+        )
+        print(f"  Checkpoint synced from {hf_repo}/{path_in_repo}", flush=True)
+        return downloaded
+    except Exception:
+        return local_path if os.path.exists(local_path) else None
+
+
 def main(
     backbone: str = "resnet18",
     chunk_size: int = CHUNK.default_chunk_size,
@@ -346,6 +371,7 @@ def main(
     num_episodes: int = EVAL_CFG.num_episodes,
     visual: bool = False,
     device: str = "cpu",
+    hf_checkpoint_repo: str | None = None,
 ) -> None:
     base = os.path.dirname(__file__)
     max_steps = (
@@ -378,8 +404,15 @@ def main(
         print(f"\nNo BaselineCNN checkpoint at {baseline_ckpt}. Skipping.")
 
     # --- ACT ---
-    act_ckpt = checkpoint or os.path.join(base, "checkpoints", "act_best.pt")
-    if os.path.exists(act_ckpt):
+    act_default = os.path.join(
+        base, "checkpoints", f"{backbone}_chunk{chunk_size}", "best.pt"
+    )
+    act_ckpt = checkpoint or resolve_checkpoint(
+        act_default,
+        hf_checkpoint_repo,
+        f"{backbone}_chunk{chunk_size}/best.pt",
+    )
+    if act_ckpt and os.path.exists(act_ckpt):
         print(f"\nRunning ACT assessment ({act_ckpt})...")
         act_agent = ACTAgent(
             act_ckpt,
@@ -423,7 +456,7 @@ def main(
             f"(p95={act_loop_p95:.2f}ms < 33.3ms)"
         )
     else:
-        print(f"\nNo ACT checkpoint at {act_ckpt}. Skipping.")
+        print(f"\nNo ACT checkpoint found. Skipping.")
 
     # --- Random ---
     print("\nRunning random baseline assessment...")
@@ -466,6 +499,10 @@ if __name__ == "__main__":
         "--device", type=str, default="cpu",
         help="Torch device (cpu, cuda, mps)"
     )
+    parser.add_argument(
+        "--hf-checkpoint-repo", type=str, default="PenTest-duck/cu-vla-checkpoints",
+        help="HF model repo to auto-download checkpoints from"
+    )
     args = parser.parse_args()
 
     main(
@@ -476,4 +513,5 @@ if __name__ == "__main__":
         num_episodes=args.num_episodes,
         visual=args.visual,
         device=args.device,
+        hf_checkpoint_repo=args.hf_checkpoint_repo,
     )
