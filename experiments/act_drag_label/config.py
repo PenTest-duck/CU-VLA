@@ -67,9 +67,9 @@ class ChunkConfig:
 @dataclass(frozen=True)
 class TrainConfig:
     num_episodes: int = 10000
-    batch_size: int = 256
-    lr: float = 1e-4
-    backbone_lr: float = 1e-5
+    batch_size: int = 1024
+    lr: float = 4e-4
+    backbone_lr: float = 4e-5
     weight_decay: float = 1e-4
     epochs: int = 100
     early_stop_patience: int = 15

@@ -309,7 +309,14 @@ def train(
         scaler = torch.amp.GradScaler(enabled=False)
 
     print(f"AMP: {amp_dtype if use_amp else 'disabled'} (GradScaler: {scaler.is_enabled()})")
-    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}", flush=True)
+    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}")
+    if use_cuda:
+        total_vram = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        print(f"GPU: {torch.cuda.get_device_name(0)}, VRAM: {total_vram:.1f}GB")
+    import shutil
+    disk = shutil.disk_usage("/")
+    print(f"Disk: {disk.used/1024**3:.1f}GB used / {disk.total/1024**3:.1f}GB total "
+          f"({disk.free/1024**3:.1f}GB free)", flush=True)
 
     # Training loop
     head_names = ["dx", "dy", "click", "key", "pad", "kl"]
@@ -424,10 +431,16 @@ def train(
             # Debug: log progress during first epoch to diagnose throughput
             if epoch == 0 and (batch_idx == 0 or (batch_idx + 1) % 100 == 0):
                 elapsed_batch = time.perf_counter() - t0
+                vram_str = ""
+                if use_cuda:
+                    alloc = torch.cuda.memory_allocated() / 1024**3
+                    reserved = torch.cuda.memory_reserved() / 1024**3
+                    peak = torch.cuda.max_memory_allocated() / 1024**3
+                    vram_str = f" | VRAM: {alloc:.1f}GB alloc, {reserved:.1f}GB reserved, {peak:.1f}GB peak"
                 print(
                     f"    batch {batch_idx+1}/{n_batches} | "
                     f"loss={total_loss.item():.4f} | "
-                    f"{elapsed_batch:.1f}s elapsed",
+                    f"{elapsed_batch:.1f}s elapsed{vram_str}",
                     flush=True,
                 )
 
