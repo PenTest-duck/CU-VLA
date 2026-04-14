@@ -16,7 +16,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from experiments.act_drag_label.config import (
-    ACTION, CHUNK, ENV, EVAL_CFG,
+    ACTION, CHUNK, ENV, EVAL_CFG, BIN_CENTERS, NUM_BINS,
 )
 
 from experiments.act_drag_label.env import DragLabelEnv
@@ -49,7 +49,7 @@ def build_proprio(env: DragLabelEnv) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 class ACTAgent:
-    """Wraps a trained ACT model with temporal ensemble for inference."""
+    """Wraps a trained ACT model with probability-ensemble temporal smoothing."""
 
     def __init__(
         self,
@@ -67,7 +67,7 @@ class ACTAgent:
         state = torch.load(checkpoint, map_location=self.device, weights_only=True)
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         self.model.load_state_dict(state)
-        self.model.eval()
+        self.model.train(False)  # put model in inference mode
         self.active_chunks: list[dict] = []
 
     def reset(self) -> None:
@@ -75,35 +75,32 @@ class ACTAgent:
 
     @torch.no_grad()
     def act(self, obs: np.ndarray, proprio: np.ndarray) -> dict:
-        # Prepare tensors
         x = (
             torch.from_numpy(obs).permute(2, 0, 1).unsqueeze(0).float() / 255.0
         ).to(self.device)
         p = torch.from_numpy(proprio).unsqueeze(0).float().to(self.device)
 
-        # Forward (inference: no actions, z=0)
-        out = self.model(x, p, actions=None)
+        # Forward — no actions arg
+        out = self.model(x, p)
 
-        # Extract new chunk as numpy arrays (denormalize dx/dy from [-1,1] to pixels)
-        dx_chunk = out["dx"][0].cpu().numpy() * ACTION.max_delta_px  # (chunk_size,)
-        dy_chunk = out["dy"][0].cpu().numpy() * ACTION.max_delta_px  # (chunk_size,)
-        click_chunk = torch.sigmoid(out["click"][0]).cpu().numpy()  # (chunk_size,)
-        key_chunk = out["key_logits"][0].cpu().numpy()  # (chunk_size, 28)
+        # Store softmax/sigmoid distributions (not raw logits)
+        dx_probs = torch.softmax(out["dx_logits"][0], dim=-1).cpu().numpy()  # (chunk, 49)
+        dy_probs = torch.softmax(out["dy_logits"][0], dim=-1).cpu().numpy()  # (chunk, 49)
+        click_chunk = torch.sigmoid(out["click"][0]).cpu().numpy()
+        key_probs = torch.softmax(out["key_logits"][0], dim=-1).cpu().numpy()  # (chunk, 28)
 
-        new_chunk = {
-            "dx": dx_chunk,
-            "dy": dy_chunk,
+        self.active_chunks.append({
+            "dx_probs": dx_probs,
+            "dy_probs": dy_probs,
             "click": click_chunk,
-            "key_logits": key_chunk,
+            "key_probs": key_probs,
             "age": 0,
-        }
-        self.active_chunks.append(new_chunk)
+        })
 
-        # Temporal ensemble: blend active chunks for current step
-        # w_i = exp(-0.01 * age_i)
+        # Probability ensemble: blend all distributions consistently
         total_w = 0.0
-        blended_dx = 0.0
-        blended_dy = 0.0
+        blended_dx = np.zeros(NUM_BINS, dtype=np.float32)
+        blended_dy = np.zeros(NUM_BINS, dtype=np.float32)
         blended_click = 0.0
         blended_key = np.zeros(ACTION.num_key_classes, dtype=np.float32)
 
@@ -113,10 +110,10 @@ class ACTAgent:
                 continue
             w = np.exp(-CHUNK.ensemble_decay * age)
             total_w += w
-            blended_dx += w * chunk["dx"][age]
-            blended_dy += w * chunk["dy"][age]
+            blended_dx += w * chunk["dx_probs"][age]
+            blended_dy += w * chunk["dy_probs"][age]
             blended_click += w * chunk["click"][age]
-            blended_key += w * chunk["key_logits"][age]
+            blended_key += w * chunk["key_probs"][age]
 
         if total_w > 0:
             blended_dx /= total_w
@@ -124,10 +121,13 @@ class ACTAgent:
             blended_click /= total_w
             blended_key /= total_w
 
+        # Expected value: dot product of blended distribution with bin centers
+        dx_out = float(np.dot(blended_dx, BIN_CENTERS))
+        dy_out = float(np.dot(blended_dy, BIN_CENTERS))
         click_out = 1 if blended_click > 0.5 else 0
         key_out = int(np.argmax(blended_key))
 
-        # Increment ages and prune expired chunks
+        # Increment ages and prune
         for chunk in self.active_chunks:
             chunk["age"] += 1
         self.active_chunks = [
@@ -135,8 +135,8 @@ class ACTAgent:
         ]
 
         return {
-            "dx": float(blended_dx),
-            "dy": float(blended_dy),
+            "dx": dx_out,
+            "dy": dy_out,
             "click": click_out,
             "key": key_out,
         }
@@ -151,7 +151,7 @@ class BaselineCNNAgent:
         state = torch.load(checkpoint, map_location=self.device, weights_only=True)
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         self.model.load_state_dict(state)
-        self.model.eval()
+        self.model.train(False)  # put model in inference mode
 
     def reset(self) -> None:
         pass
@@ -374,6 +374,7 @@ def main(
     visual: bool = False,
     device: str = "cpu",
     hf_checkpoint_repo: str | None = None,
+    model_only: bool = False,
 ) -> None:
     base = os.path.dirname(__file__)
     max_steps = (
@@ -387,26 +388,28 @@ def main(
         num_shapes=num_shapes,
     )
 
-    # --- Expert ---
-    print("Running expert assessment...")
-    expert = ExpertAgent()
-    expert_results = run_agent(expert, env, num_episodes, max_steps)
-    print_metrics(expert_results, "Expert (Fitts's Law)")
+    expert_results = None
+    if not model_only:
+        # --- Expert ---
+        print("Running expert assessment...")
+        expert = ExpertAgent()
+        expert_results = run_agent(expert, env, num_episodes, max_steps)
+        print_metrics(expert_results, "Expert (Fitts's Law)")
 
-    # --- Baseline CNN ---
-    baseline_default = os.path.join(base, "checkpoints", "baseline", "best.pt")
-    baseline_ckpt = checkpoint or resolve_checkpoint(
-        baseline_default,
-        hf_checkpoint_repo,
-        "baseline/best.pt",
-    )
-    if baseline_ckpt and os.path.exists(baseline_ckpt):
-        print(f"\nRunning BaselineCNN assessment ({baseline_ckpt})...")
-        baseline_agent = BaselineCNNAgent(baseline_ckpt, device=device)
-        baseline_results = run_agent(baseline_agent, env, num_episodes, max_steps)
-        print_metrics(baseline_results, "BaselineCNN")
-    else:
-        print(f"\nNo BaselineCNN checkpoint found. Skipping.")
+        # --- Baseline CNN ---
+        baseline_default = os.path.join(base, "checkpoints", "baseline", "best.pt")
+        baseline_ckpt = checkpoint or resolve_checkpoint(
+            baseline_default,
+            hf_checkpoint_repo,
+            "baseline/best.pt",
+        )
+        if baseline_ckpt and os.path.exists(baseline_ckpt):
+            print(f"\nRunning BaselineCNN assessment ({baseline_ckpt})...")
+            baseline_agent = BaselineCNNAgent(baseline_ckpt, device=device)
+            baseline_results = run_agent(baseline_agent, env, num_episodes, max_steps)
+            print_metrics(baseline_results, "BaselineCNN")
+        else:
+            print(f"\nNo BaselineCNN checkpoint found. Skipping.")
 
     # --- ACT ---
     act_default = os.path.join(
@@ -429,11 +432,6 @@ def main(
         print_metrics(act_results, f"ACT (backbone={backbone}, chunk={chunk_size})")
 
         # --- Comparison summary ---
-        expert_success = (
-            sum(expert_results["success"])
-            / len(expert_results["success"])
-            * 100
-        )
         act_success = (
             sum(act_results["success"])
             / len(act_results["success"])
@@ -441,16 +439,29 @@ def main(
         )
 
         print(f"\n{'='*60}")
-        print(f"  SUMMARY: ACT vs Expert")
-        print(f"{'='*60}")
-        print(f"  Expert completion:  {expert_success:.1f}%")
-        print(f"  ACT completion:     {act_success:.1f}%")
-        print(
-            f"  Expert mean steps:  {np.mean(expert_results['total_steps']):.1f}"
-        )
-        print(
-            f"  ACT mean steps:     {np.mean(act_results['total_steps']):.1f}"
-        )
+        if expert_results:
+            expert_success = (
+                sum(expert_results["success"])
+                / len(expert_results["success"])
+                * 100
+            )
+            print(f"  SUMMARY: ACT vs Expert")
+            print(f"{'='*60}")
+            print(f"  Expert completion:  {expert_success:.1f}%")
+            print(f"  ACT completion:     {act_success:.1f}%")
+            print(
+                f"  Expert mean steps:  {np.mean(expert_results['total_steps']):.1f}"
+            )
+            print(
+                f"  ACT mean steps:     {np.mean(act_results['total_steps']):.1f}"
+            )
+        else:
+            print(f"  SUMMARY: ACT")
+            print(f"{'='*60}")
+            print(f"  ACT completion:     {act_success:.1f}%")
+            print(
+                f"  ACT mean steps:     {np.mean(act_results['total_steps']):.1f}"
+            )
 
         act_loop_p95 = np.percentile(act_results["loop_times_ms"], 95)
         hz_pass = act_loop_p95 < 33.3
@@ -463,11 +474,12 @@ def main(
     else:
         print(f"\nNo ACT checkpoint found. Skipping.")
 
-    # --- Random ---
-    print("\nRunning random baseline assessment...")
-    random_agent = RandomAgent()
-    random_results = run_agent(random_agent, env, num_episodes, max_steps)
-    print_metrics(random_results, "Random")
+    if not model_only:
+        # --- Random ---
+        print("\nRunning random baseline assessment...")
+        random_agent = RandomAgent()
+        random_results = run_agent(random_agent, env, num_episodes, max_steps)
+        print_metrics(random_results, "Random")
 
     env.close()
 
@@ -508,6 +520,10 @@ if __name__ == "__main__":
         "--hf-checkpoint-repo", type=str, default="PenTest-duck/cu-vla-checkpoints",
         help="HF model repo to auto-download checkpoints from"
     )
+    parser.add_argument(
+        "--model-only", action="store_true",
+        help="Only evaluate ACT model, skip expert/baseline/random"
+    )
     args = parser.parse_args()
 
     main(
@@ -519,4 +535,5 @@ if __name__ == "__main__":
         visual=args.visual,
         device=args.device,
         hf_checkpoint_repo=args.hf_checkpoint_repo,
+        model_only=args.model_only,
     )
