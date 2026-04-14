@@ -53,25 +53,24 @@ def build_episode_offsets(
 # ---------------------------------------------------------------------------
 
 class ChunkDataset(Dataset):
-    """Arrow-backed dataset that samples (obs, proprio, action_chunk, ...) tuples.
+    """Dataset that samples (obs, proprio, action_chunk, ...) tuples.
 
     Every timestep t in every episode is a valid start index.
     Action chunks are zero-padded when near the episode end.
 
-    Action columns are pre-extracted to numpy arrays (~7MB) to avoid
-    expensive ds.select() calls per sample. Only the image column is
-    read from Arrow at __getitem__ time (single PNG decode per sample).
+    All columns (including images) are pre-extracted to numpy arrays
+    so __getitem__ is pure array indexing with no PNG decode.
     """
 
     def __init__(
         self,
-        ds,
+        images: np.ndarray,
         episode_offsets: dict[int, tuple[int, int]],
         episode_ids: set[int],
         chunk_size: int,
         action_arrays: dict[str, np.ndarray],
     ) -> None:
-        self.ds = ds
+        self.images = images
         self.chunk_size = chunk_size
         self.episode_offsets = {
             eid: episode_offsets[eid] for eid in episode_ids
@@ -113,9 +112,8 @@ class ChunkDataset(Dataset):
         C = self.chunk_size
         row_idx = start_row + t
 
-        # --- Observation at time t (single PNG decode from Arrow) ---
-        row = self.ds[row_idx]
-        obs = torch.from_numpy(np.array(row["image"])).permute(2, 0, 1).float() / 255.0
+        # --- Observation at time t (pre-decoded uint8 array) ---
+        obs = torch.from_numpy(self.images[row_idx].copy()).permute(2, 0, 1).float() / 255.0
 
         # --- Proprioception at time t (env state before action, matches eval) ---
         cx_norm = float(self.cursor_x[row_idx]) / ENV.window_size
@@ -222,6 +220,27 @@ def train(
         flush=True,
     )
 
+    # Pre-decode all images to numpy (eliminates PNG decode during training)
+    n_samples = len(ds)
+    obs_size = ENV.obs_size
+    t_decode = time.perf_counter()
+    images = np.zeros((n_samples, obs_size, obs_size, 3), dtype=np.uint8)
+    for i in range(n_samples):
+        images[i] = np.array(ds[i]["image"])
+        if (i + 1) % 50000 == 0 or i == 0:
+            elapsed_decode = time.perf_counter() - t_decode
+            print(
+                f"  Pre-decoded {i+1}/{n_samples} images "
+                f"({elapsed_decode:.1f}s elapsed)",
+                flush=True,
+            )
+    images_gb = images.nbytes / 1024**3
+    print(
+        f"Images pre-decoded in {time.perf_counter() - t_decode:.1f}s "
+        f"({images_gb:.1f}GB, {n_samples/( time.perf_counter() - t_decode):.0f} img/s)",
+        flush=True,
+    )
+
     # Build episode offset table
     t_init = time.perf_counter()
     episode_offsets = build_episode_offsets(ep_ids_np)
@@ -248,8 +267,8 @@ def train(
 
     print(f"DataLoader workers: {num_workers}")
 
-    train_dataset = ChunkDataset(ds, episode_offsets, train_ids, chunk_size, action_arrays)
-    val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size, action_arrays)
+    train_dataset = ChunkDataset(images, episode_offsets, train_ids, chunk_size, action_arrays)
+    val_dataset = ChunkDataset(images, episode_offsets, val_ids, chunk_size, action_arrays)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}", flush=True)
 
     use_cuda = device.startswith("cuda")
