@@ -1,8 +1,12 @@
 """All hyperparameters for Experiment 5: Mini Text Editor."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+
+# Root directory of this experiment (experiments/mini_editor/)
+_EXP_DIR = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Key indices for the 53-key physical Mac keyboard held-state vector
@@ -253,7 +257,7 @@ class DataConfig:
     num_episodes: int = 10000
     num_shards: int = 10
     jpeg_quality: int = 95
-    output_dir: str = "experiments/mini_editor/data"
+    output_dir: str = str(_EXP_DIR / "data")
 
 
 @dataclass(frozen=True)
