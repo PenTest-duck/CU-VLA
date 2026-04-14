@@ -671,7 +671,10 @@ def train(
 
     use_cuda = device.startswith("cuda")
     if num_workers is None:
-        num_workers = 8 if use_cuda else 0
+        # Images are pre-decoded to memmap, so data loading is just array
+        # indexing (~0.1ms/sample). No need for workers — avoids fork+memmap
+        # contention and log stream stalls from forked processes.
+        num_workers = 0
 
     # --- Data ---
     train_loader, val_loader = load_dataset_splits(
