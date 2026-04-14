@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from experiments.act_drag_label.config import ACTION, CHUNK, TRAIN
+from experiments.act_drag_label.config import ACTION, CHUNK, ENV, TRAIN
 from experiments.act_drag_label.model import ACT, count_parameters
 
 
@@ -77,6 +77,8 @@ class ChunkDataset(Dataset):
             eid: episode_offsets[eid] for eid in episode_ids
             if eid in episode_offsets
         }
+        self.cursor_x = action_arrays["cursor_x"]
+        self.cursor_y = action_arrays["cursor_y"]
         self.action_dx = action_arrays["action_dx"]
         self.action_dy = action_arrays["action_dy"]
         self.action_click = action_arrays["action_click"]
@@ -114,13 +116,15 @@ class ChunkDataset(Dataset):
         obs = torch.from_numpy(np.array(row["image"])).permute(2, 0, 1).float() / 255.0
 
         # --- Proprioception at time t (from pre-extracted numpy) ---
+        cx_norm = float(self.cursor_x[row_idx]) / ENV.window_size
+        cy_norm = float(self.cursor_y[row_idx]) / ENV.window_size
         click_t = float(self.action_click[row_idx])
         key_t = int(self.action_key[row_idx])
         key_onehot = np.zeros(ACTION.num_key_classes, dtype=np.float32)
         key_onehot[key_t] = 1.0
         proprio = np.zeros(31, dtype=np.float32)
-        proprio[0] = 0.5  # mouse_x_norm placeholder
-        proprio[1] = 0.5  # mouse_y_norm placeholder
+        proprio[0] = cx_norm
+        proprio[1] = cy_norm
         proprio[2] = click_t
         proprio[3:] = key_onehot
         proprio = torch.from_numpy(proprio)
@@ -202,6 +206,8 @@ def train(
     t_extract = time.perf_counter()
     ep_ids_np = np.array(ds["episode_id"], dtype=np.int32)
     action_arrays = {
+        "cursor_x": np.array(ds["cursor_x"], dtype=np.float32),
+        "cursor_y": np.array(ds["cursor_y"], dtype=np.float32),
         "action_dx": np.array(ds["action_dx"], dtype=np.float32),
         "action_dy": np.array(ds["action_dy"], dtype=np.float32),
         "action_click": np.array(ds["action_click"], dtype=np.int8),
@@ -288,12 +294,19 @@ def train(
         optimizer, T_max=TRAIN.epochs
     )
 
-    # AMP — GradScaler only works on CUDA, not MPS
+    # AMP — prefer bf16 on Ampere+ (L4, A10G, A100), fall back to fp16 on older (T4)
     use_amp = TRAIN.use_amp and device.startswith("cuda")
-    scaler = torch.amp.GradScaler(enabled=use_amp)
-    amp_dtype = torch.float16 if use_amp else torch.float32
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+        scaler = torch.amp.GradScaler(enabled=False)
+    elif use_amp:
+        amp_dtype = torch.float16
+        scaler = torch.amp.GradScaler(enabled=True)
+    else:
+        amp_dtype = torch.float32
+        scaler = torch.amp.GradScaler(enabled=False)
 
-    print(f"AMP: {'enabled' if use_amp else 'disabled (GradScaler requires CUDA)'}")
+    print(f"AMP: {amp_dtype if use_amp else 'disabled'} (GradScaler: {scaler.is_enabled()})")
     print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}", flush=True)
 
     # Training loop

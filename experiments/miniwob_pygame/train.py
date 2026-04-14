@@ -356,12 +356,19 @@ def train(
         optimizer, T_max=epochs
     )
 
-    # AMP — GradScaler only works on CUDA, not MPS
+    # AMP — prefer bf16 on Ampere+ (L4, A10G, A100), fall back to fp16 on older (T4)
     use_amp = TRAIN.use_amp and device.startswith("cuda")
-    scaler = torch.amp.GradScaler(enabled=use_amp)
-    amp_dtype = torch.float16 if use_amp else torch.float32
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+        scaler = torch.amp.GradScaler(enabled=False)  # bf16 doesn't need GradScaler
+    elif use_amp:
+        amp_dtype = torch.float16
+        scaler = torch.amp.GradScaler(enabled=True)
+    else:
+        amp_dtype = torch.float32
+        scaler = torch.amp.GradScaler(enabled=False)
 
-    print(f"AMP: {'enabled' if use_amp else 'disabled (GradScaler requires CUDA)'}")
+    print(f"AMP: {amp_dtype if use_amp else 'disabled'} (GradScaler: {scaler.is_enabled()})")
     print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}", flush=True)
 
     # Training loop

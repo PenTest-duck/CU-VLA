@@ -1,19 +1,17 @@
 """Launch an HF Jobs training run.
 
-Usage (Exp 3 — default):
+Usage (Exp 3 — default, 1xL4):
     uv run python scripts/launch_hf_job.py \
-      --flavor t4-medium --timeout 4h \
       -- --backbone resnet18 --chunk-size 10 \
          --hf-upload-repo PenTest-duck/cu-vla-exp3-checkpoints
 
 Usage (Exp 2):
     uv run python scripts/launch_hf_job.py \
-      --flavor t4-medium --timeout 4h \
       -- --experiment exp2 --backbone resnet18 --chunk-size 10
 
 The dataset is auto-downloaded from HF Hub inside the training script.
 Pass --experiment exp2|exp3 after -- to select which experiment to train.
-Defaults to exp3 (MiniWoB-Pygame).
+Defaults to exp3 (MiniWoB-Pygame). Default GPU is 1xL4 (24GB, bf16).
 """
 
 import argparse
@@ -31,8 +29,8 @@ def main() -> None:
         description="Launch HF Jobs training",
         usage="%(prog)s [launcher-options] -- [train.py options]",
     )
-    parser.add_argument("--flavor", type=str, default="t4-medium",
-                        help="HF Jobs hardware flavor (default: t4-medium)")
+    parser.add_argument("--flavor", type=str, default="1x-l4",
+                        help="HF Jobs hardware flavor (default: 1x-l4)")
     parser.add_argument("--timeout", type=str, default="4h",
                         help="Job timeout (default: 4h)")
     parser.add_argument("--namespace", type=str, default=None,
