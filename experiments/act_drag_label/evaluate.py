@@ -393,16 +393,19 @@ def main(
     print_metrics(expert_results, "Expert (Fitts's Law)")
 
     # --- Baseline CNN ---
-    baseline_ckpt = checkpoint or os.path.join(
-        base, "checkpoints", "baseline_best.pt"
+    baseline_default = os.path.join(base, "checkpoints", "baseline", "best.pt")
+    baseline_ckpt = checkpoint or resolve_checkpoint(
+        baseline_default,
+        hf_checkpoint_repo,
+        "baseline/best.pt",
     )
-    if os.path.exists(baseline_ckpt):
+    if baseline_ckpt and os.path.exists(baseline_ckpt):
         print(f"\nRunning BaselineCNN assessment ({baseline_ckpt})...")
         baseline_agent = BaselineCNNAgent(baseline_ckpt, device=device)
         baseline_results = run_agent(baseline_agent, env, num_episodes, max_steps)
         print_metrics(baseline_results, "BaselineCNN")
     else:
-        print(f"\nNo BaselineCNN checkpoint at {baseline_ckpt}. Skipping.")
+        print(f"\nNo BaselineCNN checkpoint found. Skipping.")
 
     # --- ACT ---
     act_default = os.path.join(
