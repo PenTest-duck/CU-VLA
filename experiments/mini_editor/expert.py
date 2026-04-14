@@ -589,6 +589,20 @@ def _trajectory_select_word(
     target_width: float,
     rng: np.random.Generator,
 ) -> list[dict]:
+    """Select a word using either shift+click or click-and-drag (50/50 random)."""
+    if rng.random() < 0.5:
+        return _select_shift_click(cx, cy, word_start_px, word_end_px, target_width, rng)
+    else:
+        return _select_click_drag(cx, cy, word_start_px, word_end_px, target_width, rng)
+
+
+def _select_shift_click(
+    cx: float, cy: float,
+    word_start_px: tuple[float, float],
+    word_end_px: tuple[float, float],
+    target_width: float,
+    rng: np.random.Generator,
+) -> list[dict]:
     """Move to word start, click, then shift+click at word end to select."""
     actions: list[dict] = []
 
@@ -639,6 +653,72 @@ def _trajectory_select_word(
 
     # Shift+click at word end (extends selection)
     actions.extend(shift_click_actions(KEY_LSHIFT, rng))
+
+    return actions
+
+
+def _select_click_drag(
+    cx: float, cy: float,
+    word_start_px: tuple[float, float],
+    word_end_px: tuple[float, float],
+    target_width: float,
+    rng: np.random.Generator,
+) -> list[dict]:
+    """Move to word start, mouseDown, drag to word end, mouseUp."""
+    actions: list[dict] = []
+
+    # Move to word start + correction nudge
+    move_start = fitts_trajectory_human(
+        cx, cy, word_start_px[0], word_start_px[1], target_width, rng
+    )
+    actions.extend(move_start)
+    cx, cy = simulate_cursor(move_start, cx, cy)
+
+    err_x = word_start_px[0] - cx
+    err_y = word_start_px[1] - cy
+    if abs(err_x) > 2.0 or abs(err_y) > 2.0:
+        nudge = {
+            "dx": float(np.clip(err_x, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "dy": float(np.clip(err_y, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "mouse_left": 0,
+            "keys_held": [0] * NUM_KEYS,
+        }
+        actions.append(nudge)
+        cx, cy = simulate_cursor([nudge], cx, cy)
+
+    # Pre-click dwell
+    dwell_n = int(rng.integers(EXPERT.click_dwell_lo, EXPERT.click_dwell_hi + 1))
+    actions.extend([noop_action() for _ in range(dwell_n)])
+
+    # Mouse down (start drag)
+    actions.append({
+        "dx": 0.0, "dy": 0.0, "mouse_left": 1, "keys_held": [0] * NUM_KEYS,
+    })
+
+    # Drag to word end (mouse held)
+    drag_move = fitts_trajectory_human(
+        cx, cy, word_end_px[0], word_end_px[1], target_width, rng,
+        mouse_held=True,
+    )
+    actions.extend(drag_move)
+    cx, cy = simulate_cursor(drag_move, cx, cy)
+
+    # Correction nudge for end position (still dragging)
+    err_x = word_end_px[0] - cx
+    err_y = word_end_px[1] - cy
+    if abs(err_x) > 2.0 or abs(err_y) > 2.0:
+        nudge = {
+            "dx": float(np.clip(err_x, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "dy": float(np.clip(err_y, -ACTION.max_delta_px, ACTION.max_delta_px)),
+            "mouse_left": 1,
+            "keys_held": [0] * NUM_KEYS,
+        }
+        actions.append(nudge)
+
+    # Mouse up (end drag, finalize selection)
+    actions.append({
+        "dx": 0.0, "dy": 0.0, "mouse_left": 0, "keys_held": [0] * NUM_KEYS,
+    })
 
     return actions
 
