@@ -314,9 +314,12 @@ def train(
     print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}", flush=True)
 
     # Training loop
+    head_names = ["dx", "dy", "click", "key", "pad", "kl"]
     history: dict[str, list] = {
         "train_loss": [],
         "val_loss": [],
+        **{f"train_{h}": [] for h in head_names},
+        **{f"val_{h}": [] for h in head_names},
     }
     best_val_loss = float("inf")
     epochs_without_improvement = 0
@@ -334,6 +337,7 @@ def train(
         # --- Train ---
         model.train()
         train_loss_sum = 0.0
+        head_sums_train = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0, "kl": 0.0}
         train_total = 0
         n_batches = len(train_loader)
 
@@ -411,6 +415,12 @@ def train(
 
             bs = obs.size(0)
             train_loss_sum += total_loss.item() * bs
+            head_sums_train["dx"] += loss_dx.item() * bs
+            head_sums_train["dy"] += loss_dy.item() * bs
+            head_sums_train["click"] += loss_click.item() * bs
+            head_sums_train["key"] += loss_key.item() * bs
+            head_sums_train["pad"] += loss_pad.item() * bs
+            head_sums_train["kl"] += kl.item() * bs
             train_total += bs
 
             # Debug: log progress during first epoch to diagnose throughput
@@ -429,6 +439,7 @@ def train(
         # --- Validate ---
         model.train(False)
         val_loss_sum = 0.0
+        head_sums_val = {"dx": 0.0, "dy": 0.0, "click": 0.0, "key": 0.0, "pad": 0.0, "kl": 0.0}
         val_total = 0
 
         with torch.no_grad():
@@ -494,6 +505,12 @@ def train(
 
                 bs = obs.size(0)
                 val_loss_sum += total_loss.item() * bs
+                head_sums_val["dx"] += loss_dx.item() * bs
+                head_sums_val["dy"] += loss_dy.item() * bs
+                head_sums_val["click"] += loss_click.item() * bs
+                head_sums_val["key"] += loss_key.item() * bs
+                head_sums_val["pad"] += loss_pad.item() * bs
+                head_sums_val["kl"] += kl.item() * bs
                 val_total += bs
 
         val_loss = val_loss_sum / max(val_total, 1)
@@ -501,6 +518,9 @@ def train(
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        for h in head_names:
+            history[f"train_{h}"].append(head_sums_train[h] / max(train_total, 1))
+            history[f"val_{h}"].append(head_sums_val[h] / max(val_total, 1))
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -539,9 +559,13 @@ def train(
         if True:
             remaining_epochs = TRAIN.epochs - epoch - 1
             eta_min = remaining_epochs * elapsed / 60
+            # Per-head val losses (raw, before weighting)
+            vh = {h: head_sums_val[h] / max(val_total, 1) for h in head_names}
+            head_str = " ".join(f"{h}={vh[h]:.3f}" for h in head_names)
             print(
                 f"  Epoch {epoch+1:3d}/{TRAIN.epochs} | "
                 f"train={train_loss:.4f} val={val_loss:.4f} | "
+                f"val_heads: {head_str} | "
                 f"kl_w={kl_weight:.4f} | "
                 f"lr={scheduler.get_last_lr()[0]:.6f} | "
                 f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min",
