@@ -542,8 +542,8 @@ class MiniEditorEnv:
             # Word wrap each paragraph
             remaining = para
             while len(remaining) > self._chars_per_line:
-                # Try to break at a space
-                break_at = remaining.rfind(" ", 0, self._chars_per_line)
+                # Try to break at a space (include the boundary position)
+                break_at = remaining.rfind(" ", 0, self._chars_per_line + 1)
                 if break_at <= 0:
                     # No space found, hard break
                     break_at = self._chars_per_line
