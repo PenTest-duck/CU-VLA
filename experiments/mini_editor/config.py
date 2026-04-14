@@ -253,7 +253,7 @@ class DataConfig:
     num_episodes: int = 10000
     num_shards: int = 10
     jpeg_quality: int = 95
-    output_dir: str = "data/mini_editor"
+    output_dir: str = "experiments/mini_editor/data"
 
 
 @dataclass(frozen=True)

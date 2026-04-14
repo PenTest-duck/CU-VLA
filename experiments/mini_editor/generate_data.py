@@ -143,12 +143,14 @@ def _episode_generator(
 
 def generate(
     num_episodes: int = DATA.num_episodes,
-    output_dir: str = DATA.output_dir,
+    output_dir: str | None = None,
     seed: int = 0,
     num_shards: int = DATA.num_shards,
     push_to_hub: str | None = None,
 ) -> None:
     """Main entry point: generate dataset and save."""
+    if output_dir is None:
+        output_dir = DATA.output_dir
     print(f"Generating {num_episodes} episodes (seed={seed})")
     print(f"Output: {output_dir}")
 
