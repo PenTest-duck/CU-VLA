@@ -174,3 +174,58 @@ Added per-head loss tracking (dx, dy, click, key, pad, kl) to history.pt and epo
 - **Checkpoint versioning:** Upload to `{backbone}_chunk{chunk_size}/{YYYYMMDD-HHMM}/` to avoid overwriting previous runs.
 - **GPU flavour naming:** API expects `l4x1` not `1x-l4`.
 - **`total_memory` not `total_mem`** for `torch.cuda.get_device_properties()`.
+
+## Open Questions & Decisions (2026-04-14)
+
+Reviewed all open questions from the current training run (resnet18, chunk=10, L40S, 100 epochs). Decisions made at epoch 15 with val_loss=0.107 (best at epoch 14).
+
+### Training progress at time of review
+
+| Epoch | val_total | dx | dy | click | key | kl | LR |
+|-------|-----------|------|------|-------|-------|-------|---------|
+| 4 | 0.190 | 0.055 | 0.070 | 0.000 | 0.006 | 2.09 | 3.2e-4 |
+| 5 | **0.572** | 0.077 | 0.112 | 0.004 | 0.057 | 3.73 | **4.0e-4** |
+| 8 | 0.144 | 0.041 | 0.046 | 0.000 | 0.003 | 1.14 | 4.0e-4 |
+| 10 | 0.128 | 0.041 | 0.037 | 0.000 | 0.001 | 0.95 | 4.0e-4 |
+| 14 | **0.107** | 0.033 | 0.030 | 0.000 | 0.001 | 0.62 | 3.9e-4 |
+| 15 | 0.146 | 0.032 | 0.038 | 0.000 | 0.006 | 0.53 | 3.9e-4 |
+
+### Decisions
+
+| # | Question | Decision | Rationale |
+|---|----------|----------|-----------|
+| 1 | Asymmetric key loss | **Monitor, don't implement** | Key loss at 0.000-0.006 after gradient normalisation — already solved. Flag if it regresses. |
+| 2 | Eval results | **Wait for training to finish** | Training still running. Per-head losses can look good while closed-loop eval fails at phase transitions (compounding BC errors). |
+| 3 | Loss weight rebalancing | **Reduce click/key from 5x to 2x next run** | Click (0.000) and key (0.001) are near-zero — 5x weights amplify noise on solved heads. dx/dy (0.033/0.030) are the remaining bottleneck and should get more relative gradient signal. |
+| 4 | JPEG cache vs memmap | **Closed — not needed** | L40S has 62GB RAM, 42GB memmap fits comfortably. Only revisit if hardware downsizes. |
+| 5 | max_delta_px clipping (50px/frame) | **Defer — 50px fine for 256×256** | At 30Hz, 50px/frame = 1500px/sec, crosses 256px screen in 0.17s. For future full-resolution scaling, the real issue is action representation (tanh with fixed scale can't serve both precision and range). Analysed log-space deltas vs discrete buckets — see below. |
+| 6 | Port optimisations to exp 3 | **After exp 2 eval** | Finish exp 2 end-to-end first. Exp 3 has a different action space (multi-binary held state) so not all optimisations may apply directly. |
+| 7 | Optimal LR (4e-4) | **Keep 4e-4** | Epoch 5 spike (0.19→0.57) was transient — model recovered to 0.107 by epoch 14. Cosine decay is handling the tail. Changing LR simultaneously with loss weights would confound comparison. |
+
+### Epoch 5 LR spike analysis
+
+Warmup completed at epoch 5 (LR hit full 4e-4). Val loss spiked 3x (0.190→0.572), all heads regressed. Gradient norms were hitting the clip ceiling (mean=68, max=100). However, the model fully recovered by epoch 8 (val=0.144) and continued improving to best-ever 0.107 at epoch 14. Conclusion: 4e-4 is at the aggressive edge but not destructive. The warmup→constant transition causes a transient shock that resolves within ~3 epochs.
+
+### Action representation analysis (future reference)
+
+For scaling beyond 256×256 to real screen resolutions, the current `tanh() * 50px` representation has a fundamental precision-range tradeoff. Two candidates analysed:
+
+**Log-space deltas** (predict `sign(δ) × log(|δ|+1)`, invert with `sign × (exp(|pred|) - 1)`):
+- Excellent precision near zero (where cursor accuracy matters most)
+- Natural compression of large ballistic movements
+- Matches Fitts's Law intuition (precision scales with log distance)
+- Weakness: regression output = single point estimate, cannot represent multimodal distributions (e.g., two valid targets equidistant from cursor → averages to zero)
+
+**Discrete buckets** (256 bins per dimension, cross-entropy loss):
+- Universal VLA baseline (RT-2, OpenVLA, Octo all use this)
+- Handles multimodality natively — softmax can express "either left or right"
+- Very stable training (classification is well-behaved)
+- Weakness: uniform bins have poor precision near zero (~4px bins over [-500,+500]). Fix: quantile-based binning (dense near zero, sparse at extremes)
+- Parameter cost: 256 output neurons per dimension vs 1 for regression
+
+**Advanced approaches from literature:**
+- FAST (DCT + BPE compression): 5-13x compression, dominates for high-frequency manipulation
+- OAT (learned tokeniser): coarse-to-fine structure, prefix-robust encoding, best overall but complex
+- Hybrid coarse+fine heads: biologically inspired (ballistic + corrective saccades)
+
+**Decision:** Deferred. Current 50px works for 256×256 experiments. Revisit when scaling to real screen resolutions. The multimodality argument favours discretisation long-term, but ACT's CVAE handles it for now.

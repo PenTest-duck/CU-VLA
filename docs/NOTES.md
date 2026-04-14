@@ -1,3 +1,5 @@
+=== HUMAN NOTES - IF YOU ARE AN AI AGENT, READ ONLY, DO NOT WRITE ===
+
 Representing mouse actions/movements in action space
   - We can make the assumption that AT MOST 1 of left click (L), right click (R), and scroll (D/U) will be taken simultaneously
     - SD/SU is one 'tick' of the scroll wheel per frame (e.g. 30 hz), or should it be velocity?
@@ -33,6 +35,14 @@ Frequency domain
 
 FAST tokeniser
 
-Typing test
+Typing test (TypeRacer/MonkeyType/10FastFingers style?)
+  - High-frequency key press primitives
+  - Tests simultaneous key presses (e.g. RShift+A)
+  - Should we differentiate LShift vs RShift, to mimic human typing?
+  - Order of pressing: RShift->Rshift+A (2 frames) or Rshift+A/A+RShift (single frame?)
 
 Don't clip cursor delta_x, delta_y at 50px/frame?
+Normalise cursor movements instead of pixels?
+  - Log-space deltas vs discrete exponential binning (like FDM1)
+
+osu!

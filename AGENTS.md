@@ -18,6 +18,8 @@ When you perform some major task, made some big decision, or wrote significant p
 
 You are encouraged to perform web research to ground yourself in latest literature/information/documentation using tools e.g. WebFetch, WebSearch, Firecrawl, Exa, context7.
 
+Do not run any training locally unless you have explicit approval - it is likely to cause OOM.
+
 ## Repo Layout
 
 Serves as a high-level table of contents.
@@ -76,6 +78,7 @@ uv run python experiments/act_drag_label/train.py --backbone resnet18 --chunk-si
 uv run python experiments/act_drag_label/train.py --hf-data-repo PenTest-duck/cu-vla-data --device mps  # from HF Hub
 uv run python experiments/act_drag_label/evaluate.py --backbone resnet18 --chunk-size 10
 uv run python experiments/act_drag_label/evaluate.py --visual            # with Pygame window
+uv run python experiments/act_drag_label/evaluate.py --model-only        # ACT only, skip expert/baseline/random
 ```
 
 **Code layout:**
@@ -85,11 +88,11 @@ uv run python experiments/act_drag_label/evaluate.py --visual            # with 
 | `env.py` | `DragLabelEnv` — Pygame-based Gym-style env (headless + visual modes) |
 | `expert.py` | Fitts's Law expert with drag + typing phases |
 | `backbones.py` | ResNet18, DINOv2 ViT-S/14, SigLIP2 base — all output (B, 49, 256) |
-| `model.py` | `ACT` — CVAE + transformer encoder-decoder + action heads (~33M params) |
+| `model.py` | `ACT` — transformer encoder-decoder + FiLM proprio + 49-bin discrete dx/dy heads (~28M params) |
 | `baseline_cnn.py` | `BaselineCNN` — extended TinyCNN, single-step no-chunking baseline |
 | `generate_data.py` | Runs expert, saves parquet dataset via HF `datasets` library |
-| `train.py` | BC training: chunk sampling, multi-head loss, KL annealing, AMP |
-| `evaluate.py` | Runs all agents, temporal ensemble, decomposed metrics by phase |
+| `train.py` | BC training: chunk sampling, CE loss on bins + BCE/CE for click/key, AMP |
+| `evaluate.py` | Runs all agents, probability-ensemble temporal smoothing, decomposed metrics |
 | `hf_sync.py` | Upload/download data and checkpoints to/from HuggingFace Hub |
 
 **Dataset format:** Parquet via HF `datasets` library (~10 shards). One row per timestep with columns: `episode_id`, `timestep`, `image` (PNG), `action_dx/dy/click/key`, episode metadata. Loaded via `load_dataset("PenTest-duck/cu-vla-data")` or `load_from_disk("data/")`.
