@@ -2,10 +2,15 @@
 
 Contains both low-level movement primitives (Fitts's Law with human variance)
 and the high-level episode state machine for all 4 edit operations.
+
+Visual demo:
+    uv run python -m experiments.mini_editor.expert --visual -n 10
+    uv run python -m experiments.mini_editor.expert --visual --operation select_delete
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 
 import numpy as np
@@ -692,3 +697,83 @@ def run_episode(
     # Trim: obs[t] is the state when action[t] was chosen
     observations = observations[: len(actions)]
     return observations, actions, final_info
+
+
+# -----------------------------------------------------------------------
+# CLI — visual demo
+# -----------------------------------------------------------------------
+
+
+def visualize(num_episodes: int = 10, operation: str | None = None, seed: int = 42, fps: int = 30) -> None:
+    """Run expert episodes in a visible Pygame window."""
+    from .corpus import extract_words, load_corpus, make_passage
+    from .env import MiniEditorEnv
+    from .instructions import EditInstruction, generate_instruction
+
+    corpus = load_corpus()
+    print(f"Loaded corpus: {len(corpus)} sentences")
+
+    env = MiniEditorEnv(visual=True, fps=fps)
+    rng = np.random.default_rng(seed)
+
+    successes = 0
+    for i in range(num_episodes):
+        passage = None
+        for _ in range(100):
+            passage = make_passage(corpus, rng)
+            if passage is not None:
+                break
+        if passage is None:
+            print(f"Episode {i}: failed to generate passage, skipping")
+            continue
+
+        words = extract_words(passage)
+        inst = generate_instruction(passage, words, rng)
+
+        # Filter by operation if requested
+        if operation is not None:
+            for _ in range(50):
+                if inst.operation == operation:
+                    break
+                inst = generate_instruction(passage, words, rng)
+            else:
+                continue
+
+        print(f"Episode {i}: [{inst.operation}] {inst.instruction_text}")
+
+        env.reset(passage, seed=int(rng.integers(0, 2**31)))
+        env.set_expected_text(inst.expected_text)
+        traj = generate_episode_trajectory(env, inst, rng)
+
+        # Replay
+        env.reset(passage, seed=int(rng.integers(0, 2**31)))
+        env.set_expected_text(inst.expected_text)
+        for action in traj:
+            obs, done, info = env.step(action)
+            if done:
+                break
+
+        success = env.text == inst.expected_text
+        if success:
+            successes += 1
+        print(f"  {len(traj)} steps, success={success}")
+
+    print(f"\nTotal: {successes}/{num_episodes} successes")
+    env.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visualize expert demos")
+    parser.add_argument("--visual", action="store_true", default=True, help="Show Pygame window (default)")
+    parser.add_argument("-n", "--num-episodes", type=int, default=10)
+    parser.add_argument("--operation", type=str, default=None, choices=["click", "click_type", "select_delete", "replace"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fps", type=int, default=30)
+    args = parser.parse_args()
+
+    visualize(
+        num_episodes=args.num_episodes,
+        operation=args.operation,
+        seed=args.seed,
+        fps=args.fps,
+    )
