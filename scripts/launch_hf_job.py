@@ -11,7 +11,7 @@ Usage (Exp 2):
 
 The dataset is auto-downloaded from HF Hub inside the training script.
 Pass --experiment exp2|exp3 after -- to select which experiment to train.
-Defaults to exp3 (MiniWoB-Pygame). Default GPU is 1xL4 (24GB, bf16).
+Defaults to exp3 (MiniWoB-Pygame). Default GPU is 1xL4 (24GB, bf16), 12h timeout.
 """
 
 import argparse
@@ -31,8 +31,8 @@ def main() -> None:
     )
     parser.add_argument("--flavor", type=str, default="1x-l4",
                         help="HF Jobs hardware flavor (default: 1x-l4)")
-    parser.add_argument("--timeout", type=str, default="4h",
-                        help="Job timeout (default: 4h)")
+    parser.add_argument("--timeout", type=str, default="12h",
+                        help="Job timeout (default: 12h)")
     parser.add_argument("--namespace", type=str, default=None,
                         help="HF namespace to run the job in")
     parser.add_argument("--detach", action="store_true",

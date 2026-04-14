@@ -160,9 +160,7 @@ class ChunkDataset(Dataset):
         actions_cvae[:real_len, 0] = dx_chunk[:real_len]
         actions_cvae[:real_len, 1] = dy_chunk[:real_len]
         actions_cvae[:real_len, 2] = click_chunk[:real_len]
-        for i in range(real_len):
-            k = key_chunk[i].item()
-            actions_cvae[i, 3 + k] = 1.0
+        actions_cvae[torch.arange(real_len), 3 + key_chunk[:real_len]] = 1.0
 
         return obs, proprio, actions_cvae, dx_chunk, dy_chunk, click_chunk, key_chunk, pad_mask
 
@@ -244,9 +242,9 @@ def train(
 
     print(f"Train: {len(train_ids)} episodes, Val: {len(val_ids)} episodes")
 
-    # Default num_workers: 4 for CUDA (overlap data loading with GPU), 0 for MPS/CPU
+    # Default num_workers: 8 for CUDA (overlap data loading with GPU), 0 for MPS/CPU
     if num_workers is None:
-        num_workers = 4 if device.startswith("cuda") else 0
+        num_workers = 8 if device.startswith("cuda") else 0
 
     print(f"DataLoader workers: {num_workers}")
 
@@ -258,12 +256,12 @@ def train(
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, persistent_workers=num_workers > 0,
-        pin_memory=use_cuda,
+        pin_memory=use_cuda, prefetch_factor=4 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, persistent_workers=num_workers > 0,
-        pin_memory=use_cuda,
+        pin_memory=use_cuda, prefetch_factor=4 if num_workers > 0 else None,
     )
 
     # Model
@@ -343,14 +341,14 @@ def train(
 
         for batch_idx, batch in enumerate(train_loader):
             (obs, proprio, actions_cvae, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = batch
-            obs = obs.to(device)
-            proprio = proprio.to(device)
-            actions_cvae = actions_cvae.to(device)
-            dx_gt = dx_gt.to(device)
-            dy_gt = dy_gt.to(device)
-            click_gt = click_gt.to(device)
-            key_gt = key_gt.to(device)
-            pad_gt = pad_gt.to(device)
+            obs = obs.to(device, non_blocking=True)
+            proprio = proprio.to(device, non_blocking=True)
+            actions_cvae = actions_cvae.to(device, non_blocking=True)
+            dx_gt = dx_gt.to(device, non_blocking=True)
+            dy_gt = dy_gt.to(device, non_blocking=True)
+            click_gt = click_gt.to(device, non_blocking=True)
+            key_gt = key_gt.to(device, non_blocking=True)
+            pad_gt = pad_gt.to(device, non_blocking=True)
 
             with torch.amp.autocast(
                 device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp
@@ -447,14 +445,14 @@ def train(
                 (obs, proprio, actions_cvae, dx_gt, dy_gt, click_gt, key_gt, pad_gt) = (
                     batch
                 )
-                obs = obs.to(device)
-                proprio = proprio.to(device)
-                actions_cvae = actions_cvae.to(device)
-                dx_gt = dx_gt.to(device)
-                dy_gt = dy_gt.to(device)
-                click_gt = click_gt.to(device)
-                key_gt = key_gt.to(device)
-                pad_gt = pad_gt.to(device)
+                obs = obs.to(device, non_blocking=True)
+                proprio = proprio.to(device, non_blocking=True)
+                actions_cvae = actions_cvae.to(device, non_blocking=True)
+                dx_gt = dx_gt.to(device, non_blocking=True)
+                dy_gt = dy_gt.to(device, non_blocking=True)
+                click_gt = click_gt.to(device, non_blocking=True)
+                key_gt = key_gt.to(device, non_blocking=True)
+                pad_gt = pad_gt.to(device, non_blocking=True)
 
                 out = model(obs, proprio, actions_cvae)
 
