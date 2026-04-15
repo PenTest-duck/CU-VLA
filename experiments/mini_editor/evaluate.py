@@ -128,11 +128,25 @@ class ACTAgent:
         self.device = torch.device(device)
         self.chunk_size = chunk_size
 
-        # Build text encoder with same vocab as training
+        # Load checkpoint first to get token_id_map if saved
+        state = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        saved_token_map = state.pop("__token_id_map__", None)
+
+        # Build text encoder — use saved token_id_map for exact vocab match,
+        # fall back to rebuilding from corpus if not in checkpoint
         print("  Building text encoder...", flush=True)
-        text_encoder, self.tokenizer, self.token_map = build_text_encoder(
-            corpus_sentences
-        )
+        if saved_token_map is not None:
+            # Build with just templates (vocab size doesn't matter),
+            # then override the token map and resize embedding
+            text_encoder, self.tokenizer, _ = build_text_encoder()
+            self.token_map = saved_token_map
+            vocab_size = max(saved_token_map.values()) + 1
+            text_encoder.resize_vocab(vocab_size)
+        else:
+            text_encoder, self.tokenizer, self.token_map = build_text_encoder(
+                corpus_sentences
+            )
 
         # Build model with text encoder
         self.model = ACT(
@@ -140,8 +154,6 @@ class ACTAgent:
             text_encoder=text_encoder,
         ).to(self.device)
 
-        state = torch.load(checkpoint, map_location=self.device, weights_only=True)
-        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         self.model.load_state_dict(state)
         self.model.train(False)
 

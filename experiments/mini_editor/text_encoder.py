@@ -137,6 +137,15 @@ class TextEncoder(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
+    def resize_vocab(self, new_vocab_size: int) -> None:
+        """Replace embedding layer with one of a different vocab size.
+
+        Used at eval time when loading a checkpoint with a different
+        vocab than the freshly-built encoder. The weights will be
+        overwritten by load_state_dict anyway.
+        """
+        self.embedding = nn.Embedding(new_vocab_size, self.d_model)
+
     def forward(
         self,
         input_ids: torch.Tensor,

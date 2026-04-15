@@ -1422,6 +1422,8 @@ def train(
                 k.removeprefix("_orig_mod."): v
                 for k, v in model.state_dict().items()
             }
+            # Save token_id_map so eval can rebuild the exact vocab
+            state["__token_id_map__"] = token_id_map
             torch.save(state, best_pt_path)
             if hf_upload_repo:
                 _upload_checkpoint_async(
@@ -1456,6 +1458,7 @@ def train(
         k.removeprefix("_orig_mod."): v
         for k, v in model.state_dict().items()
     }
+    state["__token_id_map__"] = token_id_map
     torch.save(state, os.path.join(checkpoint_dir, "final.pt"))
     torch.save(history, os.path.join(checkpoint_dir, "history.pt"))
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
