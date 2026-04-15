@@ -1015,29 +1015,35 @@ def load_dataset_splits(
         ds, tokenizer, token_id_map
     )
 
-    # Extract raw JPEG bytes from Arrow dataset into a flat Python list.
-    # ~30KB/image × 508K = ~15GB. This eliminates Arrow table access during
-    # training (no GIL contention, no Arrow locks in DataLoader workers).
+    # Extract raw JPEG bytes directly from Arrow without PIL decode.
+    # HF datasets Image(decode=False) returns {"bytes": b"...", "path": ...}
+    # giving us the raw compressed bytes with zero decode overhead.
+    # ~30KB/image × 508K = ~15GB. After extraction, delete the Arrow dataset
+    # to free ~36GB — net RAM drops from ~55GB to ~20GB.
+    from datasets import Image as HFImage
+
     t_img = time.perf_counter()
-    print("Extracting image bytes from dataset ...", flush=True)
+    print("Extracting raw image bytes from dataset (no decode) ...", flush=True)
     n_samples = len(ds)
+
+    # Disable image auto-decoding to get raw bytes
+    ds_raw = ds.cast_column("image", HFImage(decode=False))
+
+    # Extract in batches to show progress
     jpeg_bytes: list[bytes] = [None] * n_samples  # type: ignore[list-item]
-    EXTRACT_BATCH = 10000
+    EXTRACT_BATCH = 50000
     for start in range(0, n_samples, EXTRACT_BATCH):
         end = min(start + EXTRACT_BATCH, n_samples)
-        batch = ds[start:end]
-        for j, img in enumerate(batch["image"]):
-            import io
+        batch = ds_raw[start:end]
+        for j, img_dict in enumerate(batch["image"]):
+            jpeg_bytes[start + j] = img_dict["bytes"]
+        elapsed = time.perf_counter() - t_img
+        print(
+            f"  {end}/{n_samples} images extracted "
+            f"({elapsed:.1f}s, {end / elapsed:.0f} img/s)",
+            flush=True,
+        )
 
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=95)
-            jpeg_bytes[start + j] = buf.getvalue()
-        if (start // EXTRACT_BATCH) % 10 == 0:
-            print(
-                f"  {end}/{n_samples} images extracted "
-                f"({time.perf_counter() - t_img:.1f}s)",
-                flush=True,
-            )
     jpeg_gb = sum(len(b) for b in jpeg_bytes) / 1024**3
     print(
         f"Image bytes extracted in {time.perf_counter() - t_img:.1f}s "
@@ -1046,7 +1052,7 @@ def load_dataset_splits(
     )
 
     # Free the Arrow dataset — all data now in extracted arrays
-    del ds
+    del ds, ds_raw
     import gc
 
     gc.collect()
