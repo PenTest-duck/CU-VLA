@@ -6,43 +6,39 @@ import pytest
 
 def test_act_forward_pass_shapes():
     from experiments.miniwob_pygame.model import ACT
-    from experiments.miniwob_pygame.config import MODEL, ACTION
+    from experiments.miniwob_pygame.config import MODEL, ACTION, NUM_BINS
 
     model = ACT(backbone_name="resnet18", chunk_size=10)
     B = 4
     images = torch.randn(B, 3, 224, 224)
     proprio = torch.randn(B, MODEL.proprio_dim)  # 46
-    action_dim = 2 + 1 + ACTION.num_keys  # 46
-    actions = torch.randn(B, 10, action_dim)
+    out = model(images, proprio)
 
-    out = model(images, proprio, actions)
-
-    assert out["dx"].shape == (B, 10)
-    assert out["dy"].shape == (B, 10)
+    assert out["dx_logits"].shape == (B, 10, NUM_BINS)
+    assert out["dy_logits"].shape == (B, 10, NUM_BINS)
     assert out["mouse_left"].shape == (B, 10)
     assert out["keys_held"].shape == (B, 10, ACTION.num_keys)
     assert out["pad_logits"].shape == (B, 10)
-    assert out["mu"].shape == (B, MODEL.latent_dim)
-    assert out["logvar"].shape == (B, MODEL.latent_dim)
 
 
-def test_act_inference_no_actions():
+def test_act_forward_is_stable_for_same_input():
     from experiments.miniwob_pygame.model import ACT
     from experiments.miniwob_pygame.config import MODEL
 
     model = ACT(backbone_name="resnet18", chunk_size=10)
-    model.eval()
+    model.train(False)
     B = 2
     images = torch.randn(B, 3, 224, 224)
     proprio = torch.randn(B, MODEL.proprio_dim)
 
     with torch.no_grad():
-        out = model(images, proprio, actions=None)
+        out_a = model(images, proprio)
+        out_b = model(images, proprio)
 
-    assert out["dx"].shape == (B, 10)
-    assert out["mouse_left"].shape == (B, 10)
-    assert out["keys_held"].shape == (B, 10, 43)
-    assert torch.all(out["mu"] == 0)
+    assert torch.allclose(out_a["dx_logits"], out_b["dx_logits"])
+    assert torch.allclose(out_a["dy_logits"], out_b["dy_logits"])
+    assert torch.allclose(out_a["mouse_left"], out_b["mouse_left"])
+    assert torch.allclose(out_a["keys_held"], out_b["keys_held"])
 
 
 def test_baseline_cnn_forward():

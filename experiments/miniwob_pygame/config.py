@@ -125,6 +125,8 @@ class EnvConfig:
 class ActionConfig:
     max_delta_px: float = 50.0
     num_keys: int = NUM_KEYS
+    num_bins_per_side: int = 24  # 24 negative + 1 zero + 24 positive = 49 total
+    bin_alpha: float = 3.0       # exponential curve parameter
 
 
 @dataclass(frozen=True)
@@ -135,7 +137,7 @@ class ModelConfig:
     nheads: int = 8
     dim_feedforward: int = 2048
     dropout: float = 0.1
-    latent_dim: int = 32
+    film_hidden_dim: int = 128
     num_vision_tokens: int = 49
     proprio_dim: int = 46  # 2 (mouse_xy) + 1 (mouse_btn) + 43 (keys_held)
     backbone_feature_dims: dict[str, int] = field(default_factory=lambda: {
@@ -150,6 +152,7 @@ class ChunkConfig:
     default_chunk_size: int = 10
     query_frequency: int = 1
     ensemble_decay: float = 0.01
+    key_decay: float = 0.5  # faster decay for key channels in temporal ensemble
 
 
 @dataclass(frozen=True)
@@ -162,11 +165,13 @@ class TrainConfig:
     epochs: int = 100
     early_stop_patience: int = 15
     val_fraction: float = 0.2
-    kl_weight_max: float = 0.1
-    kl_anneal_fraction: float = 0.2
     loss_weight_mouse: float = 5.0
     loss_weight_keys: float = 5.0
     loss_weight_pad: float = 1.0
+    bin_smooth_sigma: float = 1.5  # Gaussian label smoothing σ in bin units
+    loss_weight_ev: float = 1.0    # weight for expected-value L1 loss on dx/dy
+    grad_clip_norm: float = 100.0
+    warmup_epochs: int = 5
     use_amp: bool = True
 
 
@@ -198,3 +203,43 @@ CHUNK = ChunkConfig()
 TRAIN = TrainConfig()
 EVAL_CFG = EvalConfig()
 EXPERT = ExpertConfig()
+
+# ---------------------------------------------------------------------------
+# Bin-related constants (computed once at import time)
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+
+def build_bin_centers() -> np.ndarray:
+    """Precompute 49 exponential bin centers in pixel space.
+
+    Returns: (49,) array: [neg_24, ..., neg_1, 0, pos_1, ..., pos_24]
+    """
+    n = ACTION.num_bins_per_side
+    alpha = ACTION.bin_alpha
+    max_px = ACTION.max_delta_px
+    i = np.arange(1, n + 1, dtype=np.float64)
+    pos = (np.exp(alpha * i / n) - 1) / (np.exp(alpha) - 1) * max_px
+    centers = np.concatenate([-pos[::-1], [0.0], pos]).astype(np.float32)
+    return centers
+
+
+BIN_CENTERS = build_bin_centers()  # (49,) — shared constant
+NUM_BINS = 2 * ACTION.num_bins_per_side + 1  # 49
+
+
+def build_soft_bin_targets(sigma: float) -> np.ndarray:
+    """Precompute Gaussian-smoothed soft targets for each bin.
+
+    Returns: (49, 49) array where row i is the soft target distribution
+    when the true bin is i.
+    """
+    arange = np.arange(NUM_BINS, dtype=np.float64)
+    diff = arange[None, :] - arange[:, None]
+    soft = np.exp(-0.5 * (diff / sigma) ** 2)
+    soft /= soft.sum(axis=1, keepdims=True)
+    return soft.astype(np.float32)
+
+
+SOFT_BIN_TARGETS = build_soft_bin_targets(TRAIN.bin_smooth_sigma)  # (49, 49)

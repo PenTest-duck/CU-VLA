@@ -1,6 +1,7 @@
 """Unified evaluation: run agents across MiniWoB-Pygame tasks and report metrics.
 
-Compares: expert, ACT (with temporal ensemble), baseline CNN, and random agent.
+Compares: expert, ACT (with probability-ensemble temporal smoothing), baseline CNN,
+and random agent.
 Reports per-task and aggregate: success rate, mean steps, p50/p95, loop latency, Hz.
 """
 
@@ -16,7 +17,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from experiments.miniwob_pygame.config import (
-    ACTION, CHUNK, ENV, EVAL_CFG, NUM_KEYS, TASK_NAMES,
+    ACTION, BIN_CENTERS, CHUNK, ENV, EVAL_CFG, NUM_BINS, NUM_KEYS, TASK_NAMES,
 )
 from experiments.miniwob_pygame.model import ACT
 from experiments.miniwob_pygame.baseline_cnn import BaselineCNN
@@ -42,11 +43,39 @@ def build_proprio(env) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint resolution
+# ---------------------------------------------------------------------------
+
+def resolve_checkpoint(
+    local_path: str,
+    hf_repo: str | None,
+    path_in_repo: str,
+) -> str | None:
+    """Return a local checkpoint path, downloading from HF Hub if needed.
+
+    Returns None if the checkpoint isn't available locally or on Hub.
+    """
+    if hf_repo is None:
+        return local_path if os.path.exists(local_path) else None
+
+    from huggingface_hub import hf_hub_download
+    try:
+        downloaded = hf_hub_download(
+            hf_repo, path_in_repo, repo_type="model",
+            local_dir=os.path.dirname(local_path),
+        )
+        print(f"  Checkpoint synced from {hf_repo}/{path_in_repo}", flush=True)
+        return downloaded
+    except Exception:
+        return local_path if os.path.exists(local_path) else None
+
+
+# ---------------------------------------------------------------------------
 # Agent wrappers
 # ---------------------------------------------------------------------------
 
 class ACTAgent:
-    """Wraps a trained ACT model with temporal ensemble for inference."""
+    """Wraps a trained ACT model with probability-ensemble temporal smoothing."""
 
     def __init__(
         self,
@@ -64,7 +93,7 @@ class ACTAgent:
         state = torch.load(checkpoint, map_location=self.device, weights_only=True)
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         self.model.load_state_dict(state)
-        self.model.eval()
+        self.model.train(False)
         self.active_chunks: list[dict] = []
 
     def reset(self) -> None:
@@ -80,49 +109,56 @@ class ACTAgent:
         ).to(self.device)
         p = torch.from_numpy(proprio).unsqueeze(0).float().to(self.device)
 
-        # Forward (inference: no actions, z=0)
-        out = self.model(x, p, actions=None)
+        # Forward — no CVAE, just (images, proprio)
+        out = self.model(x, p)
 
-        # Extract new chunk as numpy arrays
-        dx_chunk = out["dx"][0].cpu().numpy()                         # (chunk_size,)
-        dy_chunk = out["dy"][0].cpu().numpy()                         # (chunk_size,)
-        mouse_chunk = torch.sigmoid(out["mouse_left"][0]).cpu().numpy()  # (chunk_size,)
-        keys_chunk = torch.sigmoid(out["keys_held"][0]).cpu().numpy()    # (chunk_size, 43)
+        # Store softmax/sigmoid distributions (not raw logits)
+        dx_probs = torch.softmax(out["dx_logits"][0], dim=-1).cpu().numpy()  # (chunk, 49)
+        dy_probs = torch.softmax(out["dy_logits"][0], dim=-1).cpu().numpy()  # (chunk, 49)
+        mouse_chunk = torch.sigmoid(out["mouse_left"][0]).cpu().numpy()      # (chunk,)
+        keys_chunk = torch.sigmoid(out["keys_held"][0]).cpu().numpy()        # (chunk, 43)
 
-        new_chunk = {
-            "dx": dx_chunk,
-            "dy": dy_chunk,
+        self.active_chunks.append({
+            "dx_probs": dx_probs,
+            "dy_probs": dy_probs,
             "mouse": mouse_chunk,
             "keys": keys_chunk,
             "age": 0,
-        }
-        self.active_chunks.append(new_chunk)
+        })
 
-        # Temporal ensemble: blend active chunks for current step
-        # w_i = exp(-decay * age_i)
+        # Probability ensemble: blend all distributions consistently
         total_w = 0.0
-        blended_dx = 0.0
-        blended_dy = 0.0
+        blended_dx = np.zeros(NUM_BINS, dtype=np.float32)
+        blended_dy = np.zeros(NUM_BINS, dtype=np.float32)
         blended_mouse = 0.0
         blended_keys = np.zeros(ACTION.num_keys, dtype=np.float32)
+
+        # Separate faster decay for key channels to prevent stale keypresses
+        total_w_keys = 0.0
 
         for chunk in self.active_chunks:
             age = chunk["age"]
             if age >= self.chunk_size:
                 continue
             w = np.exp(-CHUNK.ensemble_decay * age)
+            w_keys = np.exp(-CHUNK.key_decay * age)
             total_w += w
-            blended_dx += w * chunk["dx"][age]
-            blended_dy += w * chunk["dy"][age]
+            total_w_keys += w_keys
+            blended_dx += w * chunk["dx_probs"][age]
+            blended_dy += w * chunk["dy_probs"][age]
             blended_mouse += w * chunk["mouse"][age]
-            blended_keys += w * chunk["keys"][age]
+            blended_keys += w_keys * chunk["keys"][age]
 
         if total_w > 0:
             blended_dx /= total_w
             blended_dy /= total_w
             blended_mouse /= total_w
-            blended_keys /= total_w
+        if total_w_keys > 0:
+            blended_keys /= total_w_keys
 
+        # Expected value: dot product of blended distribution with bin centers
+        dx_out = float(np.dot(blended_dx, BIN_CENTERS))
+        dy_out = float(np.dot(blended_dy, BIN_CENTERS))
         mouse_out = 1 if blended_mouse > 0.5 else 0
         keys_out = [1 if blended_keys[i] > 0.5 else 0 for i in range(ACTION.num_keys)]
 
@@ -134,8 +170,8 @@ class ACTAgent:
         ]
 
         return {
-            "dx": float(blended_dx),
-            "dy": float(blended_dy),
+            "dx": dx_out,
+            "dy": dy_out,
             "mouse_left": mouse_out,
             "keys_held": keys_out,
         }
@@ -150,7 +186,7 @@ class BaselineCNNAgent:
         state = torch.load(checkpoint, map_location=self.device, weights_only=True)
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         self.model.load_state_dict(state)
-        self.model.eval()
+        self.model.train(False)
 
     def reset(self) -> None:
         pass
@@ -414,12 +450,13 @@ def main(
     num_episodes: int = EVAL_CFG.num_episodes,
     visual: bool = False,
     device: str = "cpu",
+    hf_checkpoint_repo: str | None = None,
+    model_only: bool = False,
 ) -> None:
     if tasks is None:
         tasks = list(TASK_NAMES)
 
     base = os.path.dirname(__file__)
-    max_steps = EVAL_CFG.max_steps_per_episode
 
     # Track results across tasks for aggregate summary
     all_results: dict[str, dict[str, dict]] = {}
@@ -432,24 +469,31 @@ def main(
 
         EnvClass = get_env_class(task_name)
         env = EnvClass(visual=visual, fps=ENV.control_hz if visual else 0)
+        max_steps = int(env._get_max_steps())
         all_results[task_name] = {}
 
-        # --- Expert ---
-        expert_name = "Expert"
-        print(f"\nRunning expert on {task_name}...")
-        expert = ExpertAgent(task_name)
-        expert_results = run_agent(expert, env, num_episodes, max_steps)
-        print_metrics(expert_results, f"Expert ({task_name})")
-        all_results[task_name][expert_name] = expert_results
-        if expert_name not in agent_names_seen:
-            agent_names_seen.append(expert_name)
+        if not model_only:
+            # --- Expert ---
+            expert_name = "Expert"
+            print(f"\nRunning expert on {task_name}...")
+            expert = ExpertAgent(task_name)
+            expert_results = run_agent(expert, env, num_episodes, max_steps)
+            print_metrics(expert_results, f"Expert ({task_name})")
+            all_results[task_name][expert_name] = expert_results
+            if expert_name not in agent_names_seen:
+                agent_names_seen.append(expert_name)
 
         # --- ACT ---
-        act_ckpt = checkpoint or os.path.join(
-            base, "checkpoints", "act_best.pt"
+        act_default = os.path.join(
+            base, "checkpoints", f"{backbone}_chunk{chunk_size}", "best.pt"
+        )
+        act_ckpt = checkpoint or resolve_checkpoint(
+            act_default,
+            hf_checkpoint_repo,
+            f"{backbone}_chunk{chunk_size}/best.pt",
         )
         act_name = f"ACT (backbone={backbone}, chunk={chunk_size})"
-        if os.path.exists(act_ckpt):
+        if act_ckpt and os.path.exists(act_ckpt):
             print(f"\nRunning ACT on {task_name} ({act_ckpt})...")
             act_agent = ACTAgent(
                 act_ckpt,
@@ -463,33 +507,39 @@ def main(
             if act_name not in agent_names_seen:
                 agent_names_seen.append(act_name)
         else:
-            print(f"\nNo ACT checkpoint at {act_ckpt}. Skipping.")
+            print(f"\nNo ACT checkpoint found. Skipping.")
 
-        # --- Baseline CNN ---
-        baseline_ckpt = checkpoint or os.path.join(
-            base, "checkpoints", "baseline_best.pt"
-        )
-        baseline_name = "BaselineCNN"
-        if os.path.exists(baseline_ckpt) and checkpoint != act_ckpt:
-            print(f"\nRunning BaselineCNN on {task_name} ({baseline_ckpt})...")
-            baseline_agent = BaselineCNNAgent(baseline_ckpt, device=device)
-            baseline_results = run_agent(baseline_agent, env, num_episodes, max_steps)
-            print_metrics(baseline_results, f"BaselineCNN ({task_name})")
-            all_results[task_name][baseline_name] = baseline_results
-            if baseline_name not in agent_names_seen:
-                agent_names_seen.append(baseline_name)
-        elif not checkpoint:
-            print(f"\nNo BaselineCNN checkpoint at {baseline_ckpt}. Skipping.")
+        if not model_only:
+            # --- Baseline CNN ---
+            baseline_default = os.path.join(
+                base, "checkpoints", "baseline", "best.pt"
+            )
+            baseline_ckpt = resolve_checkpoint(
+                baseline_default,
+                hf_checkpoint_repo,
+                "baseline/best.pt",
+            )
+            baseline_name = "BaselineCNN"
+            if baseline_ckpt and os.path.exists(baseline_ckpt):
+                print(f"\nRunning BaselineCNN on {task_name} ({baseline_ckpt})...")
+                baseline_agent = BaselineCNNAgent(baseline_ckpt, device=device)
+                baseline_results = run_agent(baseline_agent, env, num_episodes, max_steps)
+                print_metrics(baseline_results, f"BaselineCNN ({task_name})")
+                all_results[task_name][baseline_name] = baseline_results
+                if baseline_name not in agent_names_seen:
+                    agent_names_seen.append(baseline_name)
+            else:
+                print(f"\nNo BaselineCNN checkpoint found. Skipping.")
 
-        # --- Random ---
-        random_name = "Random"
-        print(f"\nRunning random baseline on {task_name}...")
-        random_agent = RandomAgent()
-        random_results = run_agent(random_agent, env, num_episodes, max_steps)
-        print_metrics(random_results, f"Random ({task_name})")
-        all_results[task_name][random_name] = random_results
-        if random_name not in agent_names_seen:
-            agent_names_seen.append(random_name)
+            # --- Random ---
+            random_name = "Random"
+            print(f"\nRunning random baseline on {task_name}...")
+            random_agent = RandomAgent()
+            random_results = run_agent(random_agent, env, num_episodes, max_steps)
+            print_metrics(random_results, f"Random ({task_name})")
+            all_results[task_name][random_name] = random_results
+            if random_name not in agent_names_seen:
+                agent_names_seen.append(random_name)
 
         env.close()
 
@@ -516,7 +566,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--checkpoint", type=str, default=None,
-        help="Path to model checkpoint"
+        help="Path to ACT checkpoint (does not override baseline checkpoint)"
     )
     parser.add_argument(
         "-n", "--num-episodes", type=int, default=EVAL_CFG.num_episodes,
@@ -530,6 +580,14 @@ if __name__ == "__main__":
         "--device", type=str, default="cpu",
         help="Torch device (cpu, cuda, mps)"
     )
+    parser.add_argument(
+        "--hf-checkpoint-repo", type=str, default=None,
+        help="HF model repo to auto-download checkpoints from"
+    )
+    parser.add_argument(
+        "--model-only", action="store_true",
+        help="Only evaluate ACT model, skip expert/baseline/random"
+    )
     args = parser.parse_args()
 
     main(
@@ -540,4 +598,6 @@ if __name__ == "__main__":
         num_episodes=args.num_episodes,
         visual=args.visual,
         device=args.device,
+        hf_checkpoint_repo=args.hf_checkpoint_repo,
+        model_only=args.model_only,
     )

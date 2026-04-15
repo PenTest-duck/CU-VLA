@@ -21,7 +21,7 @@ import sys
 from huggingface_hub import run_uv_job
 
 
-SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "hf_job_train.py")
+DEFAULT_SCRIPT = os.path.join(os.path.dirname(__file__), "hf_job_train.py")
 
 
 def main() -> None:
@@ -35,6 +35,8 @@ def main() -> None:
                         help="Job timeout (default: 12h)")
     parser.add_argument("--namespace", type=str, default=None,
                         help="HF namespace to run the job in")
+    parser.add_argument("--script", type=str, default=DEFAULT_SCRIPT,
+                        help=f"UV script to run (default: {os.path.basename(DEFAULT_SCRIPT)})")
     parser.add_argument("--detach", action="store_true",
                         help="Print job ID and return immediately")
 
@@ -50,10 +52,11 @@ def main() -> None:
 
     args = parser.parse_args(launcher_argv)
 
+    script_path = args.script
     print(f"Launching HF Job:")
     print(f"  Flavor:  {args.flavor}")
     print(f"  Timeout: {args.timeout}")
-    print(f"  Script:  {SCRIPT_PATH}")
+    print(f"  Script:  {script_path}")
     print(f"  Args:    {train_argv}")
 
     kwargs = {}
@@ -70,7 +73,7 @@ def main() -> None:
         print("  WARNING: No HF token found. Run `huggingface-cli login` first.")
 
     job = run_uv_job(
-        SCRIPT_PATH,
+        script_path,
         script_args=train_argv,
         flavor=args.flavor,
         timeout=args.timeout,

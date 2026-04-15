@@ -16,3 +16,4 @@ experiments/*/results/
 
 .firecrawl
 .pytest_cache
+.DS_Store

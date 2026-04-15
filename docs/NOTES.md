@@ -46,3 +46,8 @@ Normalise cursor movements instead of pixels?
   - Log-space deltas vs discrete exponential binning (like FDM1)
 
 osu!
+
+AWS SageMaker
+
+How to split off into differen system-levels or by frequency domain
+  - Probably reasoning -> primitive instructions "type ABC", "click the help button" into high-hz trajectories

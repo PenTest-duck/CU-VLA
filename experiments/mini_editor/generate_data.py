@@ -167,8 +167,10 @@ def generate(
 ) -> None:
     """Generate dataset using multiprocessing.
 
-    Each worker generates a shard of episodes in parallel, then shards
-    are concatenated into the final dataset.
+    Each worker generates a shard of episodes in parallel. Shards are
+    pushed to Hub incrementally (one at a time) to avoid loading the
+    full dataset into RAM. For local save, shards are concatenated
+    sequentially with each shard freed after writing.
     """
     if output_dir is None:
         output_dir = DATA.output_dir
@@ -200,28 +202,60 @@ def generate(
         with Pool(num_workers) as pool:
             shard_dirs = pool.map(_generate_shard, shard_args)
 
-    # Concatenate shards
-    print(f"\nConcatenating {len(shard_dirs)} shards...")
-    shards = [Dataset.load_from_disk(d) for d in shard_dirs]
-    ds = concatenate_datasets(shards)
-
-    # Save final dataset
-    print(f"Saving to {output_dir} ({num_shards} shards)...")
-    ds.save_to_disk(output_dir, num_shards=num_shards)
-
-    # Clean up temp shard dirs
     import shutil
+
+    if push_to_hub:
+        # Push each worker shard as a parquet file directly to Hub.
+        # Only one shard is in RAM at a time — safe for 8GB machines.
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(push_to_hub, repo_type="dataset", exist_ok=True)
+
+        n_shards = len(shard_dirs)
+        total_rows = 0
+        print(f"\nUploading {n_shards} shards to {push_to_hub} ...")
+        for i, shard_dir in enumerate(shard_dirs):
+            ds = Dataset.load_from_disk(shard_dir)
+            total_rows += len(ds)
+
+            # Save as parquet to a temp file, then upload
+            parquet_name = f"train-{i:05d}-of-{n_shards:05d}.parquet"
+            parquet_path = os.path.join(output_dir, parquet_name)
+            print(f"  Shard {i+1}/{n_shards}: {len(ds)} rows -> {parquet_name}")
+            ds.to_parquet(parquet_path)
+            del ds
+
+            api.upload_file(
+                path_or_fileobj=parquet_path,
+                path_in_repo=f"data/{parquet_name}",
+                repo_id=push_to_hub,
+                repo_type="dataset",
+            )
+            os.remove(parquet_path)
+            print(f"    Uploaded and cleaned up.")
+
+            # Free the temp shard dir immediately
+            shutil.rmtree(shard_dir, ignore_errors=True)
+
+        shard_dirs = []  # already cleaned up
+        print(f"All {total_rows} rows pushed to {push_to_hub}")
+    else:
+        # Local save: concatenate shards then save
+        print(f"\nConcatenating {len(shard_dirs)} shards...")
+        shards = [Dataset.load_from_disk(d) for d in shard_dirs]
+        ds = concatenate_datasets(shards)
+        del shards
+
+        print(f"Saving to {output_dir} ({num_shards} shards)...")
+        ds.save_to_disk(output_dir, num_shards=num_shards)
+
+    # Clean up any remaining temp shard dirs
     for d in shard_dirs:
         shutil.rmtree(d, ignore_errors=True)
 
     elapsed = time.time() - t0
-    print(f"Done: {len(ds)} rows in {elapsed:.1f}s")
+    print(f"Done in {elapsed:.1f}s")
     print(f"Effective speed: {num_episodes / elapsed:.1f} ep/s")
-
-    if push_to_hub:
-        print(f"Pushing to HuggingFace Hub: {push_to_hub}")
-        ds.push_to_hub(push_to_hub, num_shards=num_shards)
-        print("Pushed!")
 
 
 if __name__ == "__main__":

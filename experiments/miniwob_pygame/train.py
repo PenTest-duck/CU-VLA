@@ -1,30 +1,51 @@
 """Behavior cloning training loop for the ACT policy (Experiment 3).
 
-Adapted from Experiment 2 for the multi-binary held-state action space.
-Key differences from Exp 2:
-  - Loads HF datasets per task from data/{task_name}/, concatenates them
-  - Proprio: [cursor_x, cursor_y, mouse_left, keys_held_0..42] = 46 dims
-  - CVAE action vector: [dx, dy, mouse_left, keys_held_0..42] = 46 dims
-  - Loss: masked BCE for mouse_left, sum-of-BCE for 43 independent keys
+Loads expert demonstrations from HF datasets per task, trains with:
+- Gaussian-smoothed soft CE loss on dx, dy (discrete 49-bin exponential grid)
+- Expected-value L1 loss on dx, dy (pixel accuracy)
+- Masked BCE loss on mouse_left (binary)
+- Masked sum-of-BCE loss on keys_held (43 independent channels)
+- Unmasked BCE loss on pad prediction
 
-Saves checkpoints + training history.
+No CVAE — discrete bins handle multimodality.
+Saves checkpoints + training history with per-head loss tracking.
 """
 
 import argparse
 import os
+import shutil
 import sys
 import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from experiments.miniwob_pygame.config import ACTION, CHUNK, TRAIN
+from experiments.miniwob_pygame.config import (
+    ACTION, BIN_CENTERS, CHUNK, ENV, NUM_BINS, SOFT_BIN_TARGETS, TRAIN,
+)
 from experiments.miniwob_pygame.model import ACT, count_parameters
+
+
+# ---------------------------------------------------------------------------
+# Bin quantisation helper
+# ---------------------------------------------------------------------------
+
+def _delta_to_bin(raw_delta: np.ndarray) -> np.ndarray:
+    """Convert raw pixel deltas to closest bin indices.
+
+    BIN_CENTERS is a sorted (49,) float32 array of exponential bin centers.
+    Returns int64 indices in [0, NUM_BINS-1].
+    """
+    idx = np.searchsorted(BIN_CENTERS, raw_delta, side='left')
+    idx = np.clip(idx, 0, NUM_BINS - 1)
+    left = np.clip(idx - 1, 0, NUM_BINS - 1)
+    closer_left = np.abs(raw_delta - BIN_CENTERS[left]) < np.abs(raw_delta - BIN_CENTERS[idx])
+    return np.where(closer_left, left, idx).astype(np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -98,29 +119,96 @@ def load_task_datasets(
 
 
 # ---------------------------------------------------------------------------
+# Image pre-decode memmap cache
+# ---------------------------------------------------------------------------
+
+def predecode_images(ds) -> np.ndarray:
+    """Decode all images from Arrow/parquet into a disk-backed memmap.
+
+    Returns a numpy memmap array of shape (N, obs_size, obs_size, 3) uint8.
+    Reuses an existing cache if the file size matches.
+    """
+    n_samples = len(ds)
+    obs_size = ENV.obs_size
+    img_shape = (n_samples, obs_size, obs_size, 3)
+    memmap_path = os.path.join("/tmp", "exp3_images_cache.dat")
+    t_decode = time.perf_counter()
+
+    if os.path.exists(memmap_path):
+        expected_bytes = int(np.prod(img_shape))
+        actual_bytes = os.path.getsize(memmap_path)
+        if actual_bytes == expected_bytes:
+            images = np.memmap(memmap_path, dtype=np.uint8, mode="r", shape=img_shape)
+            print(
+                f"Image cache loaded from {memmap_path} "
+                f"({actual_bytes / 1024**3:.1f}GB)",
+                flush=True,
+            )
+            return images
+        else:
+            os.remove(memmap_path)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    images = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=img_shape)
+
+    def _decode_range(start: int, end: int) -> int:
+        for i in range(start, end):
+            images[i] = np.array(ds[i]["image"])
+        return end - start
+
+    n_threads = min(8, os.cpu_count() or 1)
+    chunk = (n_samples + n_threads - 1) // n_threads
+    futures = []
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        for t in range(n_threads):
+            start = t * chunk
+            end = min(start + chunk, n_samples)
+            if start < end:
+                futures.append(pool.submit(_decode_range, start, end))
+
+        done = 0
+        for future in as_completed(futures):
+            done += future.result()
+            print(
+                f"  Pre-decoded {done}/{n_samples} images "
+                f"({time.perf_counter() - t_decode:.1f}s elapsed)",
+                flush=True,
+            )
+
+    images.flush()
+    images_gb = images.nbytes / 1024**3
+    print(
+        f"Images pre-decoded to {memmap_path} in {time.perf_counter() - t_decode:.1f}s "
+        f"({images_gb:.1f}GB, {n_samples / (time.perf_counter() - t_decode):.0f} img/s)",
+        flush=True,
+    )
+    return images
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
 class ChunkDataset(Dataset):
-    """Arrow-backed dataset that samples (obs, proprio, action_chunk, ...) tuples.
+    """Dataset that samples (obs, proprio, action_chunk, ...) tuples.
 
     Every timestep t in every episode is a valid start index.
     Action chunks are zero-padded when near the episode end.
 
-    Action columns are pre-extracted to numpy arrays to avoid
-    expensive per-sample Arrow reads. Only the image column is
-    read from Arrow at __getitem__ time (single decode per sample).
+    All columns (including images) are pre-extracted to numpy arrays
+    so __getitem__ is pure array indexing with no PNG decode.
     """
 
     def __init__(
         self,
-        ds,
+        images: np.ndarray,
         episode_offsets: dict[int, tuple[int, int]],
         episode_ids: set[int],
         chunk_size: int,
         action_arrays: dict[str, np.ndarray],
     ) -> None:
-        self.ds = ds
+        self.images = images
         self.chunk_size = chunk_size
         self.episode_offsets = {
             eid: episode_offsets[eid] for eid in episode_ids
@@ -133,12 +221,16 @@ class ChunkDataset(Dataset):
         self.cursor_x = action_arrays["cursor_x"]
         self.cursor_y = action_arrays["cursor_y"]
 
-        # Build flat index: every timestep in the selected episodes
+        # Build flat index grouped by episode (sequential within each episode
+        # for memmap-friendly access patterns)
         self.index: list[tuple[int, int]] = []
+        self.episode_ranges: list[tuple[int, int]] = []  # (start_idx, length) per episode
         for eid in sorted(self.episode_offsets):
             _, length = self.episode_offsets[eid]
+            start = len(self.index)
             for t in range(length):
                 self.index.append((eid, t))
+            self.episode_ranges.append((start, length))
 
     def __len__(self) -> int:
         return len(self.index)
@@ -148,11 +240,10 @@ class ChunkDataset(Dataset):
     ) -> tuple[
         torch.Tensor,  # obs (3, 224, 224)
         torch.Tensor,  # proprio (46,)
-        torch.Tensor,  # actions_cvae (chunk, 46) for CVAE encoder
-        torch.Tensor,  # dx_chunk (chunk,)
-        torch.Tensor,  # dy_chunk (chunk,)
-        torch.Tensor,  # mouse_chunk (chunk,)
-        torch.Tensor,  # keys_chunk (chunk, 43)
+        torch.Tensor,  # dx_chunk (chunk,) int64 bin indices
+        torch.Tensor,  # dy_chunk (chunk,) int64 bin indices
+        torch.Tensor,  # mouse_chunk (chunk,) float32
+        torch.Tensor,  # keys_chunk (chunk, 43) float32
         torch.Tensor,  # pad_mask (chunk,) — 1 where padded, 0 where real
     ]:
         eid, t = self.index[idx]
@@ -160,11 +251,10 @@ class ChunkDataset(Dataset):
         C = self.chunk_size
         row_idx = start_row + t
 
-        # --- Observation at time t (single image decode from Arrow) ---
-        row = self.ds[row_idx]
-        obs = torch.from_numpy(np.array(row["image"])).permute(2, 0, 1).float() / 255.0
+        # --- Observation at time t (pre-decoded uint8 array) ---
+        obs = torch.from_numpy(self.images[row_idx].copy()).permute(2, 0, 1).float() / 255.0
 
-        # --- Proprioception at time t (from pre-extracted numpy) ---
+        # --- Proprioception at time t ---
         cursor_x = float(self.cursor_x[row_idx])
         cursor_y = float(self.cursor_y[row_idx])
         mouse_t = float(self.action_mouse_left[row_idx])
@@ -182,14 +272,15 @@ class ChunkDataset(Dataset):
         real_len = end_t - t
         sl = slice(row_idx, row_idx + real_len)
 
-        dx_chunk = np.zeros(C, dtype=np.float32)
-        dy_chunk = np.zeros(C, dtype=np.float32)
+        center_bin = ACTION.num_bins_per_side  # 24 — index of the zero-movement bin
+        dx_chunk = np.full(C, center_bin, dtype=np.int64)
+        dy_chunk = np.full(C, center_bin, dtype=np.int64)
         mouse_chunk = np.zeros(C, dtype=np.float32)
         keys_chunk = np.zeros((C, ACTION.num_keys), dtype=np.float32)
         pad_mask = np.ones(C, dtype=np.float32)  # 1=padded, 0=real
 
-        dx_chunk[:real_len] = self.action_dx[sl]
-        dy_chunk[:real_len] = self.action_dy[sl]
+        dx_chunk[:real_len] = _delta_to_bin(self.action_dx[sl])
+        dy_chunk[:real_len] = _delta_to_bin(self.action_dy[sl])
         mouse_chunk[:real_len] = self.action_mouse_left[sl].astype(np.float32)
         keys_chunk[:real_len] = self.action_keys_held[sl].astype(np.float32)
         pad_mask[:real_len] = 0.0
@@ -200,40 +291,421 @@ class ChunkDataset(Dataset):
         keys_chunk = torch.from_numpy(keys_chunk)
         pad_mask = torch.from_numpy(pad_mask)
 
-        # --- Actions for CVAE encoder: (chunk, action_dim=46) ---
-        # action_dim = 2 (dx,dy) + 1 (mouse_left) + 43 (keys_held)
-        actions_cvae = torch.zeros(C, 2 + 1 + ACTION.num_keys)
-        actions_cvae[:real_len, 0] = dx_chunk[:real_len]
-        actions_cvae[:real_len, 1] = dy_chunk[:real_len]
-        actions_cvae[:real_len, 2] = mouse_chunk[:real_len]
-        actions_cvae[:real_len, 3:] = keys_chunk[:real_len]
+        return obs, proprio, dx_chunk, dy_chunk, mouse_chunk, keys_chunk, pad_mask
 
-        return obs, proprio, actions_cvae, dx_chunk, dy_chunk, mouse_chunk, keys_chunk, pad_mask
+
+class EpisodeSequentialSampler(Sampler[int]):
+    """Shuffle episode order each epoch, but iterate timesteps within each
+    episode sequentially. This produces near-sequential memmap reads
+    (kernel readahead works) while still randomizing training order.
+    """
+
+    def __init__(self, dataset: ChunkDataset, seed: int = 0) -> None:
+        self.episode_ranges = dataset.episode_ranges
+        self.total = len(dataset)
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        ep_order = rng.permutation(len(self.episode_ranges))
+        for ep_idx in ep_order:
+            start, length = self.episode_ranges[ep_idx]
+            yield from range(start, start + length)
+
+    def __len__(self) -> int:
+        return self.total
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Loss computation (shared by train and val)
 # ---------------------------------------------------------------------------
 
-def train(
-    backbone: str = "resnet18",
-    chunk_size: int = CHUNK.default_chunk_size,
-    batch_size: int = TRAIN.batch_size,
-    max_episodes: int | None = None,
-    num_workers: int | None = None,
-    data_dir: str | None = None,
-    checkpoint_dir: str | None = None,
-    device: str = "cpu",
-    tasks: list[str] | None = None,
-    max_epochs: int | None = None,
-    hf_upload_repo: str | None = None,
-    hf_data_repo: str | None = None,
+def compute_losses(
+    out: dict[str, torch.Tensor],
+    dx_gt: torch.Tensor,      # (B, chunk) int64 bin indices
+    dy_gt: torch.Tensor,      # (B, chunk) int64 bin indices
+    mouse_gt: torch.Tensor,   # (B, chunk) float32
+    keys_gt: torch.Tensor,    # (B, chunk, 43) float32
+    pad_gt: torch.Tensor,     # (B, chunk) float32
+    _soft_targets: torch.Tensor | None = None,
+    _bin_centers: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute all loss components from model output and ground truth.
+
+    Returns (total_loss, head_losses) where head_losses has keys:
+    dx, dy, mouse, keys, pad, ev (raw, before weighting).
+    dx/dy use Gaussian-smoothed soft CE + expected-value L1 loss.
+    """
+    mask = 1.0 - pad_gt
+    mask_sum = mask.sum().clamp(min=1)
+    B, C_chunk = dx_gt.shape
+    mask_flat = mask.reshape(B * C_chunk)
+    mask_flat_sum = mask_flat.sum().clamp(min=1)
+
+    # Lazy-init soft targets and bin centers on correct device
+    if _soft_targets is None:
+        _soft_targets = torch.from_numpy(SOFT_BIN_TARGETS).to(dx_gt.device)
+    if _bin_centers is None:
+        _bin_centers = torch.from_numpy(BIN_CENTERS).to(dx_gt.device)
+
+    # dx/dy: Gaussian-smoothed soft cross-entropy
+    dx_logits_flat = out["dx_logits"].reshape(B * C_chunk, -1)  # (N, 49)
+    dy_logits_flat = out["dy_logits"].reshape(B * C_chunk, -1)
+    dx_gt_flat = dx_gt.reshape(B * C_chunk)
+    dy_gt_flat = dy_gt.reshape(B * C_chunk)
+
+    dx_soft = _soft_targets[dx_gt_flat]  # (N, 49) soft target distributions
+    dy_soft = _soft_targets[dy_gt_flat]
+    dx_log_probs = F.log_softmax(dx_logits_flat, dim=-1)
+    dy_log_probs = F.log_softmax(dy_logits_flat, dim=-1)
+    loss_dx = (-(dx_soft * dx_log_probs).sum(dim=-1) * mask_flat).sum() / mask_flat_sum
+    loss_dy = (-(dy_soft * dy_log_probs).sum(dim=-1) * mask_flat).sum() / mask_flat_sum
+
+    # dx/dy: expected-value L1 loss (pixel accuracy)
+    dx_probs = F.softmax(dx_logits_flat, dim=-1)
+    dy_probs = F.softmax(dy_logits_flat, dim=-1)
+    dx_ev = (dx_probs * _bin_centers).sum(dim=-1)  # predicted px
+    dy_ev = (dy_probs * _bin_centers).sum(dim=-1)
+    dx_gt_px = _bin_centers[dx_gt_flat]  # ground truth px
+    dy_gt_px = _bin_centers[dy_gt_flat]
+    loss_ev = (
+        (F.l1_loss(dx_ev, dx_gt_px, reduction="none") * mask_flat).sum()
+        + (F.l1_loss(dy_ev, dy_gt_px, reduction="none") * mask_flat).sum()
+    ) / mask_flat_sum
+
+    # Masked BCE for mouse_left
+    loss_mouse = (
+        F.binary_cross_entropy_with_logits(out["mouse_left"], mouse_gt, reduction="none") * mask
+    ).sum() / mask_sum
+
+    # Masked sum-of-BCE for 43 independent key sigmoids
+    loss_keys_per = F.binary_cross_entropy_with_logits(
+        out["keys_held"], keys_gt, reduction="none"
+    )  # (B, chunk, 43)
+    loss_keys_summed = loss_keys_per.sum(dim=-1)  # (B, chunk)
+    loss_keys = (loss_keys_summed * mask).sum() / mask_sum
+
+    # Unmasked BCE for pad prediction
+    loss_pad = F.binary_cross_entropy_with_logits(out["pad_logits"], pad_gt)
+
+    total_loss = (
+        loss_dx + loss_dy
+        + TRAIN.loss_weight_ev * loss_ev
+        + TRAIN.loss_weight_mouse * loss_mouse
+        + TRAIN.loss_weight_keys * loss_keys
+        + TRAIN.loss_weight_pad * loss_pad
+    )
+
+    head_losses = {
+        "dx": loss_dx, "dy": loss_dy, "ev": loss_ev,
+        "mouse": loss_mouse, "keys": loss_keys, "pad": loss_pad,
+    }
+    return total_loss, head_losses
+
+
+# ---------------------------------------------------------------------------
+# Epoch 1 diagnostics
+# ---------------------------------------------------------------------------
+
+def print_epoch1_diagnostics(
+    timings: dict[str, float],
+    n_batches: int,
+    batch_size: int,
+    train_total: int,
+    use_cuda: bool,
+    grad_norms: list[float],
 ) -> None:
-    from datetime import datetime, timezone
-    base = os.path.dirname(__file__)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-    repo_prefix = f"{backbone}_chunk{chunk_size}/{run_id}"
+    """Print comprehensive training diagnostics after epoch 1."""
+    t_wall = timings["wall"]
+    samples_per_sec = train_total / t_wall
 
+    print(f"\n{'='*70}")
+    print(f"  EPOCH 1 TRAINING DIAGNOSTICS")
+    print(f"{'='*70}")
+    print(f"  Wall time:         {t_wall:.1f}s ({n_batches} batches x {batch_size} samples)")
+    print(f"  Throughput:        {samples_per_sec:.0f} samples/sec")
+    print()
+
+    phases = ["data", "xfer", "fwd", "loss", "bwd", "opt"]
+    labels = {
+        "data": "DataLoader wait", "xfer": "CPU->GPU transfer",
+        "fwd": "Forward pass", "loss": "Loss computation",
+        "bwd": "Backward pass", "opt": "Optimizer step",
+    }
+
+    print(f"  --- Time breakdown (training only, excludes validation) ---")
+    for p in phases:
+        t = timings[p]
+        suffix = "  <- data loading bottleneck?" if p == "data" else ""
+        print(f"  {labels[p]:20s} {t:6.1f}s ({t/t_wall*100:4.1f}%){suffix}")
+
+    t_gpu = timings["fwd"] + timings["loss"] + timings["bwd"]
+    t_accounted = sum(timings[p] for p in phases)
+    t_overhead = t_wall - t_accounted
+    print(f"  {'Other overhead':20s} {t_overhead:6.1f}s ({t_overhead/t_wall*100:4.1f}%)")
+    print(f"  {'GPU compute total':20s} {t_gpu:6.1f}s ({t_gpu/t_wall*100:4.1f}%)  <- GPU utilization")
+    print()
+
+    print(f"  --- Per-batch averages ---")
+    for p in phases:
+        print(f"  {labels[p]:20s} {timings[p]/n_batches*1000:6.1f}ms/batch")
+    print()
+
+    if use_cuda:
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  --- VRAM ---")
+        print(f"  Peak allocated:  {peak:.1f}GB / {total_vram:.1f}GB ({peak/total_vram*100:.0f}%)")
+        print(f"  Headroom:        {total_vram-peak:.1f}GB")
+        vram_per_sample = (peak - 0.9) / batch_size
+        max_batch = int((total_vram * 0.9 - 0.9) / vram_per_sample)
+        print(f"  Est. VRAM/sample: {vram_per_sample*1024:.1f}MB")
+        print(f"  Est. max batch:   ~{max_batch} (at 90% VRAM)")
+        print()
+
+    if grad_norms:
+        gn = np.array(grad_norms)
+        print(f"  --- Gradient norms (sampled every 10 batches) ---")
+        print(f"  Mean: {gn.mean():.2f}  Std: {gn.std():.2f}  Min: {gn.min():.2f}  Max: {gn.max():.2f}")
+        if gn.max() > 100:
+            print(f"  WARNING: Large gradient norms detected -- consider gradient clipping")
+
+    print(f"  --- RAM ---")
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        ram = psutil.virtual_memory()
+        print(
+            f"  Used: {ram.used/1024**3:.1f}GB / "
+            f"{ram.total/1024**3:.1f}GB ({ram.percent}%)"
+        )
+    else:
+        print("  psutil not installed; RAM diagnostics skipped")
+    disk = shutil.disk_usage("/")
+    print(f"  --- Disk ---")
+    print(f"  Used: {disk.used/1024**3:.1f}GB / {disk.total/1024**3:.1f}GB ({disk.free/1024**3:.1f}GB free)")
+    print(f"{'='*70}\n", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Train / val epoch helpers
+# ---------------------------------------------------------------------------
+
+def _run_train_epoch(
+    model, train_loader, optimizer, scaler, device, use_cuda, use_amp,
+    amp_dtype, batch_size, diag, t0,
+) -> tuple[float, dict[str, float], int]:
+    """Run one training epoch. Returns (avg_loss, head_sums, total_samples)."""
+    model.train()
+    loss_sum = 0.0
+    head_sums = {"dx": 0.0, "dy": 0.0, "ev": 0.0, "mouse": 0.0, "keys": 0.0, "pad": 0.0}
+    total = 0
+    n_batches = len(train_loader)
+
+    if diag:
+        timings = {"data": 0.0, "xfer": 0.0, "fwd": 0.0, "loss": 0.0, "bwd": 0.0, "opt": 0.0}
+        grad_norms: list[float] = []
+
+    t_data_start = time.perf_counter()
+
+    for batch_idx, batch in enumerate(train_loader):
+        if diag:
+            timings["data"] += time.perf_counter() - t_data_start
+
+        (obs, proprio, dx_gt, dy_gt, mouse_gt, keys_gt, pad_gt) = batch
+
+        # --- Transfer to GPU ---
+        if diag:
+            t_mark = time.perf_counter()
+        obs = obs.to(device, non_blocking=True)
+        proprio = proprio.to(device, non_blocking=True)
+        dx_gt = dx_gt.to(device, non_blocking=True)
+        dy_gt = dy_gt.to(device, non_blocking=True)
+        mouse_gt = mouse_gt.to(device, non_blocking=True)
+        keys_gt = keys_gt.to(device, non_blocking=True)
+        pad_gt = pad_gt.to(device, non_blocking=True)
+        if diag:
+            if use_cuda:
+                torch.cuda.synchronize()
+            timings["xfer"] += time.perf_counter() - t_mark
+
+        # --- Forward + loss ---
+        with torch.amp.autocast(
+            device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp
+        ):
+            if diag:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t_mark = time.perf_counter()
+            out = model(obs, proprio)
+            if diag:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                timings["fwd"] += time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
+
+            total_loss, head_losses = compute_losses(
+                out, dx_gt, dy_gt, mouse_gt, keys_gt, pad_gt,
+            )
+
+        if diag:
+            if use_cuda:
+                torch.cuda.synchronize()
+            timings["loss"] += time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
+
+        # --- Backward ---
+        optimizer.zero_grad()
+        scaler.scale(total_loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=TRAIN.grad_clip_norm)
+
+        if diag:
+            if use_cuda:
+                torch.cuda.synchronize()
+            timings["bwd"] += time.perf_counter() - t_mark
+
+            if batch_idx % 10 == 0:
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.data.float().norm(2).item() ** 2
+                grad_norms.append(total_norm ** 0.5)
+
+            t_mark = time.perf_counter()
+
+        # --- Optimizer step ---
+        scaler.step(optimizer)
+        scaler.update()
+
+        if diag:
+            if use_cuda:
+                torch.cuda.synchronize()
+            timings["opt"] += time.perf_counter() - t_mark
+
+        # --- Accumulate ---
+        bs = obs.size(0)
+        loss_sum += total_loss.item() * bs
+        for h, v in head_losses.items():
+            head_sums[h] += v.item() * bs
+        total += bs
+
+        # --- Periodic progress (epoch 0) ---
+        if diag and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
+            elapsed = time.perf_counter() - t0
+            vram_str = ""
+            if use_cuda:
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                peak = torch.cuda.max_memory_allocated() / 1024**3
+                vram_str = (f" | VRAM: {alloc:.1f}/{reserved:.1f}/{peak:.1f}GB"
+                            f" (alloc/reserved/peak)")
+            print(
+                f"    batch {batch_idx+1}/{n_batches} | "
+                f"loss={total_loss.item():.4f} | "
+                f"{elapsed:.1f}s elapsed{vram_str}",
+                flush=True,
+            )
+
+        if diag:
+            t_data_start = time.perf_counter()
+
+    if diag:
+        timings["wall"] = time.perf_counter() - t0
+        print_epoch1_diagnostics(timings, n_batches, batch_size, total, use_cuda, grad_norms)
+
+    return loss_sum / max(total, 1), head_sums, total
+
+
+def _run_val_epoch(
+    model, val_loader, device, use_cuda, use_amp, amp_dtype,
+) -> tuple[float, dict[str, float], int]:
+    """Run one validation epoch. Returns (avg_loss, head_sums, total_samples)."""
+    model.train(False)
+    loss_sum = 0.0
+    head_sums = {"dx": 0.0, "dy": 0.0, "ev": 0.0, "mouse": 0.0, "keys": 0.0, "pad": 0.0}
+    total = 0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            (obs, proprio, dx_gt, dy_gt, mouse_gt, keys_gt, pad_gt) = batch
+            obs = obs.to(device, non_blocking=True)
+            proprio = proprio.to(device, non_blocking=True)
+            dx_gt = dx_gt.to(device, non_blocking=True)
+            dy_gt = dy_gt.to(device, non_blocking=True)
+            mouse_gt = mouse_gt.to(device, non_blocking=True)
+            keys_gt = keys_gt.to(device, non_blocking=True)
+            pad_gt = pad_gt.to(device, non_blocking=True)
+
+            with torch.amp.autocast(
+                device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp
+            ):
+                out = model(obs, proprio)
+                total_loss, head_losses = compute_losses(
+                    out, dx_gt, dy_gt, mouse_gt, keys_gt, pad_gt,
+                )
+
+            bs = obs.size(0)
+            loss_sum += total_loss.item() * bs
+            for h, v in head_losses.items():
+                head_sums[h] += v.item() * bs
+            total += bs
+
+    return loss_sum / max(total, 1), head_sums, total
+
+
+def _upload_checkpoint_async(hf_upload_repo, path, repo_prefix, val_loss):
+    """Upload best.pt to HF Hub in a background thread."""
+    import logging
+    import threading
+    from huggingface_hub import HfApi
+
+    _val = val_loss
+    def _upload():
+        try:
+            logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+            from huggingface_hub.utils import disable_progress_bars
+            disable_progress_bars()
+            api = HfApi()
+            api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
+            api.upload_file(
+                path_or_fileobj=path,
+                path_in_repo=f"{repo_prefix}/best.pt",
+                repo_id=hf_upload_repo,
+                repo_type="model",
+            )
+            print(f"    Uploaded best.pt (val={_val:.4f})", flush=True)
+        except Exception as e:
+            print(f"    Upload failed: {e}", flush=True)
+    threading.Thread(target=_upload, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Data loading and pre-processing
+# ---------------------------------------------------------------------------
+
+def load_dataset_splits(
+    hf_data_repo: str | None,
+    data_dir: str | None,
+    base: str,
+    checkpoint_dir: str,
+    chunk_size: int,
+    batch_size: int,
+    max_episodes: int | None,
+    num_workers: int,
+    use_cuda: bool,
+    tasks: list[str] | None,
+) -> tuple[DataLoader, EpisodeSequentialSampler, DataLoader]:
+    """Load dataset, pre-decode images, build DataLoaders.
+
+    Returns (train_loader, train_sampler, val_loader).
+    """
     if data_dir is None:
         data_dir = os.path.join(base, "data")
 
@@ -259,13 +731,7 @@ def train(
     ds = load_task_datasets(data_dir, tasks=tasks)
     print(f"Dataset: {ds}", flush=True)
 
-    if checkpoint_dir is None:
-        checkpoint_dir = os.path.join(
-            base, "checkpoints", f"{backbone}_chunk{chunk_size}"
-        )
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Pre-extract scalar columns to numpy (avoids per-sample Arrow access)
+    # Pre-extract scalar columns to numpy
     t_extract = time.perf_counter()
     ep_ids_np = np.array(ds["episode_id"], dtype=np.int32)
     action_arrays = {
@@ -283,18 +749,26 @@ def train(
         flush=True,
     )
 
-    # Build episode offset table
-    t_init = time.perf_counter()
-    episode_offsets = build_episode_offsets(ep_ids_np)
-    print(f"Episode offsets built in {time.perf_counter() - t_init:.2f}s", flush=True)
-    all_episode_ids = sorted(episode_offsets.keys())
+    images = predecode_images(ds)
 
+    # Build episode offset table and split.
+    #
+    # Important: multi-task concatenation can reuse episode_id values across
+    # tasks (e.g. each task has episodes 0..N-1). Using raw episode_id as a
+    # global key would collide and drop earlier segments. We therefore derive a
+    # collision-free contiguous-segment id stream after concatenation.
+    changes = np.where(np.diff(ep_ids_np) != 0)[0] + 1
+    segment_ids = np.zeros_like(ep_ids_np, dtype=np.int32)
+    if len(changes) > 0:
+        segment_ids[changes] = 1
+        segment_ids = np.cumsum(segment_ids, dtype=np.int32)
+    episode_offsets = build_episode_offsets(segment_ids)
+    all_episode_ids = sorted(episode_offsets.keys())
     if max_episodes is not None and max_episodes < len(all_episode_ids):
         all_episode_ids = all_episode_ids[:max_episodes]
 
     print(f"Using {len(all_episode_ids)} episodes")
 
-    # Train/val split by episode
     rng = np.random.default_rng(42)
     indices = rng.permutation(len(all_episode_ids))
     val_count = max(1, int(len(all_episode_ids) * TRAIN.val_fraction))
@@ -302,48 +776,79 @@ def train(
     train_ids = set(all_episode_ids[i] for i in indices[val_count:])
 
     print(f"Train: {len(train_ids)} episodes, Val: {len(val_ids)} episodes")
-
-    # Default num_workers
-    if num_workers is None:
-        num_workers = 4 if device.startswith("cuda") else 0
     print(f"DataLoader workers: {num_workers}")
 
-    train_dataset = ChunkDataset(ds, episode_offsets, train_ids, chunk_size, action_arrays)
-    val_dataset = ChunkDataset(ds, episode_offsets, val_ids, chunk_size, action_arrays)
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    train_dataset = ChunkDataset(images, episode_offsets, train_ids, chunk_size, action_arrays)
+    val_dataset = ChunkDataset(images, episode_offsets, val_ids, chunk_size, action_arrays)
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}", flush=True)
 
-    use_cuda = device.startswith("cuda")
+    train_sampler = EpisodeSequentialSampler(train_dataset)
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
+        train_dataset, batch_size=batch_size, sampler=train_sampler,
         num_workers=num_workers, persistent_workers=num_workers > 0,
-        pin_memory=use_cuda,
+        pin_memory=use_cuda, prefetch_factor=4 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, persistent_workers=num_workers > 0,
-        pin_memory=use_cuda,
+        pin_memory=use_cuda, prefetch_factor=4 if num_workers > 0 else None,
+    )
+    return train_loader, train_sampler, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Main training function
+# ---------------------------------------------------------------------------
+
+def train(
+    backbone: str = "resnet18",
+    chunk_size: int = CHUNK.default_chunk_size,
+    batch_size: int = TRAIN.batch_size,
+    max_episodes: int | None = None,
+    num_workers: int | None = None,
+    data_dir: str | None = None,
+    checkpoint_dir: str | None = None,
+    device: str = "cpu",
+    tasks: list[str] | None = None,
+    max_epochs: int | None = None,
+    hf_upload_repo: str | None = None,
+    hf_data_repo: str | None = None,
+) -> None:
+    from datetime import datetime, timezone
+    base = os.path.dirname(__file__)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    repo_prefix = f"{backbone}_chunk{chunk_size}/{run_id}"
+
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(
+            base, "checkpoints", f"{backbone}_chunk{chunk_size}"
+        )
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    use_cuda = device.startswith("cuda")
+    if num_workers is None:
+        # Images are pre-decoded to memmap, so data loading is just array
+        # indexing. No need for workers — avoids fork+memmap contention.
+        num_workers = 0
+
+    # --- Data ---
+    train_loader, train_sampler, val_loader = load_dataset_splits(
+        hf_data_repo, data_dir, base, checkpoint_dir, chunk_size,
+        batch_size, max_episodes, num_workers, use_cuda, tasks,
     )
 
-    # Model
+    # --- Model ---
     model = ACT(backbone_name=backbone, chunk_size=chunk_size).to(device)
     if use_cuda:
-        torch.set_float32_matmul_precision("high")  # enable TF32 tensor cores
+        torch.set_float32_matmul_precision("high")
         model = torch.compile(model)
         print("Model compiled with torch.compile (TF32 enabled)", flush=True)
-    total_params = count_parameters(model, trainable_only=False)
-    trainable_params = count_parameters(model, trainable_only=True)
-    print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    print(f"Model parameters: {count_parameters(model, False):,} total, "
+          f"{count_parameters(model, True):,} trainable")
 
-    # Optimizer with two param groups
-    backbone_params = []
-    non_backbone_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.startswith("backbone."):
-            backbone_params.append(param)
-        else:
-            non_backbone_params.append(param)
+    # --- Optimizer ---
+    backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("backbone.")]
+    non_backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("backbone.")]
 
     optimizer = torch.optim.AdamW(
         [
@@ -355,15 +860,22 @@ def train(
 
     epochs = max_epochs if max_epochs is not None else TRAIN.epochs
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-3, total_iters=TRAIN.warmup_epochs,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs - TRAIN.warmup_epochs,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[TRAIN.warmup_epochs],
     )
 
-    # AMP — prefer bf16 on Ampere+ (L4, A10G, A100), fall back to fp16 on older (T4)
-    use_amp = TRAIN.use_amp and device.startswith("cuda")
+    # --- AMP ---
+    use_amp = TRAIN.use_amp and use_cuda
     if use_amp and torch.cuda.is_bf16_supported():
         amp_dtype = torch.bfloat16
-        scaler = torch.amp.GradScaler(enabled=False)  # bf16 doesn't need GradScaler
+        scaler = torch.amp.GradScaler(enabled=False)
     elif use_amp:
         amp_dtype = torch.float16
         scaler = torch.amp.GradScaler(enabled=True)
@@ -371,226 +883,72 @@ def train(
         amp_dtype = torch.float32
         scaler = torch.amp.GradScaler(enabled=False)
 
+    # --- Print config ---
     print(f"AMP: {amp_dtype if use_amp else 'disabled'} (GradScaler: {scaler.is_enabled()})")
-    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}", flush=True)
+    print(f"Device: {device}, Backbone: {backbone}, Chunk size: {chunk_size}")
+    if use_cuda:
+        total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU: {torch.cuda.get_device_name(0)}, VRAM: {total_vram:.1f}GB")
+    disk = shutil.disk_usage("/")
+    print(f"Disk: {disk.used/1024**3:.1f}GB used / {disk.total/1024**3:.1f}GB total "
+          f"({disk.free/1024**3:.1f}GB free)", flush=True)
 
-    # Training loop
+    # --- Training loop ---
+    head_names = ["dx", "dy", "ev", "mouse", "keys", "pad"]
     history: dict[str, list] = {
-        "train_loss": [],
-        "val_loss": [],
+        "train_loss": [], "val_loss": [],
+        **{f"train_{h}": [] for h in head_names},
+        **{f"val_{h}": [] for h in head_names},
     }
     best_val_loss = float("inf")
     epochs_without_improvement = 0
-    kl_anneal_epochs = int(epochs * TRAIN.kl_anneal_fraction)
 
     for epoch in range(epochs):
         t0 = time.perf_counter()
+        diag = epoch == 0
+        train_sampler.set_epoch(epoch)
 
-        # KL weight annealing: 0 -> kl_weight_max over first 20% of epochs
-        if kl_anneal_epochs > 0:
-            kl_weight = min(1.0, epoch / kl_anneal_epochs) * TRAIN.kl_weight_max
-        else:
-            kl_weight = TRAIN.kl_weight_max
-
-        # --- Train ---
-        model.train()
-        train_loss_sum = 0.0
-        train_total = 0
-        n_batches = len(train_loader)
-
-        for batch_idx, batch in enumerate(train_loader):
-            (obs, proprio, actions_cvae, dx_gt, dy_gt, mouse_gt, keys_gt, pad_gt) = batch
-            obs = obs.to(device)
-            proprio = proprio.to(device)
-            actions_cvae = actions_cvae.to(device)
-            dx_gt = dx_gt.to(device)
-            dy_gt = dy_gt.to(device)
-            mouse_gt = mouse_gt.to(device)
-            keys_gt = keys_gt.to(device)
-            pad_gt = pad_gt.to(device)
-
-            with torch.amp.autocast(
-                device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp
-            ):
-                out = model(obs, proprio, actions_cvae)
-
-                # Mask: 1 where real, 0 where padded
-                mask = 1.0 - pad_gt  # (B, chunk)
-                mask_sum = mask.sum().clamp(min=1)
-
-                # Masked L1 losses for dx, dy
-                loss_dx = (
-                    F.l1_loss(out["dx"], dx_gt, reduction="none") * mask
-                ).sum() / mask_sum
-                loss_dy = (
-                    F.l1_loss(out["dy"], dy_gt, reduction="none") * mask
-                ).sum() / mask_sum
-
-                # Masked BCE for mouse_left
-                loss_mouse = (
-                    F.binary_cross_entropy_with_logits(
-                        out["mouse_left"], mouse_gt, reduction="none"
-                    )
-                    * mask
-                ).sum() / mask_sum
-
-                # Masked sum-of-BCE for 43 independent key sigmoids
-                # keys_gt: (B, chunk, 43), out["keys_held"]: (B, chunk, 43)
-                loss_keys_per = F.binary_cross_entropy_with_logits(
-                    out["keys_held"], keys_gt, reduction="none"
-                )  # (B, chunk, 43)
-                # Sum over keys, then mask and average over (steps x batch)
-                loss_keys_summed = loss_keys_per.sum(dim=-1)  # (B, chunk)
-                loss_keys = (loss_keys_summed * mask).sum() / mask_sum
-
-                # Unmasked BCE for pad prediction
-                loss_pad = F.binary_cross_entropy_with_logits(
-                    out["pad_logits"], pad_gt
-                )
-
-                # KL divergence
-                mu = out["mu"]
-                logvar = out["logvar"]
-                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-                total_loss = (
-                    loss_dx
-                    + loss_dy
-                    + TRAIN.loss_weight_mouse * loss_mouse
-                    + TRAIN.loss_weight_keys * loss_keys
-                    + TRAIN.loss_weight_pad * loss_pad
-                    + kl_weight * kl
-                )
-
-            optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            bs = obs.size(0)
-            train_loss_sum += total_loss.item() * bs
-            train_total += bs
-
-            # Debug: log progress during first epoch to diagnose throughput
-            if epoch == 0 and (batch_idx == 0 or (batch_idx + 1) % 100 == 0):
-                elapsed_batch = time.perf_counter() - t0
-                print(
-                    f"    batch {batch_idx+1}/{n_batches} | "
-                    f"loss={total_loss.item():.4f} | "
-                    f"{elapsed_batch:.1f}s elapsed",
-                    flush=True,
-                )
-
+        # Train
+        train_loss, head_sums_train, train_total = _run_train_epoch(
+            model, train_loader, optimizer, scaler, device, use_cuda, use_amp,
+            amp_dtype, batch_size, diag, t0,
+        )
         scheduler.step()
-        train_loss = train_loss_sum / max(train_total, 1)
 
-        # --- Validate ---
-        model.train(False)
-        val_loss_sum = 0.0
-        val_total = 0
+        # Validate
+        val_loss, head_sums_val, val_total = _run_val_epoch(
+            model, val_loader, device, use_cuda, use_amp, amp_dtype,
+        )
 
-        with torch.no_grad():
-            for batch in val_loader:
-                (obs, proprio, actions_cvae, dx_gt, dy_gt, mouse_gt, keys_gt, pad_gt) = batch
-                obs = obs.to(device)
-                proprio = proprio.to(device)
-                actions_cvae = actions_cvae.to(device)
-                dx_gt = dx_gt.to(device)
-                dy_gt = dy_gt.to(device)
-                mouse_gt = mouse_gt.to(device)
-                keys_gt = keys_gt.to(device)
-                pad_gt = pad_gt.to(device)
-
-                out = model(obs, proprio, actions_cvae)
-
-                mask = 1.0 - pad_gt
-                mask_sum = mask.sum().clamp(min=1)
-
-                loss_dx = (
-                    F.l1_loss(out["dx"], dx_gt, reduction="none") * mask
-                ).sum() / mask_sum
-                loss_dy = (
-                    F.l1_loss(out["dy"], dy_gt, reduction="none") * mask
-                ).sum() / mask_sum
-
-                loss_mouse = (
-                    F.binary_cross_entropy_with_logits(
-                        out["mouse_left"], mouse_gt, reduction="none"
-                    )
-                    * mask
-                ).sum() / mask_sum
-
-                loss_keys_per = F.binary_cross_entropy_with_logits(
-                    out["keys_held"], keys_gt, reduction="none"
-                )
-                loss_keys_summed = loss_keys_per.sum(dim=-1)
-                loss_keys = (loss_keys_summed * mask).sum() / mask_sum
-
-                loss_pad = F.binary_cross_entropy_with_logits(
-                    out["pad_logits"], pad_gt
-                )
-
-                mu = out["mu"]
-                logvar = out["logvar"]
-                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-                total_loss = (
-                    loss_dx
-                    + loss_dy
-                    + TRAIN.loss_weight_mouse * loss_mouse
-                    + TRAIN.loss_weight_keys * loss_keys
-                    + TRAIN.loss_weight_pad * loss_pad
-                    + kl_weight * kl
-                )
-
-                bs = obs.size(0)
-                val_loss_sum += total_loss.item() * bs
-                val_total += bs
-
-        val_loss = val_loss_sum / max(val_total, 1)
         elapsed = time.perf_counter() - t0
 
+        # Record history
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        for h in head_names:
+            history[f"train_{h}"].append(head_sums_train[h] / max(train_total, 1))
+            history[f"val_{h}"].append(head_sums_val[h] / max(val_total, 1))
 
+        # Checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_without_improvement = 0
             best_pt_path = os.path.join(checkpoint_dir, "best.pt")
             state = {k.removeprefix("_orig_mod."): v for k, v in model.state_dict().items()}
             torch.save(state, best_pt_path)
-            # Upload best checkpoint async so training continues immediately
             if hf_upload_repo:
-                import logging
-                import threading
-                from huggingface_hub import HfApi
-                _val = val_loss
-                def _upload():
-                    try:
-                        logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-                        from huggingface_hub.utils import disable_progress_bars
-                        disable_progress_bars()
-                        api = HfApi()
-                        api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
-                        api.upload_file(
-                            path_or_fileobj=best_pt_path,
-                            path_in_repo=f"{repo_prefix}/best.pt",
-                            repo_id=hf_upload_repo,
-                            repo_type="model",
-                        )
-                        print(f"    Uploaded best.pt (val={_val:.4f})", flush=True)
-                    except Exception as e:
-                        print(f"    Upload failed: {e}", flush=True)
-                threading.Thread(target=_upload, daemon=True).start()
+                _upload_checkpoint_async(hf_upload_repo, best_pt_path, repo_prefix, val_loss)
         else:
             epochs_without_improvement += 1
 
-        remaining_epochs = epochs - epoch - 1
-        eta_min = remaining_epochs * elapsed / 60
+        # Epoch log
+        vh = {h: head_sums_val[h] / max(val_total, 1) for h in head_names}
+        head_str = " ".join(f"{h}={vh[h]:.3f}" for h in head_names)
+        eta_min = (epochs - epoch - 1) * elapsed / 60
         print(
             f"  Epoch {epoch+1:3d}/{epochs} | "
             f"train={train_loss:.4f} val={val_loss:.4f} | "
-            f"kl_w={kl_weight:.4f} | "
+            f"val_heads: {head_str} | "
             f"lr={scheduler.get_last_lr()[0]:.6f} | "
             f"{elapsed:.1f}s/ep | ETA ~{eta_min:.0f}min",
             flush=True,
@@ -598,10 +956,8 @@ def train(
 
         # Early stopping
         if epochs_without_improvement >= TRAIN.early_stop_patience:
-            print(
-                f"  Early stopping at epoch {epoch+1} "
-                f"(no improvement for {TRAIN.early_stop_patience} epochs)"
-            )
+            print(f"  Early stopping at epoch {epoch+1} "
+                  f"(no improvement for {TRAIN.early_stop_patience} epochs)")
             break
 
     # Save final
@@ -611,15 +967,13 @@ def train(
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Checkpoints saved to: {checkpoint_dir}")
 
-    # Upload checkpoints to HF Hub if repo specified
     if hf_upload_repo:
         from huggingface_hub import HfApi
         api = HfApi()
         api.create_repo(hf_upload_repo, repo_type="model", exist_ok=True)
         print(f"Uploading checkpoints to {hf_upload_repo}/{repo_prefix} ...")
         api.upload_folder(
-            repo_id=hf_upload_repo,
-            repo_type="model",
+            repo_id=hf_upload_repo, repo_type="model",
             folder_path=checkpoint_dir,
             path_in_repo=repo_prefix,
         )
@@ -639,7 +993,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-episodes", type=int, default=None,
                         help="Cap number of episodes to load (default: all)")
     parser.add_argument("--num-workers", type=int, default=None,
-                        help="DataLoader workers (default: 4 for CUDA, 0 for MPS/CPU)")
+                        help="DataLoader workers (default: 0 since images are pre-decoded)")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="Root data directory containing task subdirectories")
     parser.add_argument("--checkpoint-dir", type=str, default=None)

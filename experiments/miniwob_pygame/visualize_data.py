@@ -144,7 +144,8 @@ def _build_playlist(
     if task_name is not None:
         # Single task mode
         ds = _load_task_dataset(data_dir, task_name)
-        offsets = build_episode_offsets(ds)
+        ep_ids_np = np.array(ds["episode_id"], dtype=np.int32)
+        offsets = build_episode_offsets(ep_ids_np)
         eids = sorted(offsets.keys())
 
         if not eids:
@@ -176,7 +177,8 @@ def _build_playlist(
     per_task: dict[str, tuple[list[int], dict, object]] = {}
     for t in tasks:
         ds = _load_task_dataset(data_dir, t)
-        offsets = build_episode_offsets(ds)
+        ep_ids_np = np.array(ds["episode_id"], dtype=np.int32)
+        offsets = build_episode_offsets(ep_ids_np)
         eids = sorted(offsets.keys())
         per_task[t] = (eids, offsets, ds)
 
