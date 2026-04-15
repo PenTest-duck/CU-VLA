@@ -24,32 +24,33 @@ Do not run any training locally unless you have explicit approval - it is likely
 
 Serves as a high-level table of contents.
 
-| Path | Contents |
-|------|----------|
-| `docs/research/Brain Dump.md` | Original idea brainstorm — first-principles decomposition of computer input |
-| `docs/research/VLA Models Meet Computer Use.md` | Literature survey: GUI-VLAs, high-freq control, world models, Tesla Digital Optimus, sub-1B models, PoC sketch |
+| Path                                                                               | Contents                                                                                                               |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `docs/research/Brain Dump.md`                                                      | Original idea brainstorm — first-principles decomposition of computer input                                            |
+| `docs/research/VLA Models Meet Computer Use.md`                                    | Literature survey: GUI-VLAs, high-freq control, world models, Tesla Digital Optimus, sub-1B models, PoC sketch         |
 | `docs/research/High-Frequency Vision-Language-Action Models for Computer Use...md` | Formal feasibility report with references — action granularity analysis, layered architecture, toy PoC design, roadmap |
-| `docs/experiments/1-reactive-clicks.md` | Experiment 1 brief — click reaction time test |
-| `docs/plans/2026-04-11-reactive-clicks-design.md` | Experiment 1 full design doc — architecture decisions, env, model, training, eval criteria |
-| `experiments/reactive_clicks/` | Experiment 1 code (see below) |
-| `docs/experiments/2-act.md` | Experiment 2 brief — ACT for drag-and-label |
-| `docs/plans/2026-04-13-act-drag-and-label-design.md` | Experiment 2 full design doc — ACT architecture, drag-and-label task, vision backbone + chunk size ablations |
-| `docs/plans/2026-04-13-act-drag-and-label-implementation.md` | Experiment 2 implementation plan — 12-task breakdown |
-| `experiments/act_drag_label/` | Experiment 2 code (see below) |
-| `docs/experiments/3-miniwob-pygame.md` | Experiment 3 design doc — MiniWoB-Pygame unified task suite |
-| `docs/plans/2026-04-13-miniwob-pygame-implementation.md` | Experiment 3 implementation plan |
-| `experiments/miniwob_pygame/` | Experiment 3 code (see below) |
-| `docs/plans/2026-04-14-mini-editor-design.md` | Experiment 5 full design doc — mini text editor task for V+L+A |
-| `experiments/mini_editor/` | Experiment 5 code (see below) |
-| `scripts/launch_hf_job.py` | Launcher for HF Jobs training (calls `run_uv_job()`) |
-| `scripts/hf_job_train.py` | UV script that runs inside HF Jobs (clones repo, runs train.py) |
-| `scripts/migrate_hdf5_to_parquet.py` | One-shot migration from HDF5 episodes to parquet |
+| `docs/experiments/1-reactive-clicks.md`                                            | Experiment 1 brief — click reaction time test                                                                          |
+| `docs/plans/2026-04-11-reactive-clicks-design.md`                                  | Experiment 1 full design doc — architecture decisions, env, model, training, eval criteria                             |
+| `experiments/reactive_clicks/`                                                     | Experiment 1 code (see below)                                                                                          |
+| `docs/experiments/2-act.md`                                                        | Experiment 2 brief — ACT for drag-and-label                                                                            |
+| `docs/plans/2026-04-13-act-drag-and-label-design.md`                               | Experiment 2 full design doc — ACT architecture, drag-and-label task, vision backbone + chunk size ablations           |
+| `docs/plans/2026-04-13-act-drag-and-label-implementation.md`                       | Experiment 2 implementation plan — 12-task breakdown                                                                   |
+| `experiments/act_drag_label/`                                                      | Experiment 2 code (see below)                                                                                          |
+| `docs/experiments/3-miniwob-pygame.md`                                             | Experiment 3 design doc — MiniWoB-Pygame unified task suite                                                            |
+| `docs/plans/2026-04-13-miniwob-pygame-implementation.md`                           | Experiment 3 implementation plan                                                                                       |
+| `experiments/miniwob_pygame/`                                                      | Experiment 3 code (see below)                                                                                          |
+| `docs/plans/2026-04-14-mini-editor-design.md`                                      | Experiment 5 full design doc — mini text editor task for V+L+A                                                         |
+| `experiments/mini_editor/`                                                         | Experiment 5 code (see below)                                                                                          |
+| `scripts/launch_hf_job.py`                                                         | Launcher for HF Jobs training (calls `run_uv_job()`)                                                                   |
+| `scripts/hf_job_train.py`                                                          | UV script that runs inside HF Jobs (clones repo, runs train.py)                                                        |
+| `scripts/migrate_hdf5_to_parquet.py`                                               | One-shot migration from HDF5 episodes to parquet                                                                       |
 
 ## Experiment 1: Reactive Clicks
 
 Validates the core visuomotor loop: CNN observes 128x128 frame, outputs discretized delta mouse + click at 30 Hz.
 
 **Run sequence:**
+
 ```bash
 uv run python experiments/reactive_clicks/generate_data.py   # generates 1000 expert episodes
 uv run python experiments/reactive_clicks/train.py            # trains TinyCNN via behavior cloning
@@ -74,6 +75,7 @@ uv run python experiments/reactive_clicks/evaluate.py --visual  # with visible P
 Validates ACT (Action Chunking with Transformers) for desktop interaction: drag colored shapes to matching zones, type 3-char labels. Tests whether action chunking provides genuine advantage over reactive single-step models.
 
 **Run sequence:**
+
 ```bash
 uv run python experiments/act_drag_label/generate_data.py -n 10000       # generate expert demos (parquet)
 uv run python experiments/act_drag_label/train.py --backbone resnet18 --chunk-size 10 --device mps
@@ -100,6 +102,7 @@ uv run python experiments/act_drag_label/evaluate.py --model-only        # ACT o
 **Dataset format:** Parquet via HF `datasets` library (~10 shards). One row per timestep with columns: `episode_id`, `timestep`, `image` (PNG), `action_dx/dy/click/key`, episode metadata. Loaded via `load_dataset("PenTest-duck/cu-vla-data")` or `load_from_disk("data/")`.
 
 **HF Jobs training** (dataset loaded via `load_dataset()` — no volume mounting needed):
+
 ```bash
 uv run python scripts/launch_hf_job.py --flavor t4-medium --timeout 4h \
   -- --backbone resnet18 --chunk-size 10 --hf-upload-repo PenTest-duck/cu-vla-checkpoints
@@ -112,6 +115,7 @@ Unified multi-task Pygame environment suite with 12 computer use tasks. Tests wh
 **Key design:** All inputs (mouse, keyboard) represented as binary held state — the physical ground truth of input devices. No high-level abstractions. The env detects transitions (press/release) from state changes. 43 independent key channels support simultaneous key combos (Ctrl+C, Shift+A).
 
 **Run sequence:**
+
 ```bash
 # Generate expert demos for Phase 1 (MVP)
 uv run python experiments/miniwob_pygame/generate_data.py \
@@ -153,6 +157,7 @@ uv run python experiments/miniwob_pygame/generate_data.py --tasks all -n 5000
 | `hf_sync.py` | Upload/download data and checkpoints to HuggingFace Hub |
 
 **Action space (multi-binary held state):**
+
 ```python
 action = {
     "dx": float,           # cursor delta, continuous
@@ -179,9 +184,13 @@ action = {
 First V+L+A task: a Pygame text editor where the model must execute natural language edit instructions using low-level mouse + keyboard primitives at 30 Hz. Tests vision (locate words), language (parse instruction), and action (multi-step motor sequences) simultaneously.
 
 **Run sequence:**
+
 ```bash
 uv run python -m experiments.mini_editor.generate_data -n 100 -o data/mini_editor_test  # small test
 uv run python -m experiments.mini_editor.generate_data -n 10000 -o data/mini_editor       # full dataset
+uv run python -m experiments.mini_editor.train --epochs 100 --device cuda --hf-data-repo PenTest-duck/cu-vla-mini-editor
+uv run python -m experiments.mini_editor.evaluate --checkpoint path/to/best.pt
+uv run python -m experiments.mini_editor.evaluate --visual  # with Pygame window
 ```
 
 **Code layout:**
@@ -193,8 +202,15 @@ uv run python -m experiments.mini_editor.generate_data -n 10000 -o data/mini_edi
 | `env.py` | `MiniEditorEnv` — 640×480 Pygame editor, physical keyboard edge detection, 512×384 obs |
 | `expert.py` | Fitts's Law + human variance (curvature, overshoot, typing rhythm), episode state machine |
 | `generate_data.py` | Expert demo generation → HF Dataset (parquet), JPEG q=95 screenshots |
+| `backbones.py` | ResNet18 backbone (384×288 input, 108 tokens, 2D sinusoidal PE) |
+| `text_encoder.py` | Trainable 2L transformer text encoder, MobileBERT-init embeddings, ~4M params |
+| `model.py` | `ACT` — V+L+A fusion, 108 vision + text + proprio tokens, 53 keys (~21M params) |
+| `train.py` | BC training: focal BCE for keys, soft CE for bins, AMP, warmup+cosine LR |
+| `evaluate.py` | Per-operation eval, temporal ensemble smoothing, held-out phrasing accuracy |
+| `hf_sync.py` | Upload/download data and checkpoints to HuggingFace Hub |
 
 **Action space (53-key physical Mac keyboard held-state):**
+
 ```python
 action = {
     "dx": float,           # cursor delta, 49 discrete exponential bins
@@ -208,6 +224,7 @@ action = {
 ```
 
 **Observation space:**
+
 ```python
 observation = {
     "screenshot": np.ndarray,  # (384, 512, 3) uint8 RGB
@@ -219,6 +236,14 @@ observation = {
 **4 operations:** click-to-position, click+type, select+delete (shift+click), replace
 
 **Design doc:** `docs/plans/2026-04-14-mini-editor-design.md`
+
+## Experiment Results
+
+Experiment 1: simple CNN got pretty perfect results
+Experiment 2: ACT, 10 chunks, ResNet18 got 94% eval. No ablations tested.
+Experiment 3: skipped
+Experiment 4: skipped
+Experiment 5: in progress
 
 ## Key Technical Decisions (from research)
 
