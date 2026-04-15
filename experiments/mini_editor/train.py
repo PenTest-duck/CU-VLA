@@ -33,12 +33,10 @@ from experiments.mini_editor.config import (
     BIN_CENTERS,
     CHUNK,
     DATA,
-    ENV,
     FOCAL,
     MODEL,
     NUM_BINS,
     NUM_KEYS,
-    PROPRIO_DIM,
     SOFT_BIN_TARGETS,
     TRAIN,
 )
@@ -853,7 +851,6 @@ def _run_val_epoch(
     val_loader,
     focal_loss_fn,
     device,
-    use_cuda,
     use_amp,
     amp_dtype,
 ) -> tuple[float, dict[str, float], int]:
@@ -1007,7 +1004,6 @@ def load_dataset_splits(
     hf_data_repo: str | None,
     data_dir: str | None,
     base: str,
-    checkpoint_dir: str,
     chunk_size: int,
     batch_size: int,
     max_episodes: int | None,
@@ -1175,16 +1171,19 @@ def load_dataset_splits(
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
         pin_memory=use_cuda,
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
+    # Validation uses num_workers=0 (main-process decode) to avoid
+    # having 2×num_workers alive simultaneously during val.  Training
+    # workers are persistent, so they stay resident while val runs —
+    # extra val workers caused OOM at 51GB/62GB.  Val is forward-only
+    # (no backward), so it's fast enough single-threaded.
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        persistent_workers=num_workers > 0,
+        num_workers=0,
         pin_memory=use_cuda,
-        prefetch_factor=4 if num_workers > 0 else None,
     )
     return train_loader, train_sampler, val_loader
 
@@ -1221,10 +1220,12 @@ def train(
 
     use_cuda = device.startswith("cuda")
     if num_workers is None:
-        # Default: 4 workers for on-the-fly JPEG decode parallelism.
-        # With num_workers=0, all decode happens in the main process,
-        # blocking the GPU. Workers overlap decode with GPU compute.
-        num_workers = min(4, os.cpu_count() or 1)
+        # Default: 2 workers for on-the-fly JPEG decode parallelism.
+        # DataLoader wait was only 3.3% with 4 workers — 2 is plenty.
+        # Fewer workers = less fork CoW overhead and malloc fragmentation
+        # (each persistent worker accumulates ~5-8GB over an epoch from
+        # unreturned malloc pages after PIL decode cycles).
+        num_workers = min(2, os.cpu_count() or 1)
 
     # --- Build text encoder ---
     # Collect corpus sentences from the dataset to ensure vocab coverage
@@ -1264,7 +1265,6 @@ def train(
         None,  # don't re-download
         data_dir,
         base,
-        checkpoint_dir,
         chunk_size,
         batch_size,
         max_episodes,
@@ -1401,7 +1401,6 @@ def train(
             val_loader,
             focal_loss_fn,
             device,
-            use_cuda,
             use_amp,
             amp_dtype,
         )
