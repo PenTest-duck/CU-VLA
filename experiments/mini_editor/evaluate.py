@@ -151,9 +151,17 @@ class ACTAgent:
                 "PenTest-duck/cu-vla-exp5-data", split="train", streaming=True
             )
             train_corpus: set[str] = set()
+            n_rows = 0
             for row in ds:
                 train_corpus.add(row["initial_text"])
-            print(f"  {len(train_corpus)} unique passages from dataset")
+                n_rows += 1
+                if n_rows % 50000 == 0:
+                    print(
+                        f"    {n_rows} rows streamed, "
+                        f"{len(train_corpus)} unique passages so far...",
+                        flush=True,
+                    )
+            print(f"  {len(train_corpus)} unique passages from {n_rows} rows")
             text_encoder, self.tokenizer, self.token_map = build_text_encoder(
                 list(train_corpus)
             )
