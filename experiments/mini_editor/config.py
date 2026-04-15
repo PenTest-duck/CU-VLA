@@ -240,8 +240,8 @@ class ExpertConfig:
 @dataclass(frozen=True)
 class TrainConfig:
     num_episodes: int = 10000
-    batch_size: int = 256
-    lr: float = 1e-4
+    batch_size: int = 512
+    lr: float = 2e-4  # scaled from 1e-4 at batch=256 (linear scaling rule)
     weight_decay: float = 1e-4
     epochs: int = 100
     early_stop_patience: int = 15
