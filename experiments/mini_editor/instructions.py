@@ -90,6 +90,7 @@ def generate_instruction(
     words: list[dict],
     rng: np.random.Generator,
     vocab: list[str] | None = None,
+    operation: str | None = None,
 ) -> EditInstruction:
     """Sample a random edit instruction for the given text.
 
@@ -104,8 +105,11 @@ def generate_instruction(
     vocab : list[str] | None
         Optional word list for sampling new_text.  Falls back to word texts
         from *words* if not provided.
+    operation : str | None
+        Force a specific operation (one of "click", "click_type",
+        "select_delete", "replace").  If None, sample randomly.
     """
-    op = _OPERATIONS[rng.integers(len(_OPERATIONS))]
+    op = operation if operation is not None else _OPERATIONS[rng.integers(len(_OPERATIONS))]
     target = words[rng.integers(len(words))]
     templates = _TEMPLATE_MAP[op]
     template = templates[rng.integers(len(templates))]

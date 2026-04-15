@@ -416,7 +416,11 @@ def run_agent(
 
         words = extract_words(passage)
         vocab = [w["word"] for w in words]
-        instruction = generate_instruction(passage, words, rng, vocab)
+        # Round-robin through operation types
+        _ops = ["click", "click_type", "select_delete", "replace"]
+        instruction = generate_instruction(
+            passage, words, rng, vocab, operation=_ops[ep % len(_ops)]
+        )
 
         # Reset env with the passage text
         obs = env.reset(text=passage, seed=seed)
