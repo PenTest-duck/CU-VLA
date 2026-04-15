@@ -180,10 +180,6 @@ class ChunkDataset(Dataset):
         self.token_ids = token_ids
         self.attention_masks = attention_masks
 
-        # Model input dimensions (resized from dataset resolution)
-        self.model_h = MODEL.obs_h  # 288
-        self.model_w = MODEL.obs_w  # 384
-
         # Build flat index grouped by episode (sequential within each episode
         # for memmap-friendly access patterns)
         self.index: list[tuple[int, int]] = []
@@ -217,14 +213,9 @@ class ChunkDataset(Dataset):
         row_idx = start_row + t
 
         # --- Observation at time t (JPEG decoded on-the-fly from Arrow) ---
-        # HF dataset returns PIL Image; resize to model input resolution
-        from PIL import Image
-
+        # Load at native resolution; resize happens on GPU after batching
+        # (see _resize_batch_on_gpu in the training loop)
         img_pil = self.hf_dataset[row_idx]["image"]
-        if img_pil.size != (self.model_w, self.model_h):
-            img_pil = img_pil.resize(
-                (self.model_w, self.model_h), Image.BILINEAR
-            )
         img_np = np.array(img_pil)
         obs = (
             torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
@@ -649,6 +640,15 @@ def _run_train_epoch(
         mouse_gt = mouse_gt.to(device, non_blocking=True)
         keys_gt = keys_gt.to(device, non_blocking=True)
         pad_gt = pad_gt.to(device, non_blocking=True)
+
+        # GPU batch resize: (B, 3, obs_h, obs_w) -> (B, 3, model_h, model_w)
+        # Much faster than per-image PIL resize in DataLoader workers
+        if obs.shape[-2] != MODEL.obs_h or obs.shape[-1] != MODEL.obs_w:
+            obs = torch.nn.functional.interpolate(
+                obs, size=(MODEL.obs_h, MODEL.obs_w),
+                mode="bilinear", align_corners=False,
+            )
+
         if diag:
             if use_cuda:
                 torch.cuda.synchronize()
@@ -841,6 +841,13 @@ def _run_val_epoch(
             mouse_gt = mouse_gt.to(device, non_blocking=True)
             keys_gt = keys_gt.to(device, non_blocking=True)
             pad_gt = pad_gt.to(device, non_blocking=True)
+
+            # GPU batch resize
+            if obs.shape[-2] != MODEL.obs_h or obs.shape[-1] != MODEL.obs_w:
+                obs = torch.nn.functional.interpolate(
+                    obs, size=(MODEL.obs_h, MODEL.obs_w),
+                    mode="bilinear", align_corners=False,
+                )
 
             with torch.amp.autocast(
                 device_type=device.split(":")[0],
@@ -1092,7 +1099,10 @@ def train(
 
     use_cuda = device.startswith("cuda")
     if num_workers is None:
-        num_workers = 0
+        # Default: 4 workers for on-the-fly JPEG decode parallelism.
+        # With num_workers=0, all decode happens in the main process,
+        # blocking the GPU. Workers overlap decode with GPU compute.
+        num_workers = min(4, os.cpu_count() or 1)
 
     # --- Build text encoder ---
     # Collect corpus sentences from the dataset to ensure vocab coverage
