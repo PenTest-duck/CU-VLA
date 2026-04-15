@@ -123,13 +123,16 @@ class ACTAgent:
         checkpoint: str,
         chunk_size: int = CHUNK.default_chunk_size,
         device: str = "cpu",
+        corpus_sentences: list[str] | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.chunk_size = chunk_size
 
-        # Build text encoder (downloads MobileBERT on first run)
+        # Build text encoder with same vocab as training
         print("  Building text encoder...", flush=True)
-        text_encoder, self.tokenizer, self.token_map = build_text_encoder()
+        text_encoder, self.tokenizer, self.token_map = build_text_encoder(
+            corpus_sentences
+        )
 
         # Build model with text encoder
         self.model = ACT(
@@ -532,6 +535,7 @@ def main(
             act_ckpt,
             chunk_size=chunk_size,
             device=device,
+            corpus_sentences=corpus_sentences,
         )
         act_results = run_agent(
             act_agent, env, corpus_sentences, num_episodes, max_steps
