@@ -37,6 +37,22 @@ EXPERIMENTS = {
 
 
 def main() -> None:
+    # Install SDL2 dev libraries (needed by pygame on bare Linux containers)
+    subprocess.run(
+        ["apt-get", "update", "-qq"],
+        check=False, capture_output=True,
+    )
+    subprocess.run(
+        ["apt-get", "install", "-y", "-qq", "libsdl2-dev", "libsdl2-image-dev",
+         "libsdl2-mixer-dev", "libsdl2-ttf-dev", "libfreetype6-dev"],
+        check=False, capture_output=True,
+    )
+    # Reinstall pygame now that SDL2 is available
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--force-reinstall", "pygame>=2.6"],
+        check=True,
+    )
+
     gen_args = [a for a in sys.argv[1:] if a.strip()]
 
     experiment = "exp5"  # default to latest
@@ -58,13 +74,6 @@ def main() -> None:
 
     os.chdir(WORKDIR)
     sys.path.insert(0, WORKDIR)
-
-    # Install the agentlans/high-quality-english-sentences dataset dependency
-    # (exp5 corpus.py uses it)
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "datasets"],
-        check=True,
-    )
 
     print(f"Experiment: {experiment}")
     print(f"Running {exp['generate_script']} with args: {gen_args}")
