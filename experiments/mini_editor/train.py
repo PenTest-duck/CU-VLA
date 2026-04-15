@@ -1051,12 +1051,26 @@ def load_dataset_splits(
         flush=True,
     )
 
-    # Free the Arrow dataset — all data now in extracted arrays
+    # Free the Arrow dataset — all data now in extracted arrays.
+    # Must force glibc to return pages to OS, otherwise Python's allocator
+    # keeps the freed ~36GB mapped and DataLoader worker forks OOM.
     del ds, ds_raw
     import gc
 
     gc.collect()
-    print("Arrow dataset released.", flush=True)
+
+    # Force glibc to release freed heap pages back to OS
+    import ctypes
+
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # Not Linux or libc not available
+
+    import psutil  # type: ignore[import-untyped]
+
+    rss_gb = psutil.Process().memory_info().rss / 1024**3
+    print(f"Arrow dataset released. RSS after trim: {rss_gb:.1f}GB", flush=True)
 
     # Build episode offset table and split
     episode_offsets = build_episode_offsets(ep_ids_np)
