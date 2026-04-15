@@ -141,6 +141,9 @@ def predecode_images(ds) -> np.ndarray:
     Returns a numpy memmap array of shape (N, obs_h, obs_w, 3) uint8
     at the dataset resolution (ENV.obs_h x ENV.obs_w = 384 x 512).
     Reuses an existing cache if the file size matches.
+
+    Decodes in sequential batches to limit peak RAM usage — each batch
+    decodes BATCH_SIZE images, writes to memmap, and flushes.
     """
     n_samples = len(ds)
     obs_h = ENV.obs_h  # 384
@@ -165,51 +168,43 @@ def predecode_images(ds) -> np.ndarray:
         else:
             os.remove(memmap_path)
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     images = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=img_shape)
 
-    def _decode_range(start: int, end: int) -> int:
-        for i in range(start, end):
-            img = ds[i]["image"]
-            # HF datasets stores images as PIL; convert to numpy
+    # Decode in batches to limit RAM: decode BATCH_SIZE images at a time,
+    # write to memmap, flush, and move on. This avoids holding all decoded
+    # images in RAM simultaneously.
+    BATCH_SIZE = 5000
+    done = 0
+    for batch_start in range(0, n_samples, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, n_samples)
+        # Use HF datasets batch access for efficiency
+        batch = ds[batch_start:batch_end]
+        for j, img in enumerate(batch["image"]):
+            idx = batch_start + j
             img_np = np.array(img)
-            # Handle potential size mismatch (should be obs_h x obs_w already)
             if img_np.shape[:2] != (obs_h, obs_w):
                 from PIL import Image
 
                 img_pil = img if hasattr(img, "resize") else Image.fromarray(img_np)
                 img_pil = img_pil.resize((obs_w, obs_h), Image.BILINEAR)
                 img_np = np.array(img_pil)
-            images[i] = img_np
-        return end - start
+            images[idx] = img_np
+        images.flush()
+        done = batch_end
+        elapsed = time.perf_counter() - t_decode
+        print(
+            f"  Pre-decoded {done}/{n_samples} images "
+            f"({elapsed:.1f}s, {done / elapsed:.0f} img/s)",
+            flush=True,
+        )
 
-    n_threads = min(8, os.cpu_count() or 1)
-    chunk = (n_samples + n_threads - 1) // n_threads
-    futures = []
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        for t in range(n_threads):
-            start = t * chunk
-            end = min(start + chunk, n_samples)
-            if start < end:
-                futures.append(pool.submit(_decode_range, start, end))
-
-        done = 0
-        for future in as_completed(futures):
-            done += future.result()
-            print(
-                f"  Pre-decoded {done}/{n_samples} images "
-                f"({time.perf_counter() - t_decode:.1f}s elapsed)",
-                flush=True,
-            )
-
-    images.flush()
     images_gb = images.nbytes / 1024**3
+    elapsed = time.perf_counter() - t_decode
     print(
         f"Images pre-decoded to {memmap_path} in "
-        f"{time.perf_counter() - t_decode:.1f}s "
+        f"{elapsed:.1f}s "
         f"({images_gb:.1f}GB, "
-        f"{n_samples / (time.perf_counter() - t_decode):.0f} img/s)",
+        f"{n_samples / elapsed:.0f} img/s)",
         flush=True,
     )
     return images
@@ -1025,21 +1020,24 @@ def load_dataset_splits(
     use_cuda: bool,
     tokenizer,
     token_id_map: dict[int, int],
+    ds_preloaded=None,
 ) -> tuple[DataLoader, EpisodeSequentialSampler, DataLoader]:
     """Load dataset, pre-decode images, build DataLoaders.
 
     Returns (train_loader, train_sampler, val_loader).
+    If ds_preloaded is provided, use it instead of loading from disk/hub.
     """
-    if data_dir is None:
-        data_dir = os.path.join(base, "data")
-
-    # Load dataset: from HF Hub (parquet) or local (Arrow)
-    if hf_data_repo:
+    if ds_preloaded is not None:
+        ds = ds_preloaded
+        print(f"Using preloaded dataset: {len(ds)} rows")
+    elif hf_data_repo:
         from datasets import load_dataset as _load_dataset
 
         print(f"Loading dataset from HF Hub: {hf_data_repo} ...")
         ds = _load_dataset(hf_data_repo, split="train")
     else:
+        if data_dir is None:
+            data_dir = os.path.join(base, "data")
         from datasets import load_from_disk
 
         print(f"Loading dataset from {data_dir} ...")
@@ -1193,17 +1191,18 @@ def train(
         ds_temp = load_from_disk(_data_dir)
     corpus_sentences = list(set(ds_temp["initial_text"]))
     print(f"Corpus: {len(corpus_sentences)} unique initial_text passages")
-    del ds_temp  # free memory
 
     text_encoder, tokenizer, token_id_map = build_text_encoder(corpus_sentences)
+    del corpus_sentences
     print(
         f"Text encoder built in {time.perf_counter() - t_te:.1f}s",
         flush=True,
     )
 
     # --- Data ---
+    # Pass the already-loaded dataset to avoid loading it a second time
     train_loader, train_sampler, val_loader = load_dataset_splits(
-        hf_data_repo,
+        None,  # don't re-download
         data_dir,
         base,
         checkpoint_dir,
@@ -1214,7 +1213,9 @@ def train(
         use_cuda,
         tokenizer,
         token_id_map,
+        ds_preloaded=ds_temp,
     )
+    del ds_temp
 
     # --- Model ---
     model = ACT(
