@@ -917,6 +917,10 @@ def pretokenize_instructions(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pre-tokenize all instruction strings and cache as numpy arrays.
 
+    Deduplicates first: with 508K rows but ~10K unique instructions,
+    tokenizes each unique string once then broadcasts. ~50x fewer
+    tokenize calls than the naive per-row approach.
+
     Returns:
         (token_ids, attention_masks) each of shape (N, max_length) int64.
     """
@@ -927,16 +931,22 @@ def pretokenize_instructions(
     t0 = time.perf_counter()
     instructions = ds["instruction"]  # list[str]
 
-    for i, text in enumerate(instructions):
+    # Deduplicate: tokenize each unique instruction once
+    unique_texts = list(set(instructions))
+    cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for text in unique_texts:
         ids, mask = tokenize_instruction(text, tokenizer, token_id_map, max_length)
-        token_ids[i] = ids[0].numpy()
-        attention_masks[i] = mask[0].numpy()
+        cache[text] = (ids[0].numpy(), mask[0].numpy())
+
+    # Broadcast to all rows
+    for i, text in enumerate(instructions):
+        token_ids[i], attention_masks[i] = cache[text]
 
     elapsed = time.perf_counter() - t0
     print(
-        f"Pre-tokenized {n} instructions in {elapsed:.1f}s "
-        f"({n / elapsed:.0f} instr/s, "
-        f"{token_ids.nbytes / 1024**2:.1f}MB)",
+        f"Pre-tokenized {n} instructions ({len(unique_texts)} unique) "
+        f"in {elapsed:.1f}s "
+        f"({token_ids.nbytes / 1024**2:.1f}MB)",
         flush=True,
     )
     return token_ids, attention_masks
