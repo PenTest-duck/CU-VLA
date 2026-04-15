@@ -130,10 +130,58 @@ class FocalBCELoss(nn.Module):
         return loss.mean()
 
 
-    # NOTE: No image predecode / memmap cache. Images are decoded on-the-fly
-    # from the HF Arrow dataset in ChunkDataset.__getitem__. The JPEG-compressed
-    # dataset (~15GB for 508K images) fits in OS page cache, and multi-worker
-    # DataLoader overlaps decode with GPU compute. See ChunkDataset docstring.
+
+
+# ---------------------------------------------------------------------------
+# JPEG memmap: flat file of concatenated JPEG bytes + offset index
+# ---------------------------------------------------------------------------
+
+
+class JpegMemmap:
+    """Memory-mapped store of concatenated JPEG bytes.
+
+    Stores all images as raw JPEG bytes in a flat binary file with an
+    offset index. Workers read via mmap — no Python object refcounts,
+    so forked DataLoader workers don't trigger copy-on-write.
+
+    Layout:
+        flat file: [jpeg_0_bytes][jpeg_1_bytes]...[jpeg_N_bytes]
+        offsets:    numpy array of (start, length) pairs, shape (N, 2)
+    """
+
+    def __init__(self, path: str, offsets: np.ndarray) -> None:
+        self.path = path
+        self.offsets = offsets  # (N, 2) int64: (start_byte, length)
+        self._mmap = None
+
+    def _ensure_mmap(self) -> None:
+        if self._mmap is None:
+            import mmap as mmap_mod
+
+            self._fh = open(self.path, "rb")
+            self._mmap = mmap_mod.mmap(
+                self._fh.fileno(), 0, access=mmap_mod.ACCESS_READ
+            )
+
+    def __getitem__(self, idx: int) -> bytes:
+        self._ensure_mmap()
+        start, length = self.offsets[idx]
+        return self._mmap[start : start + length]
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    @staticmethod
+    def build(jpeg_list: list[bytes], path: str) -> "JpegMemmap":
+        """Write a list of JPEG byte strings to a flat file + offset index."""
+        offsets = np.zeros((len(jpeg_list), 2), dtype=np.int64)
+        with open(path, "wb") as f:
+            pos = 0
+            for i, data in enumerate(jpeg_list):
+                offsets[i] = (pos, len(data))
+                f.write(data)
+                pos += len(data)
+        return JpegMemmap(path, offsets)
 
 
 # ---------------------------------------------------------------------------
@@ -147,17 +195,16 @@ class ChunkDataset(Dataset):
     Every timestep t in every episode is a valid start index.
     Action chunks are zero-padded when near the episode end.
 
-    Images stored as raw JPEG bytes in a Python list (~15GB for 508K images).
-    Decoded to numpy on-the-fly in __getitem__ using PIL — no Arrow access,
-    no GIL contention between DataLoader workers. Multi-worker DataLoader
-    overlaps JPEG decode with GPU compute.
+    Images stored in a flat memory-mapped file (JpegMemmap). Workers read
+    via mmap without touching Python object refcounts, avoiding the
+    fork + refcount copy-on-write problem that OOMs with list[bytes].
 
     Scalar columns and tokenized instructions are pre-extracted to numpy.
     """
 
     def __init__(
         self,
-        jpeg_bytes: list[bytes],
+        jpeg_mmap: JpegMemmap,
         episode_offsets: dict[int, tuple[int, int]],
         episode_ids: set[int],
         chunk_size: int,
@@ -165,7 +212,7 @@ class ChunkDataset(Dataset):
         token_ids: np.ndarray,
         attention_masks: np.ndarray,
     ) -> None:
-        self.jpeg_bytes = jpeg_bytes
+        self.jpeg_mmap = jpeg_mmap
         self.chunk_size = chunk_size
         self.episode_offsets = {
             eid: episode_offsets[eid]
@@ -212,13 +259,14 @@ class ChunkDataset(Dataset):
         C = self.chunk_size
         row_idx = start_row + t
 
-        # --- Observation at time t (JPEG decoded from pre-extracted bytes) ---
-        # No Arrow access — decodes from raw bytes, no GIL contention
+        # --- Observation at time t (JPEG decoded from mmap) ---
+        # Reads from memory-mapped file — no Python refcount, no CoW
         # Resize happens on GPU after batching (F.interpolate)
         import io
         from PIL import Image
 
-        img_pil = Image.open(io.BytesIO(self.jpeg_bytes[row_idx]))
+        jpeg_data = self.jpeg_mmap[row_idx]
+        img_pil = Image.open(io.BytesIO(jpeg_data))
         img_np = np.array(img_pil)
         obs = (
             torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
@@ -1051,10 +1099,17 @@ def load_dataset_splits(
         flush=True,
     )
 
-    # Free the Arrow dataset — all data now in extracted arrays.
-    # Must force glibc to return pages to OS, otherwise Python's allocator
-    # keeps the freed ~36GB mapped and DataLoader worker forks OOM.
-    del ds, ds_raw
+    # Write JPEG bytes to a flat memory-mapped file.
+    # This avoids the fork + refcount CoW problem: forked DataLoader workers
+    # read from the mmap (kernel pages, no Python refcount) instead of
+    # a Python list (each access increments refcount → CoW page copy → OOM).
+    jpeg_mmap_path = os.path.join("/tmp", "exp5_jpeg.mmap")
+    print("Writing JPEG memmap ...", flush=True)
+    jpeg_mmap = JpegMemmap.build(jpeg_bytes, jpeg_mmap_path)
+    print(f"JPEG memmap written: {jpeg_mmap_path} ({jpeg_gb:.1f}GB)", flush=True)
+
+    # Free everything: Arrow dataset + Python jpeg_bytes list
+    del ds, ds_raw, jpeg_bytes
     import gc
 
     gc.collect()
@@ -1070,7 +1125,7 @@ def load_dataset_splits(
     import psutil  # type: ignore[import-untyped]
 
     rss_gb = psutil.Process().memory_info().rss / 1024**3
-    print(f"Arrow dataset released. RSS after trim: {rss_gb:.1f}GB", flush=True)
+    print(f"Arrow + jpeg_bytes released. RSS after trim: {rss_gb:.1f}GB", flush=True)
 
     # Build episode offset table and split
     episode_offsets = build_episode_offsets(ep_ids_np)
@@ -1090,7 +1145,7 @@ def load_dataset_splits(
     print(f"DataLoader workers: {num_workers}")
 
     train_dataset = ChunkDataset(
-        jpeg_bytes,
+        jpeg_mmap,
         episode_offsets,
         train_ids,
         chunk_size,
@@ -1099,7 +1154,7 @@ def load_dataset_splits(
         attention_masks,
     )
     val_dataset = ChunkDataset(
-        jpeg_bytes,
+        jpeg_mmap,
         episode_offsets,
         val_ids,
         chunk_size,
