@@ -582,10 +582,14 @@ def print_epoch1_diagnostics(
     )
 
     # Per-head gradient norms
-    if model is not None and hasattr(model, "_diag_head_grad_norms"):
+    # torch.compile wraps model in OptimizedModule — access diag attrs
+    # on the inner module to avoid AttributeError on del.
+    _mod = getattr(model, "_orig_mod", model) if model is not None else None
+
+    if _mod is not None and hasattr(_mod, "_diag_head_grad_norms"):
         print()
         print(f"  --- Per-component gradient norms (sampled every 10 batches) ---")
-        for group_name, norms in model._diag_head_grad_norms.items():
+        for group_name, norms in _mod._diag_head_grad_norms.items():
             if norms:
                 gn = np.array(norms)
                 print(
@@ -594,17 +598,17 @@ def print_epoch1_diagnostics(
                     f"min={gn.min():.4f}  max={gn.max():.4f}"
                 )
         # Check text encoder gradient flow
-        te_norms = model._diag_head_grad_norms.get("text_encoder", [])
+        te_norms = _mod._diag_head_grad_norms.get("text_encoder", [])
         if te_norms and np.mean(te_norms) < 1e-6:
             print(
                 f"  WARNING: Text encoder gradients near zero — "
                 f"end-to-end gradient flow may be broken!"
             )
-        del model._diag_head_grad_norms
+        del _mod._diag_head_grad_norms
 
     # Key press accuracy
-    if model is not None and hasattr(model, "_diag_key_stats"):
-        ks = model._diag_key_stats
+    if _mod is not None and hasattr(_mod, "_diag_key_stats"):
+        ks = _mod._diag_key_stats
         tp, fp, fn, tn = ks["tp"], ks["fp"], ks["fn"], ks["tn"]
         total_pos = tp + fn
         total_neg = tn + fp
@@ -623,7 +627,7 @@ def print_epoch1_diagnostics(
                 f"  WARNING: Model predicting near-zero key presses "
                 f"(recall={recall:.4f}). Focal BCE may need tuning."
             )
-        del model._diag_key_stats
+        del _mod._diag_key_stats
 
     print(f"{'='*70}\n", flush=True)
 
@@ -1213,11 +1217,10 @@ def train(
 
     use_cuda = device.startswith("cuda")
     if num_workers is None:
-        # 4 workers for JPEG decode parallelism.
-        # With uint8 + worker-side resize, per-worker memory footprint
-        # is small (~7GB including fragmentation). On A100-large (142GB)
-        # 8 persistent workers (4 train + 4 val) use ~84GB total.
-        num_workers = min(4, os.cpu_count() or 1)
+        # 8 workers for JPEG decode parallelism.
+        # DataLoader wait was 33.7% with 4 workers on A100-large (12 vCPU).
+        # 8 workers leaves 4 cores for main process + system.
+        num_workers = min(8, os.cpu_count() or 1)
 
     # --- Build text encoder ---
     # Collect corpus sentences from the dataset to ensure vocab coverage
