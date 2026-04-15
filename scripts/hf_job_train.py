@@ -1,9 +1,9 @@
 # /// script
-# requires-python = ">=3.14"
+# requires-python = ">=3.13,<3.14"
 # dependencies = [
 #     "torch>=2.6,<2.11",
 #     "torchvision>=0.21,<0.22",
-#     "transformers>=4.52",
+#     "transformers>=4.50",
 #     "numpy>=2.0",
 #     "datasets>=3.0",
 #     "Pillow>=10.0",
