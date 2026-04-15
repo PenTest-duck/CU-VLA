@@ -143,14 +143,19 @@ class ACTAgent:
             vocab_size = max(saved_token_map.values()) + 1
             text_encoder.resize_vocab(vocab_size)
         else:
-            # Fallback: load training dataset to get same corpus as train.py
-            print("  No token_id_map in checkpoint, rebuilding from dataset...")
+            # Fallback: stream training dataset to get same corpus as
+            # train.py without loading the full ~36GB Arrow table.
+            print("  No token_id_map in checkpoint, streaming dataset for vocab...")
             from datasets import load_dataset as _load_dataset
-            ds = _load_dataset("PenTest-duck/cu-vla-exp5-data", split="train")
-            train_corpus = list(set(ds["initial_text"]))
-            del ds
+            ds = _load_dataset(
+                "PenTest-duck/cu-vla-exp5-data", split="train", streaming=True
+            )
+            train_corpus: set[str] = set()
+            for row in ds:
+                train_corpus.add(row["initial_text"])
+            print(f"  {len(train_corpus)} unique passages from dataset")
             text_encoder, self.tokenizer, self.token_map = build_text_encoder(
-                train_corpus
+                list(train_corpus)
             )
             del train_corpus
 
