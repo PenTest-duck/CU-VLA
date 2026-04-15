@@ -150,6 +150,7 @@ class ACTAgent:
             ds = _load_dataset(
                 "PenTest-duck/cu-vla-exp5-data", split="train", streaming=True
             )
+            ds = ds.select_columns(["initial_text"])
             from tqdm import tqdm
             train_corpus: set[str] = set()
             for row in tqdm(ds, total=508628, desc="  Streaming vocab"):
