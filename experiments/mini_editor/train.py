@@ -130,84 +130,10 @@ class FocalBCELoss(nn.Module):
         return loss.mean()
 
 
-# ---------------------------------------------------------------------------
-# Image pre-decode memmap cache
-# ---------------------------------------------------------------------------
-
-
-def predecode_images(ds) -> np.ndarray:
-    """Decode all images from Arrow/parquet into a disk-backed memmap.
-
-    Returns a numpy memmap array of shape (N, obs_h, obs_w, 3) uint8
-    at the dataset resolution (ENV.obs_h x ENV.obs_w = 384 x 512).
-    Reuses an existing cache if the file size matches.
-
-    Decodes in sequential batches to limit peak RAM usage — each batch
-    decodes BATCH_SIZE images, writes to memmap, and flushes.
-    """
-    n_samples = len(ds)
-    obs_h = ENV.obs_h  # 384
-    obs_w = ENV.obs_w  # 512
-    img_shape = (n_samples, obs_h, obs_w, 3)
-    memmap_path = os.path.join("/tmp", "exp5_images_cache.dat")
-    t_decode = time.perf_counter()
-
-    if os.path.exists(memmap_path):
-        expected_bytes = int(np.prod(img_shape))
-        actual_bytes = os.path.getsize(memmap_path)
-        if actual_bytes == expected_bytes:
-            images = np.memmap(
-                memmap_path, dtype=np.uint8, mode="r", shape=img_shape
-            )
-            print(
-                f"Image cache loaded from {memmap_path} "
-                f"({actual_bytes / 1024**3:.1f}GB)",
-                flush=True,
-            )
-            return images
-        else:
-            os.remove(memmap_path)
-
-    images = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=img_shape)
-
-    # Decode in batches to limit RAM: decode BATCH_SIZE images at a time,
-    # write to memmap, flush, and move on. This avoids holding all decoded
-    # images in RAM simultaneously.
-    BATCH_SIZE = 5000
-    done = 0
-    for batch_start in range(0, n_samples, BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, n_samples)
-        # Use HF datasets batch access for efficiency
-        batch = ds[batch_start:batch_end]
-        for j, img in enumerate(batch["image"]):
-            idx = batch_start + j
-            img_np = np.array(img)
-            if img_np.shape[:2] != (obs_h, obs_w):
-                from PIL import Image
-
-                img_pil = img if hasattr(img, "resize") else Image.fromarray(img_np)
-                img_pil = img_pil.resize((obs_w, obs_h), Image.BILINEAR)
-                img_np = np.array(img_pil)
-            images[idx] = img_np
-        images.flush()
-        done = batch_end
-        elapsed = time.perf_counter() - t_decode
-        print(
-            f"  Pre-decoded {done}/{n_samples} images "
-            f"({elapsed:.1f}s, {done / elapsed:.0f} img/s)",
-            flush=True,
-        )
-
-    images_gb = images.nbytes / 1024**3
-    elapsed = time.perf_counter() - t_decode
-    print(
-        f"Images pre-decoded to {memmap_path} in "
-        f"{elapsed:.1f}s "
-        f"({images_gb:.1f}GB, "
-        f"{n_samples / elapsed:.0f} img/s)",
-        flush=True,
-    )
-    return images
+    # NOTE: No image predecode / memmap cache. Images are decoded on-the-fly
+    # from the HF Arrow dataset in ChunkDataset.__getitem__. The JPEG-compressed
+    # dataset (~15GB for 508K images) fits in OS page cache, and multi-worker
+    # DataLoader overlaps decode with GPU compute. See ChunkDataset docstring.
 
 
 # ---------------------------------------------------------------------------
@@ -221,14 +147,17 @@ class ChunkDataset(Dataset):
     Every timestep t in every episode is a valid start index.
     Action chunks are zero-padded when near the episode end.
 
-    All columns (including images) are pre-extracted to numpy arrays
-    so __getitem__ is pure array indexing with no PNG decode.
-    Instructions are pre-tokenized at init time.
+    Images are decoded on-the-fly from the HF Arrow dataset (JPEG
+    compressed, ~30KB/image). The compressed dataset (~15GB) fits in
+    OS page cache, so repeated access is fast. Multi-worker DataLoader
+    overlaps JPEG decode with GPU compute.
+
+    Scalar columns and tokenized instructions are pre-extracted to numpy.
     """
 
     def __init__(
         self,
-        images: np.ndarray,
+        hf_dataset,
         episode_offsets: dict[int, tuple[int, int]],
         episode_ids: set[int],
         chunk_size: int,
@@ -236,7 +165,7 @@ class ChunkDataset(Dataset):
         token_ids: np.ndarray,
         attention_masks: np.ndarray,
     ) -> None:
-        self.images = images
+        self.hf_dataset = hf_dataset
         self.chunk_size = chunk_size
         self.episode_offsets = {
             eid: episode_offsets[eid]
@@ -287,20 +216,18 @@ class ChunkDataset(Dataset):
         C = self.chunk_size
         row_idx = start_row + t
 
-        # --- Observation at time t (pre-decoded uint8 array) ---
-        # Dataset resolution: (ENV.obs_h, ENV.obs_w, 3) = (384, 512, 3)
-        # Resize to model input: (MODEL.obs_h, MODEL.obs_w) = (288, 384)
-        img_np = self.images[row_idx]  # (384, 512, 3)
-        if img_np.shape[0] != self.model_h or img_np.shape[1] != self.model_w:
-            from PIL import Image
+        # --- Observation at time t (JPEG decoded on-the-fly from Arrow) ---
+        # HF dataset returns PIL Image; resize to model input resolution
+        from PIL import Image
 
-            img_pil = Image.fromarray(img_np)
+        img_pil = self.hf_dataset[row_idx]["image"]
+        if img_pil.size != (self.model_w, self.model_h):
             img_pil = img_pil.resize(
                 (self.model_w, self.model_h), Image.BILINEAR
             )
-            img_np = np.array(img_pil)
+        img_np = np.array(img_pil)
         obs = (
-            torch.from_numpy(img_np.copy()).permute(2, 0, 1).float() / 255.0
+            torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
         )
 
         # --- Proprioception at time t ---
@@ -1068,8 +995,8 @@ def load_dataset_splits(
         ds, tokenizer, token_id_map
     )
 
-    # Pre-decode images to memmap
-    images = predecode_images(ds)
+    # No image predecode — JPEG decoded on-the-fly from Arrow dataset.
+    # The compressed dataset (~15GB) fits in OS page cache for fast access.
 
     # Build episode offset table and split
     episode_offsets = build_episode_offsets(ep_ids_np)
@@ -1089,7 +1016,7 @@ def load_dataset_splits(
     print(f"DataLoader workers: {num_workers}")
 
     train_dataset = ChunkDataset(
-        images,
+        ds,
         episode_offsets,
         train_ids,
         chunk_size,
@@ -1098,7 +1025,7 @@ def load_dataset_splits(
         attention_masks,
     )
     val_dataset = ChunkDataset(
-        images,
+        ds,
         episode_offsets,
         val_ids,
         chunk_size,
