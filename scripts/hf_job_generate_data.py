@@ -5,7 +5,7 @@
 #     "datasets>=3.0",
 #     "Pillow>=10.0",
 #     "huggingface-hub>=0.30",
-#     "pygame>=2.6",
+#     "setuptools",
 # ]
 # ///
 """Self-contained data generation script for HuggingFace Jobs.
@@ -37,19 +37,19 @@ EXPERIMENTS = {
 
 
 def main() -> None:
-    # Install SDL2 dev libraries (needed by pygame on bare Linux containers)
-    subprocess.run(
-        ["apt-get", "update", "-qq"],
-        check=False, capture_output=True,
-    )
+    # Install SDL2 dev libraries then pygame (can't be in UV script deps
+    # because uv resolves deps before main() runs, and pygame needs SDL2
+    # system libs to build from source on Linux)
+    print("Installing SDL2 dev libraries...")
+    subprocess.run(["apt-get", "update", "-qq"], check=True)
     subprocess.run(
         ["apt-get", "install", "-y", "-qq", "libsdl2-dev", "libsdl2-image-dev",
          "libsdl2-mixer-dev", "libsdl2-ttf-dev", "libfreetype6-dev"],
-        check=False, capture_output=True,
+        check=True,
     )
-    # Reinstall pygame now that SDL2 is available
+    print("Installing pygame...")
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--force-reinstall", "pygame>=2.6"],
+        [sys.executable, "-m", "pip", "install", "pygame>=2.6"],
         check=True,
     )
 
