@@ -150,18 +150,11 @@ class ACTAgent:
             ds = _load_dataset(
                 "PenTest-duck/cu-vla-exp5-data", split="train", streaming=True
             )
+            from tqdm import tqdm
             train_corpus: set[str] = set()
-            n_rows = 0
-            for row in ds:
+            for row in tqdm(ds, total=508628, desc="  Streaming vocab"):
                 train_corpus.add(row["initial_text"])
-                n_rows += 1
-                if n_rows % 50000 == 0:
-                    print(
-                        f"    {n_rows} rows streamed, "
-                        f"{len(train_corpus)} unique passages so far...",
-                        flush=True,
-                    )
-            print(f"  {len(train_corpus)} unique passages from {n_rows} rows")
+            print(f"  {len(train_corpus)} unique passages")
             text_encoder, self.tokenizer, self.token_map = build_text_encoder(
                 list(train_corpus)
             )
