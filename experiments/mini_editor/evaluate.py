@@ -143,19 +143,27 @@ class ACTAgent:
             vocab_size = max(saved_token_map.values()) + 1
             text_encoder.resize_vocab(vocab_size)
         else:
-            # Fallback: stream training dataset to get same corpus as
-            # train.py without loading the full ~36GB Arrow table.
-            print("  No token_id_map in checkpoint, streaming dataset for vocab...")
-            from datasets import load_dataset as _load_dataset
-            ds = _load_dataset(
-                "PenTest-duck/cu-vla-exp5-data", split="train", streaming=True
-            )
-            ds = ds.select_columns(["initial_text"])
-            from tqdm import tqdm
+            # Fallback: read just the initial_text column from parquet
+            # shards using pyarrow column projection (skips image bytes
+            # entirely — ~50MB text vs ~11GB with images).
+            print("  No token_id_map in checkpoint, reading vocab from parquet...")
+            from huggingface_hub import HfFileSystem
+            import pyarrow.parquet as pq
+
+            fs = HfFileSystem()
+            parquet_files = sorted(fs.glob(
+                "datasets/PenTest-duck/cu-vla-exp5-data/data/*.parquet"
+            ))
             train_corpus: set[str] = set()
-            for row in tqdm(ds, total=508628, desc="  Streaming vocab"):
-                train_corpus.add(row["initial_text"])
-            print(f"  {len(train_corpus)} unique passages")
+            for i, f in enumerate(parquet_files):
+                table = pq.read_table(fs.open(f), columns=["initial_text"])
+                train_corpus.update(table["initial_text"].to_pylist())
+                print(
+                    f"    shard {i+1}/{len(parquet_files)}: "
+                    f"{len(train_corpus)} unique passages",
+                    flush=True,
+                )
+            print(f"  {len(train_corpus)} unique passages total")
             text_encoder, self.tokenizer, self.token_map = build_text_encoder(
                 list(train_corpus)
             )
