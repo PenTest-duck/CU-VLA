@@ -133,20 +133,26 @@ class ACTAgent:
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         saved_token_map = state.pop("__token_id_map__", None)
 
-        # Build text encoder — use saved token_id_map for exact vocab match,
-        # fall back to rebuilding from corpus if not in checkpoint
+        # Build text encoder — use saved token_id_map for exact vocab match.
+        # If not in checkpoint, rebuild from the training dataset's initial_text
+        # (NOT the full corpus, which has different vocab coverage).
         print("  Building text encoder...", flush=True)
         if saved_token_map is not None:
-            # Build with just templates (vocab size doesn't matter),
-            # then override the token map and resize embedding
             text_encoder, self.tokenizer, _ = build_text_encoder()
             self.token_map = saved_token_map
             vocab_size = max(saved_token_map.values()) + 1
             text_encoder.resize_vocab(vocab_size)
         else:
+            # Fallback: load training dataset to get same corpus as train.py
+            print("  No token_id_map in checkpoint, rebuilding from dataset...")
+            from datasets import load_dataset as _load_dataset
+            ds = _load_dataset("PenTest-duck/cu-vla-exp5-data", split="train")
+            train_corpus = list(set(ds["initial_text"]))
+            del ds
             text_encoder, self.tokenizer, self.token_map = build_text_encoder(
-                corpus_sentences
+                train_corpus
             )
+            del train_corpus
 
         # Build model with text encoder
         self.model = ACT(
