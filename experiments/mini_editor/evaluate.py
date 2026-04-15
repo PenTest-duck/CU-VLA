@@ -427,6 +427,13 @@ def run_agent(
             agent.generate_trajectory(instruction, rng)
 
         agent.set_instruction(instruction.instruction_text)
+
+        # Show instruction in window title during visual eval
+        if visual:
+            import pygame
+            pygame.display.set_caption(
+                f"[{instruction.operation}] {instruction.instruction_text}"
+            )
         agent.reset()
 
         proprio = build_proprio(env)
