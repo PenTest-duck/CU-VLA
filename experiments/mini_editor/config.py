@@ -266,6 +266,36 @@ class EvalConfig:
     max_steps_per_episode: int = 300
 
 
+@dataclass(frozen=True)
+class ModelConfig:
+    d_model: int = 256
+    nheads: int = 4
+    encoder_layers: int = 4
+    decoder_layers: int = 4
+    dim_feedforward: int = 512
+    dropout: float = 0.1
+    film_hidden_dim: int = 256
+    proprio_dim: int = 56  # cursor_xy(2) + mouse_left(1) + keys_held(53)
+    obs_h: int = 288       # model input height (resized from 384)
+    obs_w: int = 384       # model input width (resized from 512)
+    vision_grid_h: int = 9   # ResNet18 feature map height at 288px input
+    vision_grid_w: int = 12  # ResNet18 feature map width at 384px input
+    backbone_feature_dim: int = 512  # ResNet18 layer4 channels
+
+
+@dataclass(frozen=True)
+class ChunkConfig:
+    default_chunk_size: int = 10
+    ensemble_decay: float = 0.2
+    key_decay: float = 0.8  # faster decay for keys to prevent stale presses
+
+
+@dataclass(frozen=True)
+class FocalLossConfig:
+    gamma: float = 2.0
+    alpha: float = 0.75  # positive class weight for key presses
+
+
 # ---------------------------------------------------------------------------
 # Module-level singletons
 # ---------------------------------------------------------------------------
@@ -276,6 +306,9 @@ EXPERT = ExpertConfig()
 TRAIN = TrainConfig()
 DATA = DataConfig()
 EVAL_CFG = EvalConfig()
+MODEL = ModelConfig()
+CHUNK = ChunkConfig()
+FOCAL = FocalLossConfig()
 
 # ---------------------------------------------------------------------------
 # Bin-related constants (computed once at import time)
