@@ -1230,7 +1230,7 @@ def train(
         if p.requires_grad and not n.startswith("backbone.")
     ]
 
-    backbone_lr = lr * 0.1  # Lower LR for pretrained backbone
+    backbone_lr = lr * 0.05  # Lower LR for pretrained backbone (backbone grads dominate total norm)
     optimizer = torch.optim.AdamW(
         [
             {"params": non_backbone_params, "lr": lr},
