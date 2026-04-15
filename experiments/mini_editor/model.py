@@ -149,6 +149,13 @@ class ACT(nn.Module):
         self.head_keys = nn.Linear(d_model, NUM_KEYS)     # 53 independent keys
         self.head_pad = nn.Linear(d_model, 1)             # binary pad mask
 
+        # Prior probability init for focal loss (RetinaNet, Lin et al. 2017).
+        # Key presses are ~0.2% of all key-frames. Without this, sigmoid(0)=0.5
+        # makes focal loss ineffective early on and the keys gradient dominates.
+        import math
+        _pi = 0.002  # prior positive rate for key presses
+        nn.init.constant_(self.head_keys.bias, -math.log((1 - _pi) / _pi))
+
     def forward(
         self,
         images: torch.Tensor,

@@ -242,7 +242,7 @@ class ChunkDataset(Dataset):
     def __getitem__(
         self, idx: int
     ) -> tuple[
-        torch.Tensor,  # obs (3, model_h, model_w)
+        torch.Tensor,  # obs (3, model_h, model_w) uint8
         torch.Tensor,  # proprio (56,)
         torch.Tensor,  # input_ids (L,) int64
         torch.Tensor,  # attention_mask (L,) int64
@@ -258,17 +258,20 @@ class ChunkDataset(Dataset):
         row_idx = start_row + t
 
         # --- Observation at time t (JPEG decoded from mmap) ---
-        # Reads from memory-mapped file — no Python refcount, no CoW
-        # Resize happens on GPU after batching (F.interpolate)
+        # Decode JPEG, resize to model resolution in worker, return uint8.
+        # float32 conversion + /255 happens on GPU after transfer.
+        # This reduces CPU→GPU transfer by 7.5x vs full-res float32.
         import io
         from PIL import Image
 
         jpeg_data = self.jpeg_mmap[row_idx]
         img_pil = Image.open(io.BytesIO(jpeg_data))
+        if img_pil.size != (MODEL.obs_w, MODEL.obs_h):
+            img_pil = img_pil.resize(
+                (MODEL.obs_w, MODEL.obs_h), Image.BILINEAR
+            )
         img_np = np.array(img_pil)
-        obs = (
-            torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
-        )
+        obs = torch.from_numpy(img_np).permute(2, 0, 1)  # uint8 (3, H, W)
 
         # --- Proprioception at time t ---
         proprio = torch.from_numpy(self.proprio[row_idx].copy())
@@ -678,9 +681,11 @@ def _run_train_epoch(
         ) = batch
 
         # --- Transfer to device ---
+        # obs arrives as uint8 at model resolution (resized in worker).
+        # Transfer uint8 then convert to float32 on GPU — 7.5x less PCIe data.
         if diag:
             t_mark = time.perf_counter()
-        obs = obs.to(device, non_blocking=True)
+        obs = obs.to(device, non_blocking=True).float().div_(255.0)
         proprio = proprio.to(device, non_blocking=True)
         input_ids = input_ids.to(device, non_blocking=True)
         attention_mask = attention_mask.to(device, non_blocking=True)
@@ -689,14 +694,6 @@ def _run_train_epoch(
         mouse_gt = mouse_gt.to(device, non_blocking=True)
         keys_gt = keys_gt.to(device, non_blocking=True)
         pad_gt = pad_gt.to(device, non_blocking=True)
-
-        # GPU batch resize: (B, 3, obs_h, obs_w) -> (B, 3, model_h, model_w)
-        # Much faster than per-image PIL resize in DataLoader workers
-        if obs.shape[-2] != MODEL.obs_h or obs.shape[-1] != MODEL.obs_w:
-            obs = torch.nn.functional.interpolate(
-                obs, size=(MODEL.obs_h, MODEL.obs_w),
-                mode="bilinear", align_corners=False,
-            )
 
         if diag:
             if use_cuda:
@@ -880,7 +877,7 @@ def _run_val_epoch(
                 keys_gt,
                 pad_gt,
             ) = batch
-            obs = obs.to(device, non_blocking=True)
+            obs = obs.to(device, non_blocking=True).float().div_(255.0)
             proprio = proprio.to(device, non_blocking=True)
             input_ids = input_ids.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
@@ -889,13 +886,6 @@ def _run_val_epoch(
             mouse_gt = mouse_gt.to(device, non_blocking=True)
             keys_gt = keys_gt.to(device, non_blocking=True)
             pad_gt = pad_gt.to(device, non_blocking=True)
-
-            # GPU batch resize
-            if obs.shape[-2] != MODEL.obs_h or obs.shape[-1] != MODEL.obs_w:
-                obs = torch.nn.functional.interpolate(
-                    obs, size=(MODEL.obs_h, MODEL.obs_w),
-                    mode="bilinear", align_corners=False,
-                )
 
             with torch.amp.autocast(
                 device_type=device.split(":")[0],
@@ -1173,17 +1163,14 @@ def load_dataset_splits(
         pin_memory=use_cuda,
         prefetch_factor=2 if num_workers > 0 else None,
     )
-    # Validation uses num_workers=0 (main-process decode) to avoid
-    # having 2×num_workers alive simultaneously during val.  Training
-    # workers are persistent, so they stay resident while val runs —
-    # extra val workers caused OOM at 51GB/62GB.  Val is forward-only
-    # (no backward), so it's fast enough single-threaded.
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
         pin_memory=use_cuda,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     return train_loader, train_sampler, val_loader
 
@@ -1220,12 +1207,11 @@ def train(
 
     use_cuda = device.startswith("cuda")
     if num_workers is None:
-        # Default: 2 workers for on-the-fly JPEG decode parallelism.
-        # DataLoader wait was only 3.3% with 4 workers — 2 is plenty.
-        # Fewer workers = less fork CoW overhead and malloc fragmentation
-        # (each persistent worker accumulates ~5-8GB over an epoch from
-        # unreturned malloc pages after PIL decode cycles).
-        num_workers = min(2, os.cpu_count() or 1)
+        # 4 workers for JPEG decode parallelism.
+        # With uint8 + worker-side resize, per-worker memory footprint
+        # is small (~7GB including fragmentation). On A100-large (142GB)
+        # 8 persistent workers (4 train + 4 val) use ~84GB total.
+        num_workers = min(4, os.cpu_count() or 1)
 
     # --- Build text encoder ---
     # Collect corpus sentences from the dataset to ensure vocab coverage
