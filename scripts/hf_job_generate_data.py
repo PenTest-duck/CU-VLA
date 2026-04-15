@@ -48,10 +48,7 @@ def main() -> None:
         check=True,
     )
     print("Installing pygame...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "pygame>=2.6"],
-        check=True,
-    )
+    subprocess.run(["uv", "pip", "install", "pygame>=2.6"], check=True)
 
     gen_args = [a for a in sys.argv[1:] if a.strip()]
 
