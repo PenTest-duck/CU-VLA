@@ -540,15 +540,25 @@ def print_epoch1_diagnostics(
 
     if grad_norms:
         gn = np.array(grad_norms)
-        print(f"  --- Gradient norms (sampled every 10 batches) ---")
+        clip_thresh = TRAIN.grad_clip_norm
+        clipped_pct = (gn >= clip_thresh).mean() * 100
+        print(f"  --- Gradient norms (pre-clip, sampled every 10 batches) ---")
         print(
             f"  Mean: {gn.mean():.2f}  Std: {gn.std():.2f}  "
             f"Min: {gn.min():.2f}  Max: {gn.max():.2f}"
         )
-        if gn.max() > 100:
+        print(
+            f"  Clipped: {clipped_pct:.0f}% of batches "
+            f"(threshold={clip_thresh})"
+        )
+        if clipped_pct > 50:
             print(
-                f"  WARNING: Large gradient norms detected "
-                f"-- consider gradient clipping"
+                f"  NOTE: >50% batches clipped — LR may be too high "
+                f"or clip_norm too low"
+            )
+        elif clipped_pct < 5:
+            print(
+                f"  NOTE: <5% batches clipped — room to increase LR"
             )
 
     print(f"  --- RAM ---")
@@ -735,7 +745,7 @@ def _run_train_epoch(
         optimizer.zero_grad()
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
+        pre_clip_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_norm=TRAIN.grad_clip_norm
         )
 
@@ -745,11 +755,7 @@ def _run_train_epoch(
             timings["bwd"] += time.perf_counter() - t_mark
 
             if batch_idx % 10 == 0:
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        total_norm += p.grad.data.float().norm(2).item() ** 2
-                grad_norms.append(total_norm**0.5)
+                grad_norms.append(pre_clip_norm.item())
 
                 # Per-head gradient norms (sampled alongside total)
                 if not hasattr(model, "_diag_head_grad_norms"):

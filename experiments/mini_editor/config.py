@@ -241,14 +241,14 @@ class ExpertConfig:
 class TrainConfig:
     num_episodes: int = 10000
     batch_size: int = 1024
-    lr: float = 4e-4  # linear scaling rule: 2x batch → 2x LR (from 2e-4 at 512)
+    lr: float = 3e-4  # conservative 1.5x from 2e-4 at batch=512 (monitor grad norms)
     weight_decay: float = 1e-4
     epochs: int = 100
     early_stop_patience: int = 15
     val_fraction: float = 0.2
     bin_smooth_sigma: float = 1.5
     grad_clip_norm: float = 100.0
-    warmup_epochs: int = 5
+    warmup_epochs: int = 10  # doubled from 5 to match warmup steps at 2x batch
     use_amp: bool = True
 
 
