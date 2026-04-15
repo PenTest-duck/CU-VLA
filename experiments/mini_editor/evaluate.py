@@ -395,6 +395,7 @@ def run_agent(
     corpus_sentences: list[str],
     num_episodes: int,
     max_steps: int,
+    visual: bool = False,
 ) -> dict:
     """Run agent in environment and collect per-episode metrics.
 
@@ -578,7 +579,7 @@ def main(
         print(f"\nRunning expert...", flush=True)
         expert = ExpertAgent()
         expert_results = run_agent(
-            expert, env, corpus_sentences, num_episodes, max_steps
+            expert, env, corpus_sentences, num_episodes, max_steps, visual
         )
         print_metrics(expert_results, expert_name)
         all_results[expert_name] = expert_results
@@ -603,7 +604,7 @@ def main(
             corpus_sentences=corpus_sentences,
         )
         act_results = run_agent(
-            act_agent, env, corpus_sentences, num_episodes, max_steps
+            act_agent, env, corpus_sentences, num_episodes, max_steps, visual
         )
         print_metrics(act_results, act_name)
         all_results[act_name] = act_results
@@ -617,7 +618,7 @@ def main(
         print(f"\nRunning random baseline...", flush=True)
         random_agent = RandomAgent()
         random_results = run_agent(
-            random_agent, env, corpus_sentences, num_episodes, max_steps
+            random_agent, env, corpus_sentences, num_episodes, max_steps, visual
         )
         print_metrics(random_results, random_name)
         all_results[random_name] = random_results
