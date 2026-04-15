@@ -170,19 +170,24 @@ class ACTAgent:
         )
 
         # Resize screenshot from 512x384 (obs) to 384x288 (model input)
+        # Match train.py: PIL resize in uint8, then float32 / 255 on device
         screenshot = obs["screenshot"]  # (384, 512, 3) uint8
-        import torch.nn.functional as F
+        from PIL import Image
 
+        img_pil = Image.fromarray(screenshot)
+        if img_pil.size != (MODEL.obs_w, MODEL.obs_h):
+            img_pil = img_pil.resize(
+                (MODEL.obs_w, MODEL.obs_h), Image.BILINEAR
+            )
+        img_np = np.array(img_pil)
         img_t = (
-            torch.from_numpy(screenshot).permute(2, 0, 1).unsqueeze(0).float()
-            / 255.0
-        )  # (1, 3, 384, 512)
-        img_t = F.interpolate(
-            img_t,
-            size=(MODEL.obs_h, MODEL.obs_w),  # (288, 384)
-            mode="bilinear",
-            align_corners=False,
-        ).to(self.device)
+            torch.from_numpy(img_np)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(self.device)
+            .float()
+            .div_(255.0)
+        )
 
         p = torch.from_numpy(proprio).unsqueeze(0).float().to(self.device)
 
