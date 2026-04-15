@@ -143,31 +143,47 @@ class ACTAgent:
             vocab_size = max(saved_token_map.values()) + 1
             text_encoder.resize_vocab(vocab_size)
         else:
-            # Fallback: read just the initial_text column from parquet
-            # shards using pyarrow column projection (skips image bytes
-            # entirely — ~50MB text vs ~11GB with images).
-            print("  No token_id_map in checkpoint, reading vocab from parquet...")
-            from huggingface_hub import HfFileSystem
-            import pyarrow.parquet as pq
-
-            fs = HfFileSystem()
-            parquet_files = sorted(fs.glob(
-                "datasets/PenTest-duck/cu-vla-exp5-data/data/*.parquet"
-            ))
-            train_corpus: set[str] = set()
-            for i, f in enumerate(parquet_files):
-                table = pq.read_table(fs.open(f), columns=["initial_text"])
-                train_corpus.update(table["initial_text"].to_pylist())
-                print(
-                    f"    shard {i+1}/{len(parquet_files)}: "
-                    f"{len(train_corpus)} unique passages",
-                    flush=True,
-                )
-            print(f"  {len(train_corpus)} unique passages total")
-            text_encoder, self.tokenizer, self.token_map = build_text_encoder(
-                list(train_corpus)
+            # Fallback: check for cached token_id_map on disk, otherwise
+            # rebuild from parquet and cache for next time.
+            cache_path = os.path.join(
+                os.path.dirname(checkpoint), "token_id_map.pt"
             )
-            del train_corpus
+            if os.path.exists(cache_path):
+                print(f"  Loading cached token_id_map from {cache_path}")
+                saved_token_map = torch.load(
+                    cache_path, map_location="cpu", weights_only=False
+                )
+                text_encoder, self.tokenizer, _ = build_text_encoder()
+                self.token_map = saved_token_map
+                vocab_size = max(saved_token_map.values()) + 1
+                text_encoder.resize_vocab(vocab_size)
+            else:
+                print("  No token_id_map found, reading vocab from parquet...")
+                from huggingface_hub import HfFileSystem
+                import pyarrow.parquet as pq
+
+                fs = HfFileSystem()
+                parquet_files = sorted(fs.glob(
+                    "datasets/PenTest-duck/cu-vla-exp5-data/data/*.parquet"
+                ))
+                train_corpus: set[str] = set()
+                for i, f in enumerate(parquet_files):
+                    table = pq.read_table(fs.open(f), columns=["initial_text"])
+                    train_corpus.update(table["initial_text"].to_pylist())
+                    print(
+                        f"    shard {i+1}/{len(parquet_files)}: "
+                        f"{len(train_corpus)} unique passages",
+                        flush=True,
+                    )
+                print(f"  {len(train_corpus)} unique passages total")
+                text_encoder, self.tokenizer, self.token_map = build_text_encoder(
+                    list(train_corpus)
+                )
+                del train_corpus
+                # Cache for next run
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                torch.save(self.token_map, cache_path)
+                print(f"  Cached token_id_map to {cache_path}")
 
         # Build model with text encoder
         self.model = ACT(
