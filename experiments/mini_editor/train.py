@@ -508,6 +508,7 @@ def print_epoch1_diagnostics(
     train_total: int,
     use_cuda: bool,
     grad_norms: list[float],
+    model: torch.nn.Module | None = None,
 ) -> None:
     """Print comprehensive training diagnostics after epoch 1."""
     t_wall = timings["wall"]
@@ -604,6 +605,51 @@ def print_epoch1_diagnostics(
         f"  Used: {disk.used/1024**3:.1f}GB / {disk.total/1024**3:.1f}GB "
         f"({disk.free/1024**3:.1f}GB free)"
     )
+
+    # Per-head gradient norms
+    if model is not None and hasattr(model, "_diag_head_grad_norms"):
+        print()
+        print(f"  --- Per-component gradient norms (sampled every 10 batches) ---")
+        for group_name, norms in model._diag_head_grad_norms.items():
+            if norms:
+                gn = np.array(norms)
+                print(
+                    f"  {group_name:18s}  "
+                    f"mean={gn.mean():.4f}  std={gn.std():.4f}  "
+                    f"min={gn.min():.4f}  max={gn.max():.4f}"
+                )
+        # Check text encoder gradient flow
+        te_norms = model._diag_head_grad_norms.get("text_encoder", [])
+        if te_norms and np.mean(te_norms) < 1e-6:
+            print(
+                f"  WARNING: Text encoder gradients near zero — "
+                f"end-to-end gradient flow may be broken!"
+            )
+        del model._diag_head_grad_norms
+
+    # Key press accuracy
+    if model is not None and hasattr(model, "_diag_key_stats"):
+        ks = model._diag_key_stats
+        tp, fp, fn, tn = ks["tp"], ks["fp"], ks["fn"], ks["tn"]
+        total_pos = tp + fn
+        total_neg = tn + fp
+        print()
+        print(f"  --- Key press accuracy (epoch 1) ---")
+        print(
+            f"  Positive samples:  {total_pos:,} "
+            f"({total_pos/(total_pos+total_neg)*100:.2f}% of all key-frames)"
+        )
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+        print(f"  Precision: {precision:.4f}  Recall: {recall:.4f}  F1: {f1:.4f}")
+        if recall < 0.01:
+            print(
+                f"  WARNING: Model predicting near-zero key presses "
+                f"(recall={recall:.4f}). Focal BCE may need tuning."
+            )
+        del model._diag_key_stats
+
     print(f"{'='*70}\n", flush=True)
 
 
@@ -737,6 +783,49 @@ def _run_train_epoch(
                         total_norm += p.grad.data.float().norm(2).item() ** 2
                 grad_norms.append(total_norm**0.5)
 
+                # Per-head gradient norms (sampled alongside total)
+                if not hasattr(model, "_diag_head_grad_norms"):
+                    model._diag_head_grad_norms = {
+                        "backbone": [], "text_encoder": [],
+                        "encoder": [], "decoder": [],
+                        "head_dx": [], "head_dy": [],
+                        "head_mouse": [], "head_keys": [], "head_pad": [],
+                    }
+                _mod = model._orig_mod if hasattr(model, "_orig_mod") else model
+                for group_name, prefix in [
+                    ("backbone", "backbone."), ("text_encoder", "text_encoder."),
+                    ("encoder", "encoder."), ("decoder", "decoder."),
+                    ("head_dx", "head_dx."), ("head_dy", "head_dy."),
+                    ("head_mouse", "head_mouse."), ("head_keys", "head_keys."),
+                    ("head_pad", "head_pad."),
+                ]:
+                    gn2 = 0.0
+                    for n, p in _mod.named_parameters():
+                        if n.startswith(prefix) and p.grad is not None:
+                            gn2 += p.grad.data.float().norm(2).item() ** 2
+                    model._diag_head_grad_norms[group_name].append(gn2**0.5)
+
+            # Key press accuracy tracking (every batch during epoch 1)
+            if not hasattr(model, "_diag_key_stats"):
+                model._diag_key_stats = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+            with torch.no_grad():
+                key_preds = (torch.sigmoid(out["keys_held"]) > 0.5).float()
+                real_mask = (1.0 - pad_gt).unsqueeze(-1)  # (B, chunk, 1)
+                key_pred_masked = key_preds * real_mask
+                key_gt_masked = keys_gt * real_mask
+                model._diag_key_stats["tp"] += int(
+                    ((key_pred_masked == 1) & (key_gt_masked == 1)).sum().item()
+                )
+                model._diag_key_stats["fp"] += int(
+                    ((key_pred_masked == 1) & (key_gt_masked == 0)).sum().item()
+                )
+                model._diag_key_stats["fn"] += int(
+                    ((key_pred_masked == 0) & (key_gt_masked == 1)).sum().item()
+                )
+                model._diag_key_stats["tn"] += int(
+                    ((key_pred_masked == 0) & (key_gt_masked == 0)).sum().item()
+                )
+
             t_mark = time.perf_counter()
 
         # --- Optimizer step ---
@@ -780,7 +869,7 @@ def _run_train_epoch(
     if diag:
         timings["wall"] = time.perf_counter() - t0
         print_epoch1_diagnostics(
-            timings, n_batches, batch_size, total, use_cuda, grad_norms
+            timings, n_batches, batch_size, total, use_cuda, grad_norms, model
         )
 
     return loss_sum / max(total, 1), head_sums, total

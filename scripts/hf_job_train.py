@@ -40,6 +40,10 @@ EXPERIMENTS = {
         "train_script": "experiments/miniwob_pygame/train.py",
         "default_data_repo": "PenTest-duck/cu-vla-exp3-data",
     },
+    "exp5": {
+        "train_script": "experiments/mini_editor/train.py",
+        "default_data_repo": "PenTest-duck/cu-vla-exp5-data",
+    },
 }
 
 

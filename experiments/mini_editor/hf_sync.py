@@ -18,7 +18,7 @@ from huggingface_hub import HfApi, snapshot_download
 
 
 HF_USER = "PenTest-duck"
-DEFAULT_DATA_REPO = f"{HF_USER}/cu-vla-mini-editor"
+DEFAULT_DATA_REPO = f"{HF_USER}/cu-vla-exp5-data"
 DEFAULT_CHECKPOINTS_REPO = f"{HF_USER}/cu-vla-mini-editor-checkpoints"
 
 BASE = os.path.dirname(__file__)
