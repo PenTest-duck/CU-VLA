@@ -1030,38 +1030,20 @@ def load_dataset_splits(
 
     Returns (train_loader, train_sampler, val_loader).
     """
-    from datasets import load_from_disk
-
     if data_dir is None:
         data_dir = os.path.join(base, "data")
 
-    # Auto-download data from HF Hub if specified and local dir is empty
+    # Load dataset: from HF Hub (parquet) or local (Arrow)
     if hf_data_repo:
-        has_local = (
-            os.path.isdir(data_dir)
-            and any(
-                not d.startswith(".")
-                for d in os.listdir(data_dir)
-            )
-            if os.path.isdir(data_dir)
-            else False
-        )
+        from datasets import load_dataset as _load_dataset
 
-        if not has_local:
-            from huggingface_hub import snapshot_download
+        print(f"Loading dataset from HF Hub: {hf_data_repo} ...")
+        ds = _load_dataset(hf_data_repo, split="train")
+    else:
+        from datasets import load_from_disk
 
-            print(f"Downloading data from {hf_data_repo} ...")
-            os.makedirs(data_dir, exist_ok=True)
-            snapshot_download(
-                repo_id=hf_data_repo,
-                repo_type="dataset",
-                local_dir=data_dir,
-            )
-            print("Download complete.")
-
-    # Load dataset
-    print(f"Loading dataset from {data_dir} ...")
-    ds = load_from_disk(data_dir)
+        print(f"Loading dataset from {data_dir} ...")
+        ds = load_from_disk(data_dir)
     print(f"Dataset: {ds}", flush=True)
 
     # Pre-extract scalar columns to numpy
@@ -1200,27 +1182,15 @@ def train(
     else:
         _data_dir = data_dir
 
-    # If HF repo is specified and no local data, download first
+    # Load dataset: from HF Hub (parquet) or local (Arrow)
     if hf_data_repo:
-        has_local = (
-            os.path.isdir(_data_dir)
-            and any(not d.startswith(".") for d in os.listdir(_data_dir))
-            if os.path.isdir(_data_dir)
-            else False
-        )
-        if not has_local:
-            from huggingface_hub import snapshot_download
+        from datasets import load_dataset as _load_dataset
 
-            print(f"Downloading data from {hf_data_repo} ...")
-            os.makedirs(_data_dir, exist_ok=True)
-            snapshot_download(
-                repo_id=hf_data_repo,
-                repo_type="dataset",
-                local_dir=_data_dir,
-            )
-            print("Download complete.")
-
-    ds_temp = load_from_disk(_data_dir)
+        print(f"Loading data from HF Hub: {hf_data_repo} ...")
+        ds_temp = _load_dataset(hf_data_repo, split="train")
+        print(f"Loaded {len(ds_temp)} rows from Hub.")
+    else:
+        ds_temp = load_from_disk(_data_dir)
     corpus_sentences = list(set(ds_temp["initial_text"]))
     print(f"Corpus: {len(corpus_sentences)} unique initial_text passages")
     del ds_temp  # free memory
