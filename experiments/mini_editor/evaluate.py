@@ -66,15 +66,33 @@ def build_proprio(env: MiniEditorEnv) -> np.ndarray:
 def resolve_checkpoint(
     local_path: str,
     hf_repo: str | None,
-    path_in_repo: str,
+    repo_prefix: str,
 ) -> str | None:
-    """Return a local checkpoint path, downloading from HF Hub if needed."""
+    """Return a local checkpoint path, downloading from HF Hub if needed.
+
+    The training script uploads checkpoints to:
+        {repo_prefix}/{run_id}/best.pt
+    where run_id is a timestamp like 20260415-0830.  This function finds
+    the latest run directory under repo_prefix and downloads best.pt.
+    """
     if hf_repo is None:
         return local_path if os.path.exists(local_path) else None
 
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import HfApi, hf_hub_download
 
     try:
+        api = HfApi()
+        files = api.list_repo_files(hf_repo, repo_type="model")
+        # Find all best.pt files under the prefix
+        candidates = sorted(
+            f for f in files
+            if f.startswith(repo_prefix + "/") and f.endswith("/best.pt")
+        )
+        if not candidates:
+            print(f"  No checkpoints found in {hf_repo}/{repo_prefix}/")
+            return local_path if os.path.exists(local_path) else None
+
+        path_in_repo = candidates[-1]  # latest run (sorted by timestamp)
         downloaded = hf_hub_download(
             hf_repo,
             path_in_repo,
@@ -83,7 +101,8 @@ def resolve_checkpoint(
         )
         print(f"  Checkpoint synced from {hf_repo}/{path_in_repo}", flush=True)
         return downloaded
-    except Exception:
+    except Exception as e:
+        print(f"  HF download failed: {e}")
         return local_path if os.path.exists(local_path) else None
 
 
@@ -499,12 +518,12 @@ def main(
 
     # --- ACT ---
     act_default = os.path.join(
-        base, "checkpoints", f"resnet18_chunk{chunk_size}", "best.pt"
+        base, "checkpoints", f"chunk{chunk_size}", "best.pt"
     )
     act_ckpt = checkpoint or resolve_checkpoint(
         act_default,
         hf_checkpoint_repo,
-        f"resnet18_chunk{chunk_size}/best.pt",
+        f"mini_editor_chunk{chunk_size}",
     )
     act_name = f"ACT (chunk={chunk_size})"
     if act_ckpt and os.path.exists(act_ckpt):
