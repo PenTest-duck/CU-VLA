@@ -1,0 +1,28 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+Device: mps
+Warmup: 20 | iters: 100
+Action expert: 16 queries, 768-dim, 12 heads
+Encoder K/V length: 265 tokens (vision=240, text=16, proprio=1, history=8)
+Output heads: [21, 21, 5, 21, 231, 1]
+
+== Config A: 3 blocks (~20M target) ==
+  params: 32.06M  mean=45.294ms  median=36.807  p5=28.171  p95=83.393  std=23.560
+
+== Config B: 6 blocks (~40M target) ==
+  params: 60.42M  mean=58.644ms  median=58.386  p5=54.487  p95=64.922  std=3.127
+
+== SigLIP2 encoder (reproducibility check, max_num_patches=256) ==
+Loading weights:   0%|          | 0/408 [00:00<?, ?it/s]Loading weights:   1%|          | 4/408 [00:03<05:59,  1.12it/s]Loading weights: 100%|██████████| 408/408 [00:03<00:00, 114.19it/s]
+  params: 375.23M  mean=161.412ms  median=110.227  p5=90.046  p95=445.583  std=116.520
+
+
+=== COMPARISON (ms, MPS fp16) ===
+config                          params      mean    median        p5       p95   Hz(mean)
+Action expert A (3 blocks)      32.1M   45.29ms   36.81ms   28.17ms   83.39ms     22.1
+Action expert B (6 blocks)      60.4M   58.64ms   58.39ms   54.49ms   64.92ms     17.1
+SigLIP2 naflex (256 patches)   375.2M  161.41ms  110.23ms   90.05ms  445.58ms      6.2
+
+Encoder + expert (median sums):
+  SigLIP2 + A: 147.03 ms  (6.8 Hz)
+  SigLIP2 + B: 168.61 ms  (5.9 Hz)
+  30-Hz budget = 33.3 ms; encoder alone = 110.23 ms

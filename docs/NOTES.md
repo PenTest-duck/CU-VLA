@@ -61,3 +61,5 @@ How to split off into differen system-levels or by frequency domain
 - Probably reasoning -> primitive instructions "type ABC", "click the help button" into high-hz trajectories
 
 VLM (language is a high-level concept) -> V-A (fast visuomotor)
+
+World Action Models (WAMs) as next step. CU-WAM.

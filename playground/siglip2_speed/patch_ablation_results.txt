@@ -1,0 +1,82 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model...
+Loading weights:   0%|          | 0/408 [00:00<?, ?it/s]Loading weights:   1%|          | 4/408 [00:06<10:43,  1.59s/it]Loading weights:  97%|█████████▋| 397/408 [00:06<00:00, 86.82it/s]Loading weights: 100%|██████████| 408/408 [00:06<00:00, 62.99it/s]
+loaded in 33.8s
+
+-- max_num_patches=16 --
+  grid=3x5 valid=15/16  pv_shape=(1, 16, 768)
+  img_encode: mean= 71.04  p50= 56.17  p90=127.43  std=57.62  hz= 14.1
+  full_fwd  : mean=174.81  p50=116.70  p90=209.90  std=168.38  hz=  5.7
+
+-- max_num_patches=32 --
+  grid=4x7 valid=28/32  pv_shape=(1, 32, 768)
+  img_encode: mean= 61.53  p50= 54.17  p90= 76.85  std=39.76  hz= 16.3
+  full_fwd  : mean=176.13  p50=145.39  p90=262.22  std=132.83  hz=  5.7
+
+-- max_num_patches=48 --
+  grid=5x8 valid=40/48  pv_shape=(1, 48, 768)
+  img_encode: mean= 29.42  p50= 21.81  p90= 34.71  std=18.68  hz= 34.0
+  full_fwd  : mean= 68.45  p50= 63.92  p90= 95.07  std=23.60  hz= 14.6
+
+-- max_num_patches=64 --
+  grid=6x10 valid=60/64  pv_shape=(1, 64, 768)
+  img_encode: mean= 47.62  p50= 35.60  p90= 86.61  std=36.81  hz= 21.0
+  full_fwd  : mean= 65.12  p50= 56.95  p90= 83.33  std=35.58  hz= 15.4
+
+-- max_num_patches=96 --
+  grid=8x12 valid=96/96  pv_shape=(1, 96, 768)
+  img_encode: mean= 56.34  p50= 53.62  p90= 73.53  std=14.23  hz= 17.7
+  full_fwd  : mean= 58.16  p50= 56.81  p90= 68.11  std= 8.86  hz= 17.2
+
+-- max_num_patches=128 --
+  grid=9x14 valid=126/128  pv_shape=(1, 128, 768)
+  img_encode: mean= 61.01  p50= 53.55  p90= 80.78  std=18.67  hz= 16.4
+  full_fwd  : mean= 77.25  p50= 71.55  p90=109.31  std=24.76  hz= 12.9
+
+-- max_num_patches=160 --
+  grid=10x16 valid=160/160  pv_shape=(1, 160, 768)
+  img_encode: mean= 86.06  p50= 63.74  p90=131.76  std=57.70  hz= 11.6
+  full_fwd  : mean=110.01  p50= 94.48  p90=132.18  std=68.43  hz=  9.1
+
+-- max_num_patches=192 --
+  grid=11x17 valid=187/192  pv_shape=(1, 192, 768)
+  img_encode: mean= 84.49  p50= 82.75  p90= 95.36  std=11.36  hz= 11.8
+  full_fwd  : mean=141.03  p50=135.04  p90=188.74  std=38.44  hz=  7.1
+
+-- max_num_patches=224 --
+  grid=12x18 valid=216/224  pv_shape=(1, 224, 768)
+  img_encode: mean= 97.23  p50= 97.31  p90=111.00  std=10.00  hz= 10.3
+  full_fwd  : mean=146.07  p50=141.53  p90=172.71  std=24.06  hz=  6.8
+
+-- max_num_patches=256 --
+  grid=12x20 valid=240/256  pv_shape=(1, 256, 768)
+  img_encode: mean=110.40  p50=107.00  p90=124.89  std=20.57  hz=  9.1
+  full_fwd  : mean=161.33  p50=161.37  p90=197.20  std=35.92  hz=  6.2
+
+-- max_num_patches=384 --
+  grid=15x24 valid=360/384  pv_shape=(1, 384, 768)
+  img_encode: mean=169.78  p50=169.06  p90=192.03  std=22.44  hz=  5.9
+  full_fwd  : mean=195.89  p50=192.69  p90=229.81  std=30.16  hz=  5.1
+
+-- max_num_patches=512 --
+  grid=18x28 valid=504/512  pv_shape=(1, 512, 768)
+  img_encode: mean=256.40  p50=253.52  p90=272.30  std=21.73  hz=  3.9
+  full_fwd  : mean=339.04  p50=324.12  p90=498.47  std=101.79  hz=  2.9
+
+
+=== ABLATION SUMMARY (naflex MPS fp16, 720x450 input) ===
+ max_np      grid  valid   img mean    img p50   img Hz   full mean   full p50   full Hz   hits 30Hz
+     16    3x5        15    71.04ms    56.17ms   14.1 Hz    174.81ms   116.70ms     5.7 Hz          no
+     32    4x7        28    61.53ms    54.17ms   16.3 Hz    176.13ms   145.39ms     5.7 Hz          no
+     48    5x8        40    29.42ms    21.81ms   34.0 Hz     68.45ms    63.92ms    14.6 Hz          no
+     64    6x10       60    47.62ms    35.60ms   21.0 Hz     65.12ms    56.95ms    15.4 Hz          no
+     96    8x12       96    56.34ms    53.62ms   17.7 Hz     58.16ms    56.81ms    17.2 Hz          no
+    128    9x14      126    61.01ms    53.55ms   16.4 Hz     77.25ms    71.55ms    12.9 Hz          no
+    160   10x16      160    86.06ms    63.74ms   11.6 Hz    110.01ms    94.48ms     9.1 Hz          no
+    192   11x17      187    84.49ms    82.75ms   11.8 Hz    141.03ms   135.04ms     7.1 Hz          no
+    224   12x18      216    97.23ms    97.31ms   10.3 Hz    146.07ms   141.53ms     6.8 Hz          no
+    256   12x20      240   110.40ms   107.00ms    9.1 Hz    161.33ms   161.37ms     6.2 Hz          no
+    384   15x24      360   169.78ms   169.06ms    5.9 Hz    195.89ms   192.69ms     5.1 Hz          no
+    512   18x28      504   256.40ms   253.52ms    3.9 Hz    339.04ms   324.12ms     2.9 Hz          no
+
+>> No config hit 30 Hz. Fastest: max_num_patches=96 at 58.2ms (17.2 Hz)

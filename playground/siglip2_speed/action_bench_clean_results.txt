@@ -1,0 +1,17 @@
+=== A ===
+=== B ===
+=== siglip2 ===
+
+=== collected ===
+config                            params      mean    median       p5      p95      std  Hz(med)
+Action expert A (3 blocks)       32.06M   49.43ms   39.90ms  29.84ms 104.62ms  25.65ms    25.1
+Action expert B (6 blocks)       60.42M   98.26ms   74.63ms  60.56ms 246.98ms  66.43ms    13.4
+SigLIP2 naflex (max_np=256)     375.23M   97.85ms   92.45ms  87.89ms 119.94ms  22.09ms    10.8
+
+--- Encoder + expert pipeline (median sums) ---
+  SigLIP2 + A: 132.34 ms  (  7.6 Hz)
+  SigLIP2 + B: 167.08 ms  (  6.0 Hz)
+  30 Hz budget = 33.3 ms
+  Expert overhead on top of encoder:
+    A adds +39.90 ms (43.2% of encoder)
+    B adds +74.63 ms (80.7% of encoder)

@@ -1,0 +1,24 @@
+Loading apple/FastVLM-0.5B via mlx_vlm.load...
+Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 10462.22it/s]
+loaded in 3.0s
+vision_tower params: 125.1M
+total model params:  622.7M
+Preprocessing 720x450 -> 1024x1024 square, fp16...
+pixel_values shape: (1, 3, 1024, 1024)  dtype=mlx.core.bfloat16
+Warmup (10 iters)...
+vision output shape (B,H,W,C): (1, 16, 16, 3072)  dtype=mlx.core.bfloat16
+=> 256 output tokens (16x16 grid), 3072 dim
+
+Measuring (30 iters)...
+FastViT-HD (0.5B bf16) b=1 1024x1024 mean=1098.04ms  std=158.55  p50=1039.63  p90=1344.36  p99=1456.80  hz=    0.9
+
+Also testing 512x512 input (non-trained resolution; speed only)...
+  512 output shape: (1, 8, 8, 3072)  => 64 tokens
+FastViT-HD (0.5B bf16) b=1  512x512  mean= 272.98ms  std= 57.59  p50= 255.14  p90= 286.34  p99= 452.97  hz=    3.7
+
+
+=== COMPARISON: vision encoder only, 720x450 source, M1 ===
+  FastViT-HD 1024x1024 -> 256 tokens  : p50= 1039.6ms  hz=  1.0
+  FastViT-HD 512x512  -> 64 tokens    : p50=  255.1ms  hz=  3.9
+  SigLIP2 naflex 256 patches                : p50=   67 ms  hz= 14.9   (earlier bench)
+  SigLIP2 naflex max_np=64 (60 patches)     : p50=   27 ms  hz= 37.0   (ablation)

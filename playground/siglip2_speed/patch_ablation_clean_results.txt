@@ -1,0 +1,29 @@
+=== max_num_patches=16 ===
+=== max_num_patches=32 ===
+=== max_num_patches=48 ===
+=== max_num_patches=64 ===
+=== max_num_patches=96 ===
+=== max_num_patches=128 ===
+=== max_num_patches=160 ===
+=== max_num_patches=192 ===
+=== max_num_patches=224 ===
+=== max_num_patches=256 ===
+=== max_num_patches=384 ===
+=== max_num_patches=512 ===
+
+=== collected results ===
+ max_np      grid  valid    img mean     img p50   img Hz   full mean    full p50   full Hz   <=33ms
+     16    3x5        15     91.61ms     46.55ms   10.9 Hz    152.35ms    111.99ms     6.6 Hz       no
+     32    4x7        28     25.04ms     24.35ms   39.9 Hz     44.29ms     45.44ms    22.6 Hz       no
+     48    5x8        40     39.38ms     27.03ms   25.4 Hz     46.01ms     44.26ms    21.7 Hz       no
+     64    6x10       60     28.58ms     27.15ms   35.0 Hz     46.92ms     44.16ms    21.3 Hz       no
+     96    8x12       96     40.80ms     39.46ms   24.5 Hz     66.03ms     64.56ms    15.1 Hz       no
+    128    9x14      126     40.78ms     39.77ms   24.5 Hz     55.76ms     55.48ms    17.9 Hz       no
+    160   10x16      160     45.01ms     44.04ms   22.2 Hz     69.51ms     64.24ms    14.4 Hz       no
+    192   11x17      187     53.52ms     52.67ms   18.7 Hz     74.87ms     69.52ms    13.4 Hz       no
+    224   12x18      216     63.34ms     62.90ms   15.8 Hz     77.85ms     77.75ms    12.8 Hz       no
+    256   12x20      240     70.59ms     69.39ms   14.2 Hz    100.31ms     88.94ms    10.0 Hz       no
+    384   15x24      360    108.21ms    107.93ms    9.2 Hz    126.76ms    124.80ms     7.9 Hz       no
+    512   18x28      504    178.13ms    157.08ms    5.6 Hz    171.24ms    165.55ms     5.8 Hz       no
+
+>> No config hit 30 Hz. Fastest: max_np=32 at 44.3ms (22.6 Hz)
