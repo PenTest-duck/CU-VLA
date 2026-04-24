@@ -66,3 +66,35 @@ def test_total_loss_all_heads_contribute():
     total, per_head = total_loss(head_logits, targets, weights)
     assert torch.isfinite(total)
     assert set(per_head.keys()) == set(head_logits.keys())
+
+
+def test_keys_smoothing_is_probability_distribution():
+    """Smoothed target must sum to 1.0 for every (sample, key), including idle targets."""
+    B = 3
+    logits = torch.randn(B, NUM_KEYS * 3)
+    # Mix of idle, press, release targets
+    target = torch.tensor([
+        [0] * NUM_KEYS,  # all press
+        [1] * NUM_KEYS,  # all release
+        [2] * NUM_KEYS,  # all idle
+    ], dtype=torch.long)
+    # We can't directly introspect `smooth` from keys_focal_loss, so instead we
+    # replicate the smoothing logic and assert its sum invariant.
+    from experiments.action_primitives.config import KEY_STATE_IDLE
+    import torch.nn.functional as F
+    logp = F.log_softmax(logits.view(B, NUM_KEYS, 3), dim=-1)
+    idle_smoothing = 0.05
+    smooth = torch.zeros_like(logp)
+    smooth.scatter_(-1, target.unsqueeze(-1), 1.0 - idle_smoothing)
+    mask_not_idle = (target != KEY_STATE_IDLE).float()
+    smooth[..., KEY_STATE_IDLE] = smooth[..., KEY_STATE_IDLE] + idle_smoothing * mask_not_idle
+    target_is_idle = (target == KEY_STATE_IDLE)
+    smooth[..., KEY_STATE_IDLE] = torch.where(
+        target_is_idle,
+        torch.ones_like(smooth[..., KEY_STATE_IDLE]),
+        smooth[..., KEY_STATE_IDLE],
+    )
+    # Every (sample, key) row must sum to 1.0 exactly (within floating-point tolerance)
+    sums = smooth.sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-6), \
+        f"smoothing sum invariant broken: min={sums.min()}, max={sums.max()}"

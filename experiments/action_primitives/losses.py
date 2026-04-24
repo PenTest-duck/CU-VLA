@@ -1,7 +1,7 @@
 """Loss functions for Experiment 6 (Q2, Q3).
 
 - Focal CE on all action heads (mouse bins, click, scroll, keys 3-way)
-- Label smoothing on bin heads (smoothing across adjacent bins)
+- Label smoothing on bin heads (uniform label smoothing across non-target bins)
 - Idle-biased smoothing on keys (concentrate smoothing mass on idle neighbor)
 - Per-class inverse-frequency weighting on keys (boosts rare keys)
 """
@@ -12,10 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from experiments.action_primitives.config import (
-    HEAD_LOGITS,
     KEY_STATE_IDLE,
     LOSS,
-    NUM_BINS_MOUSE,
     NUM_KEYS,
 )
 
@@ -68,6 +66,15 @@ def keys_focal_loss(
     mask_target_not_idle = (target_keys != KEY_STATE_IDLE).float()
     smooth[..., KEY_STATE_IDLE] = idle_slot + idle_smoothing * mask_target_not_idle
     # For targets that ARE idle, leave full mass on idle (no redistribution)
+
+    # When target IS idle, no redistribution ran but smoothed mass is still 1 - ls.
+    # Restore full mass on idle so smoothed distribution sums to 1.0 for every sample.
+    target_is_idle = (target_keys == KEY_STATE_IDLE)  # (B, NUM_KEYS) bool
+    smooth[..., KEY_STATE_IDLE] = torch.where(
+        target_is_idle,
+        torch.ones_like(smooth[..., KEY_STATE_IDLE]),
+        smooth[..., KEY_STATE_IDLE],
+    )
 
     ce = -(smooth * logp).sum(dim=-1)  # (B, NUM_KEYS)
 
