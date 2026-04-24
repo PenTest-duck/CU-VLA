@@ -34,6 +34,21 @@ class SigLIP2Naflex(nn.Module):
         # Freeze text tower per Q15
         for p in self.model.text_model.parameters():
             p.requires_grad = False
+        # Detect which kwarg name the vision tower's forward expects for the
+        # per-patch mask. transformers renamed `attention_mask` →
+        # `pixel_attention_mask` at some point between the versions used locally
+        # vs. inside HF Jobs. Pick the right one once to stay robust.
+        import inspect
+        params = inspect.signature(self.model.vision_model.forward).parameters
+        if "pixel_attention_mask" in params:
+            self._mask_kwarg = "pixel_attention_mask"
+        elif "attention_mask" in params:
+            self._mask_kwarg = "attention_mask"
+        else:
+            raise RuntimeError(
+                f"vision_model.forward has neither `pixel_attention_mask` nor "
+                f"`attention_mask` in its signature; got params: {list(params)}"
+            )
 
     def apply_lora(self, rank: int = 8) -> None:
         """Apply LoRA adapters to vision tower attention projections (Q15)."""
@@ -63,10 +78,11 @@ class SigLIP2Naflex(nn.Module):
         # Move to the same device as the model
         device = next(self.model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        # vision_model expects 'attention_mask', processor emits 'pixel_attention_mask'
+        # Map processor's `pixel_attention_mask` to whichever kwarg name the
+        # installed transformers version accepts (detected in __init__).
         vision_inputs = {
             "pixel_values": inputs["pixel_values"],
-            "attention_mask": inputs["pixel_attention_mask"],
+            self._mask_kwarg: inputs["pixel_attention_mask"],
             "spatial_shapes": inputs["spatial_shapes"],
         }
         out = self.model.vision_model(**vision_inputs)
