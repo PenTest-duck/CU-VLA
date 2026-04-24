@@ -11,7 +11,7 @@ Consolidates the four feasibility spikes (A, B, C, E) for Experiment 6. Drives t
 | Spike | Question | Result | Verdict | Phase B impact |
 |---|---|---|---|---|
 | **A** — typing legibility | Does SigLIP2@256 preserve char identity at 14pt? | Per-patch top-1 = 0.74 (46× chance) at 14pt | ✅ Pass | None — Q5/Q6 design stands. Keep `max_num_patches=256`, use visual feedback for typing. |
-| **B** — L-click end-to-end | Does the minimum-viable pipeline learn L-click? | [pending — n=200 closed-loop success rate] | [pending] | [pending] |
+| **B** — L-click end-to-end | Does the minimum-viable pipeline learn L-click? | Closed-loop success 0.705 (n=200); offline per-head 98-99% on dx/dy/click | ✅ Pass (gate 0.50) | Architecture stands. Phase B should add (a) bin-10 frequency diagnostic to Q40 epoch-1 checks, (b) consider DAgger-style correction to address the ~29pp offline→closed-loop gap (compounding error, not capacity). |
 | **C** — M1 closed-loop timing | Is eval cadence (~7.6 Hz) feasible on M1? | [pending — per-frame ms on MPS] | [pending] | [pending] |
 | **E** — pygame gen throughput | Does Q7's 200 eps/s hold? | 3.61 eps/s single-process (55× below); multi-proc at chunksize=1 doesn't help | ❌ Q7 target unachievable as written | Revise Q7 target. Phase B needs worker-writes-shards multiproc redesign. |
 
@@ -73,11 +73,15 @@ Captured in `docs/research/hf-jobs-gotchas.md` for reference by exp7+. Short ver
 
 ## Phase B handoff decisions (user to confirm)
 
+- [ ] **Covariate shift / DAgger in Phase B.** Spike B revealed a ~29pp gap between offline per-head accuracy (99%) and closed-loop success (70.5%). Expected for pure BC; the gap will widen as primitives get more complex. Options:
+  - (a) **Pure BC, bigger dataset** (simplest). Throw 3-5× more data at it.
+  - (b) **One round of DAgger** (recommended). After initial BC, roll out the model closed-loop, collect states where it fails, have the scripted expert label them, append to training. Addresses "no demonstrations for recovery from off-distribution states" directly.
+  - (c) **Skip now, instrument only.** Add covariate-shift diagnostics (bin-10 frequency, per-step distribution of predicted vs expert actions) so we can measure the gap on Phase B runs, decide mid-Phase-B whether DAgger is worth adding.
 - [ ] **Loss weighting:** Phase B should implement Q2's per-head `L_i^init` rebalancing before generating multi-primitive data, or continue with uniform weights? (Uniform worked for L-click, but with 6 primitives + varying class imbalances the keys head may over-dominate.)
 - [ ] **Text tower removal:** cache instruction embeddings offline and drop the 282M text tower from the runtime model? Saves 1.1 GB GPU memory, 0% on quality if instructions are enumerable.
 - [ ] **Dataset regen with baked-in history vectors and quantized bins:** Phase A's `__getitem__` does 10-30 ms of Python-loop work per episode. Phase B's 10×-larger dataset makes this more painful. Worth a one-time regen?
 - [ ] **Multi-process generator:** implement worker-writes-shards design before Phase B data gen (24,500 eps at 2.5 eps/s serial = 2.7 h)?
-- [ ] **Training compute budget:** 5 epochs was enough for L-click to reach [pending] success. Phase B's 6 primitives + 20 epochs may take 6× longer (~9-18 h on L4). Budget L40S for Phase B?
+- [ ] **Training compute budget:** 5 epochs × macro-batch 64 on 2400 train eps reached 70.5% success. Phase B's 6 primitives with potentially 10× data + 20 epochs → ~100× more training compute. On L4 that projects to ~15+ h; L40S halves it. Budget decision: book L40S for Phase B, or stay on L4?
 
 ## Next step
 
