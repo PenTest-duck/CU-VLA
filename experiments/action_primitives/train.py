@@ -106,6 +106,55 @@ def flatten_episode_to_frames(ep: dict) -> dict:
     }
 
 
+def _assemble_micro_batch(
+    model: ActionPrimitivesACT,
+    micro_eps: list[dict],
+    device: torch.device,
+) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Concatenate episodes into one big (sum_T, ...) micro-batch.
+
+    Returns (vision_preprocessed, text_rep, text_mask_rep, proprio, history, targets).
+    Used by both train_one_step (under grad) and run_validation (under no_grad).
+    """
+    flat_pv: list = []
+    flat_pm: list = []
+    flat_ss: list = []
+    flat_proprio: list = []
+    flat_history: list = []
+    flat_targets: dict[str, list] = {k: [] for k in ("dx", "dy", "click", "scroll", "keys", "done")}
+    text_rep_parts: list = []
+    text_mask_parts: list = []
+    instructions = [e["instruction"] for e in micro_eps]
+    with torch.no_grad():
+        text_tokens = model.backbone.encode_text(instructions)    # (M, T_text, d)
+    for ep_idx, ep in enumerate(micro_eps):
+        flat = flatten_episode_to_frames(ep)
+        vp = flat["vision_preprocessed"]
+        T = vp["pixel_values"].shape[0]
+        flat_pv.append(vp["pixel_values"])
+        flat_pm.append(vp["pixel_attention_mask"])
+        flat_ss.append(vp["spatial_shapes"])
+        flat_proprio.append(flat["proprio"])
+        flat_history.append(flat["history"])
+        for k in flat_targets:
+            flat_targets[k].append(flat[k])
+        text_rep_parts.append(text_tokens[ep_idx:ep_idx + 1].expand(T, -1, -1))
+        text_mask_parts.append(torch.ones(T, text_tokens.size(1), device=device))
+
+    vision_preprocessed = {
+        "pixel_values": torch.cat(flat_pv, dim=0),
+        "pixel_attention_mask": torch.cat(flat_pm, dim=0),
+        "spatial_shapes": torch.cat(flat_ss, dim=0),
+    }
+    text_rep = torch.cat(text_rep_parts, dim=0)
+    text_mask_rep = torch.cat(text_mask_parts, dim=0)
+    proprio = torch.cat(flat_proprio, dim=0).to(device, non_blocking=True)
+    history = torch.cat(flat_history, dim=0).to(device, non_blocking=True)
+    targets = {k: torch.cat(flat_targets[k], dim=0).to(device, non_blocking=True) for k in flat_targets}
+    targets["done"] = targets["done"].float()
+    return vision_preprocessed, text_rep, text_mask_rep, proprio, history, targets
+
+
 def train_one_step(
     model: ActionPrimitivesACT,
     opt: torch.optim.Optimizer,
@@ -142,50 +191,10 @@ def train_one_step(
     n_micros = macro_batch_episodes // micro_batch_episodes
     for _micro in range(n_micros):
         micro_eps = [next(iterator) for _ in range(micro_batch_episodes)]
-        # Concatenate frames across the micro-batch
         with autocast_ctx:
-            flat_pv: list = []
-            flat_pm: list = []
-            flat_ss: list = []
-            flat_proprio: list = []
-            flat_history: list = []
-            flat_targets = {k: [] for k in ("dx", "dy", "click", "scroll", "keys", "done")}
-            text_rep_parts: list = []
-            text_mask_parts: list = []
-            # Pre-encode text (single string per episode in Phase A; cache across frames)
-            instructions = [e["instruction"] for e in micro_eps]
-            with torch.no_grad():
-                text_tokens = model.backbone.encode_text(instructions)    # (M, T_text, d)
-            # For each episode, append all its frames
-            for ep_idx, ep in enumerate(micro_eps):
-                flat = flatten_episode_to_frames(ep)
-                vp = flat["vision_preprocessed"]
-                T = vp["pixel_values"].shape[0]
-                flat_pv.append(vp["pixel_values"])
-                flat_pm.append(vp["pixel_attention_mask"])
-                flat_ss.append(vp["spatial_shapes"])
-                flat_proprio.append(flat["proprio"])
-                flat_history.append(flat["history"])
-                for k in flat_targets:
-                    flat_targets[k].append(flat[k])
-                text_rep_parts.append(text_tokens[ep_idx:ep_idx+1].expand(T, -1, -1))
-                text_mask_parts.append(torch.ones(T, text_tokens.size(1), device=device))
-
-            vision_preprocessed = {
-                "pixel_values": torch.cat(flat_pv, dim=0),
-                "pixel_attention_mask": torch.cat(flat_pm, dim=0),
-                "spatial_shapes": torch.cat(flat_ss, dim=0),
-            }
-            text_rep = torch.cat(text_rep_parts, dim=0)
-            text_mask_rep = torch.cat(text_mask_parts, dim=0)
-            proprio = torch.cat(flat_proprio, dim=0).to(device, non_blocking=True)
-            history = torch.cat(flat_history, dim=0).to(device, non_blocking=True)
-            targets = {k: torch.cat(flat_targets[k], dim=0).to(device, non_blocking=True) for k in flat_targets}
-            targets["done"] = targets["done"].float()
-
-            # Vision tensors are moved to device inside encode_preprocessed().
-            out = model(vision_preprocessed, text_rep, text_mask_rep, proprio, history)
-            loss, per_head = total_loss(out.head_logits, targets, head_weights)
+            vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
+            out = model(vp, tr, tm, pr, hs)
+            loss, per_head = total_loss(out.head_logits, tgts, head_weights)
 
         (loss / macro_batch_episodes * micro_batch_episodes).backward()
         for k, v in per_head.items():
@@ -199,6 +208,46 @@ def train_one_step(
     )
     step_per_head_loss["grad_norm"] = float(grad_norm)
     return step_per_head_loss
+
+
+def run_validation(
+    model: ActionPrimitivesACT,
+    val_ds: PhaseAEpisodeDataset,
+    device: torch.device,
+    autocast_ctx: torch.autocast,
+    head_weights: dict[str, float],
+    micro_batch_episodes: int,
+    max_episodes: int | None = None,
+) -> dict[str, float]:
+    """Mean per-head + total loss on the validation split.
+
+    Iterates val_ds sequentially (no shuffle) in chunks of ``micro_batch_episodes``
+    under torch.no_grad + autocast. If ``max_episodes`` is set, stops early after
+    that many episodes (useful when the full val set is large).
+    """
+    was_training = model.training
+    model.train(False)
+    total_losses = {k: 0.0 for k in ("dx", "dy", "click", "scroll", "keys", "done")}
+    total_sum = 0.0
+    n = len(val_ds) if max_episodes is None else min(max_episodes, len(val_ds))
+    idx = 0
+    with torch.no_grad():
+        while idx < n:
+            batch_size = min(micro_batch_episodes, n - idx)
+            micro_eps = [val_ds[i] for i in range(idx, idx + batch_size)]
+            idx += batch_size
+            with autocast_ctx:
+                vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
+                out = model(vp, tr, tm, pr, hs)
+                loss, per_head = total_loss(out.head_logits, tgts, head_weights)
+            for k, v in per_head.items():
+                total_losses[k] += float(v.detach()) * batch_size
+            total_sum += float(loss.detach()) * batch_size
+    if was_training:
+        model.train(True)
+    result = {k: v / max(1, n) for k, v in total_losses.items()}
+    result["total"] = total_sum / max(1, n)
+    return result
 
 
 def main() -> None:
@@ -227,6 +276,19 @@ def main() -> None:
                              "behaviour for local tests). 4 is a good starting point "
                              "on HF Jobs L4 / L40S to hide JPEG decode + processor "
                              "cost behind the GPU forward.")
+    parser.add_argument("--ckpt-every-steps", type=int, default=TRAIN.ckpt_every_steps,
+                        help=f"Save a step_NNNNN.pt every N steps (default {TRAIN.ckpt_every_steps}). "
+                             "Not uploaded to HF (only best.pt and final.pt are).")
+    parser.add_argument("--eval-every-steps", type=int, default=0,
+                        help="Run validation every N steps and log val/* to wandb. "
+                             "0 = never (default). Setting this enables best.pt tracking.")
+    parser.add_argument("--early-stop-patience", type=int, default=0,
+                        help="Stop training after N consecutive eval cycles without "
+                             "improvement in val loss. 0 = disabled (default). Requires "
+                             "--eval-every-steps > 0.")
+    parser.add_argument("--val-episodes", type=int, default=None,
+                        help="Cap val-eval episodes (default: full val set). Lower for "
+                             "faster eval on large val sets.")
     args = parser.parse_args()
     if args.macro_batch_episodes % args.micro_batch_episodes != 0:
         parser.error(
@@ -307,9 +369,25 @@ def main() -> None:
         )
     else:
         iterator = infinite_loader(train_ds, seed=42)
-    model.train()
+
+    def _upload_to_hf(path: Path) -> None:
+        """Best-effort upload; log but don't crash the run if it fails."""
+        if not args.hf_upload_repo:
+            return
+        try:
+            from huggingface_hub import upload_file
+            upload_file(path_or_fileobj=str(path), path_in_repo=path.name,
+                        repo_id=args.hf_upload_repo, repo_type="model")
+            print(f"[hf-upload] {path.name} → {args.hf_upload_repo}")
+        except Exception as e:
+            print(f"[hf-upload failed] {path.name}: {e}")
+
+    model.train(True)
     step = start_step
-    while step < max_steps:
+    best_val_loss = float("inf")
+    patience_counter = 0
+    early_stopped = False
+    while step < max_steps and not early_stopped:
         lrs = [cosine_lr(step, max_steps, TRAIN.warmup_steps, base, TRAIN.cosine_min_lr_frac)
                for base in (TRAIN.lr_trunk, TRAIN.lr_lora)]
         metrics = train_one_step(
@@ -330,24 +408,52 @@ def main() -> None:
         if step % 20 == 0:
             print(f"[step {step}] loss={total_loss_avg:.4f}  grad_norm={grad_norm:.3f}")
 
-        # Checkpoint
-        if step % TRAIN.ckpt_every_steps == 0 and step > 0:
+        # Periodic local checkpoint (not uploaded; for in-VM crash recovery only).
+        if step % args.ckpt_every_steps == 0 and step > 0:
             ckpt_path = out_dir / f"step_{step:05d}.pt"
             torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(), "step": step}, ckpt_path)
             print(f"[ckpt] {ckpt_path}")
-            if args.hf_upload_repo:
-                try:
-                    from huggingface_hub import upload_file
-                    upload_file(path_or_fileobj=str(ckpt_path), path_in_repo=ckpt_path.name, repo_id=args.hf_upload_repo, repo_type="model")
-                except Exception as e:
-                    print(f"[ckpt upload failed] {e}")
+
+        # Validation + best.pt tracking + early stopping.
+        if args.eval_every_steps > 0 and step > 0 and step % args.eval_every_steps == 0:
+            val_metrics = run_validation(
+                model, val_ds, device, autocast, head_weights,
+                micro_batch_episodes=args.micro_batch_episodes,
+                max_episodes=args.val_episodes,
+            )
+            val_log = {f"val/{k}": v for k, v in val_metrics.items()}
+            val_log["step"] = step
+            wandb.log(val_log)
+            print(f"[val step {step}] total={val_metrics['total']:.4f}  "
+                  + "  ".join(f"{k}={val_metrics[k]:.4f}" for k in ("dx", "dy", "click", "scroll", "keys", "done")))
+
+            if val_metrics["total"] < best_val_loss - 1e-6:
+                best_val_loss = val_metrics["total"]
+                patience_counter = 0
+                best_path = out_dir / "best.pt"
+                torch.save(
+                    {"model": model.state_dict(), "optimizer": opt.state_dict(),
+                     "step": step, "val_loss": best_val_loss},
+                    best_path,
+                )
+                print(f"[best] val_loss={best_val_loss:.4f} at step {step}")
+                _upload_to_hf(best_path)
+            elif args.early_stop_patience > 0:
+                patience_counter += 1
+                print(f"[patience] {patience_counter}/{args.early_stop_patience} "
+                      f"(best val_loss={best_val_loss:.4f})")
+                if patience_counter >= args.early_stop_patience:
+                    print(f"[early-stop] val loss has not improved for "
+                          f"{args.early_stop_patience} consecutive evals; stopping at step {step}")
+                    early_stopped = True
 
         step += 1
 
-    # Final checkpoint
+    # Final checkpoint — always uploaded to HF if configured.
     final_path = out_dir / "final.pt"
     torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(), "step": step}, final_path)
-    print(f"done, wrote {final_path}")
+    print(f"done, wrote {final_path} (early_stopped={early_stopped})")
+    _upload_to_hf(final_path)
 
 
 if __name__ == "__main__":
