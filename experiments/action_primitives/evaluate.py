@@ -68,8 +68,48 @@ def offline_eval(model: ActionPrimitivesACT, data_dir: Path, device: str) -> dic
     return {k: correct[k] / max(1, total * (NUM_KEYS if k == "keys" else 1)) for k in correct}
 
 
-def rollout_one_episode(model: ActionPrimitivesACT, env: LClickEnv, device: str, max_frames: int = ENV.max_frames_lclick) -> dict:
-    """Closed-loop rollout. Returns info dict with success flag."""
+def _decode_mouse(
+    logits: torch.Tensor, centers: np.ndarray, mode: str
+) -> tuple[int, float]:
+    """Decode a 21-bin mouse-delta softmax.
+
+    Returns `(argmax_bin, continuous_value)`. The argmax bin is always returned
+    for history-vector bookkeeping (training saw one-hot history). The
+    continuous value is what actually gets applied via env.step.
+
+    - ``mode="argmax"``: continuous_value = centers[argmax_bin]. This is the
+      original Phase A decode — reproduces the existing 70.5% closed-loop number.
+    - ``mode="expected"``: continuous_value = E[centers] under the softmax —
+      uses the full head distribution rather than collapsing to one bin.
+      Addresses the quantization-drift zig-zag: when the true continuous
+      action is between two bin centers, argmax snaps to one and introduces
+      up to ~1.5 px drift per step; expected-value returns the interpolated
+      value and the cursor tracks the expert trajectory more tightly.
+    """
+    probs = torch.softmax(logits, dim=-1)  # (B=1, 21)
+    bin_idx = int(probs.argmax(dim=-1))
+    if mode == "argmax":
+        value = float(centers[bin_idx])
+    elif mode == "expected":
+        centers_t = torch.as_tensor(centers, device=probs.device, dtype=probs.dtype)
+        value = float((probs.squeeze(0) * centers_t).sum())
+    else:
+        raise ValueError(f"unknown decode mode: {mode!r} (expected 'argmax' or 'expected')")
+    return bin_idx, value
+
+
+def rollout_one_episode(
+    model: ActionPrimitivesACT,
+    env: LClickEnv,
+    device: str,
+    max_frames: int = ENV.max_frames_lclick,
+    decode_mode: str = "argmax",
+) -> dict:
+    """Closed-loop rollout. Returns info dict with success flag.
+
+    ``decode_mode`` controls how the dx/dy softmaxes are turned into continuous
+    deltas — see `_decode_mouse`. Default matches prior Phase A behaviour.
+    """
     obs, info = env.reset()
     with torch.no_grad():
         text_tokens = model.backbone.encode_text([f"click the {env.theme} button" if False else "click the button"])
@@ -86,11 +126,13 @@ def rollout_one_episode(model: ActionPrimitivesACT, env: LClickEnv, device: str,
         history_t = torch.from_numpy(history).float().unsqueeze(0).to(device)
         with torch.no_grad():
             out = model([obs["image"]], text_tokens, torch.ones(1, text_tokens.size(1), device=device), proprio_t, history_t)
-        # Argmax decode
-        dx_bin = int(out.head_logits["dx"].argmax(dim=-1))
-        dy_bin = int(out.head_logits["dy"].argmax(dim=-1))
-        dx = float(MOUSE_BIN_CENTERS[dx_bin])
-        dy = float(MOUSE_BIN_CENTERS[dy_bin])
+        # Decode mouse deltas (argmax or probabilistic). Bin index is still
+        # tracked for the one-hot history vector — training never saw soft
+        # history, and introducing it at inference would itself be a distribution
+        # shift.
+        dx_bin, dx = _decode_mouse(out.head_logits["dx"], MOUSE_BIN_CENTERS, decode_mode)
+        dy_bin, dy = _decode_mouse(out.head_logits["dy"], MOUSE_BIN_CENTERS, decode_mode)
+        # Click stays argmax (5-way categorical, not ordinal).
         click = int(out.head_logits["click"].argmax(dim=-1))
         # Apply
         action = Action(dx=dx, dy=dy, click=click)
@@ -113,12 +155,15 @@ def closed_loop_eval(
     tolerances_px: list[int] = [0, 3, 5, 10],
     visual: bool = False,
     fps: int = 30,
+    decode_mode: str = "argmax",
 ) -> dict:
     """Rollout n_episodes of L-click; report binary success + tolerance curves.
 
     When ``visual=True``, each env opens a pygame display window and the
     rollout runs at ``fps`` (or slower if the model is the bottleneck).
     Prints per-episode success as it goes so the user can track live.
+
+    ``decode_mode`` is forwarded to ``rollout_one_episode``; see `_decode_mouse`.
     """
     results = []
     # Visual mode prints per-episode lines; non-visual shows a tqdm bar with
@@ -126,11 +171,11 @@ def closed_loop_eval(
     iterator = range(n_episodes)
     pbar = None
     if not visual:
-        pbar = tqdm(iterator, desc="closed-loop", unit="ep", dynamic_ncols=True)
+        pbar = tqdm(iterator, desc=f"closed-loop({decode_mode})", unit="ep", dynamic_ncols=True)
         iterator = pbar
     for i in iterator:
         env = LClickEnv(seed=10000 + i, visual=visual, fps=fps)
-        res = rollout_one_episode(model, env, device)
+        res = rollout_one_episode(model, env, device, decode_mode=decode_mode)
         # For tolerance curves, we check cursor distance to target center at episode end
         x, y, w, h = env._info()["target_bbox"]
         tx, ty = x + w / 2, y + h / 2
@@ -166,6 +211,14 @@ def main() -> None:
                              "--n-rollouts (e.g. 20) when watching live.")
     parser.add_argument("--fps", type=int, default=30,
                         help="Frame rate cap when --visual is set (default 30).")
+    parser.add_argument("--decode", choices=["argmax", "expected"], default="argmax",
+                        help="Decode mode for mouse dx/dy bins. 'argmax' (default) "
+                             "snaps to the top-1 bin center — reproduces the original "
+                             "Phase A numbers. 'expected' computes E[center] under the "
+                             "softmax, giving continuous output that tracks the expert "
+                             "trajectory more tightly and reduces quantization-induced "
+                             "zig-zag. Click stays argmax regardless (5-way categorical, "
+                             "not ordinal).")
     args = parser.parse_args()
 
     model = load_model(args.checkpoint, args.device)
@@ -174,10 +227,11 @@ def main() -> None:
         off = offline_eval(model, Path(args.data_dir), args.device)
         for k, v in off.items():
             print(f"  {k}: {v:.4f}")
-    print("=== closed-loop eval ===")
+    print(f"=== closed-loop eval (decode={args.decode}) ===")
     cl = closed_loop_eval(
         model, args.device, n_episodes=args.n_rollouts,
         visual=args.visual, fps=args.fps,
+        decode_mode=args.decode,
     )
     for k, v in cl.items():
         if isinstance(v, float):
