@@ -105,11 +105,23 @@ def rollout_one_episode(model: ActionPrimitivesACT, env: LClickEnv, device: str,
     return {"success": False, "frames": max_frames}
 
 
-def closed_loop_eval(model: ActionPrimitivesACT, device: str, n_episodes: int = 200, tolerances_px: list[int] = [0, 3, 5, 10]) -> dict:
-    """Rollout n_episodes of L-click; report binary success + tolerance curves."""
+def closed_loop_eval(
+    model: ActionPrimitivesACT,
+    device: str,
+    n_episodes: int = 200,
+    tolerances_px: list[int] = [0, 3, 5, 10],
+    visual: bool = False,
+    fps: int = 30,
+) -> dict:
+    """Rollout n_episodes of L-click; report binary success + tolerance curves.
+
+    When ``visual=True``, each env opens a pygame display window and the
+    rollout runs at ``fps`` (or slower if the model is the bottleneck).
+    Prints per-episode success as it goes so the user can track live.
+    """
     results = []
     for i in range(n_episodes):
-        env = LClickEnv(seed=10000 + i)
+        env = LClickEnv(seed=10000 + i, visual=visual, fps=fps)
         res = rollout_one_episode(model, env, device)
         # For tolerance curves, we check cursor distance to target center at episode end
         x, y, w, h = env._info()["target_bbox"]
@@ -118,6 +130,12 @@ def closed_loop_eval(model: ActionPrimitivesACT, device: str, n_episodes: int = 
         dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5
         res["dist_px"] = dist
         results.append(res)
+        if visual:
+            running = sum(r["success"] for r in results) / len(results)
+            tag = "✓" if res["success"] else "✗"
+            print(f"  [{i+1:>3}/{n_episodes}] {tag}  "
+                  f"frames={res['frames']:>2}  dist={res['dist_px']:.1f}px  "
+                  f"running_success={running:.3f}", flush=True)
     out = {"n_episodes": n_episodes, "success_rate": sum(r["success"] for r in results) / n_episodes}
     for tol in tolerances_px:
         out[f"click_within_{tol}px"] = sum(1 for r in results if r["dist_px"] <= tol) / n_episodes
@@ -131,6 +149,13 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     parser.add_argument("--n-rollouts", type=int, default=200)
     parser.add_argument("--skip-offline", action="store_true")
+    parser.add_argument("--visual", action="store_true",
+                        help="Open a pygame display window for closed-loop rollouts. "
+                             "Prints per-episode success line as it goes. Implies a slower "
+                             "run because each frame is flipped to the screen; use a small "
+                             "--n-rollouts (e.g. 20) when watching live.")
+    parser.add_argument("--fps", type=int, default=30,
+                        help="Frame rate cap when --visual is set (default 30).")
     args = parser.parse_args()
 
     model = load_model(args.checkpoint, args.device)
@@ -140,7 +165,10 @@ def main() -> None:
         for k, v in off.items():
             print(f"  {k}: {v:.4f}")
     print("=== closed-loop eval ===")
-    cl = closed_loop_eval(model, args.device, n_episodes=args.n_rollouts)
+    cl = closed_loop_eval(
+        model, args.device, n_episodes=args.n_rollouts,
+        visual=args.visual, fps=args.fps,
+    )
     for k, v in cl.items():
         if isinstance(v, float):
             print(f"  {k}: {v:.4f}")

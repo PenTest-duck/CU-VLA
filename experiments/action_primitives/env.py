@@ -2,7 +2,8 @@
 
 Canvas: 720x450 white with one colored button.
 Goal: cursor over button, L_press → L_release → success.
-Headless by default (SDL_VIDEODRIVER=dummy).
+Headless by default; pass visual=True to LClickEnv(...) to open a
+pygame display window (for --visual eval).
 """
 from __future__ import annotations
 
@@ -15,9 +16,6 @@ import pygame
 from PIL import Image
 
 from experiments.action_primitives.config import ENV, NUM_KEYS
-
-
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 
 # Theme palettes (minimal Phase A set; full 20-theme system is Phase B)
@@ -56,9 +54,33 @@ class LClickEnv:
     step(action) returns (obs, done, info).
     """
 
-    def __init__(self, theme: str = "flat-modern", seed: int = 0) -> None:
-        pygame.init()
-        self.screen = pygame.Surface((ENV.canvas_w, ENV.canvas_h))
+    def __init__(self, theme: str = "flat-modern", seed: int = 0,
+                 visual: bool = False, fps: int = 30) -> None:
+        """Create a new L-click environment.
+
+        Args:
+            theme: Palette key in THEMES.
+            seed: RNG seed for target + cursor randomization.
+            visual: If True, open a real pygame display window (for live eval).
+                If False, render to an offscreen Surface with the SDL dummy
+                driver (headless, used for data generation + training).
+            fps: Frame rate cap when ``visual=True``. Ignored otherwise.
+        """
+        self.visual = visual
+        self.fps = fps
+        if visual:
+            # Remove a possibly-stale dummy driver so SDL picks the real one.
+            if os.environ.get("SDL_VIDEODRIVER") == "dummy":
+                del os.environ["SDL_VIDEODRIVER"]
+            pygame.init()
+            self.screen = pygame.display.set_mode((ENV.canvas_w, ENV.canvas_h))
+            pygame.display.set_caption("CU-VLA Exp6 · L-click eval")
+            self._clock: pygame.time.Clock | None = pygame.time.Clock()
+        else:
+            os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+            pygame.init()
+            self.screen = pygame.Surface((ENV.canvas_w, ENV.canvas_h))
+            self._clock = None
         self.rng = np.random.default_rng(seed)
         self.theme = THEMES[theme]
         self.reset(seed=seed)
@@ -140,6 +162,14 @@ class LClickEnv:
             held_mouse=self.held_mouse.copy(),
             capslock=self.capslock,
         )
+        if self.visual:
+            # Pump the event queue so macOS doesn't flag the window as "not
+            # responding", flush the drawn surface to the visible display, and
+            # cap the frame rate so humans can watch.
+            pygame.event.pump()
+            pygame.display.flip()
+            if self._clock is not None:
+                self._clock.tick(self.fps)
         return {"image": img, "proprio": proprio}
 
     def _info(self) -> dict:
