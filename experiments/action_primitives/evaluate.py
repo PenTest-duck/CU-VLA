@@ -26,10 +26,32 @@ def load_model(ckpt_path: str, device: str) -> ActionPrimitivesACT:
 
 
 def offline_eval(model: ActionPrimitivesACT, data_dir: Path, device: str) -> dict:
-    """Per-head top-1 accuracy on val set."""
+    """Per-head top-1 accuracy on val set.
+
+    Returns the standard aggregate per-head accuracies plus a *click head
+    decomposition*: click_idle_recall, click_press_recall, click_release_recall.
+    The aggregate `click` metric is dominated by the 95% of idle frames, so a
+    model that gets press/release 50% wrong can still show 99% aggregate.
+    Decomposition exposes the real per-event reliability.
+    """
     val_ds = PhaseAEpisodeDataset(data_dir, split="val")
     correct = {k: 0 for k in HEAD_LOGITS}
     total = 0
+    # Click head per-class breakdown: class id → (correct, total).
+    # Class ids per config: 0=idle, 1=L_press, 2=L_release, 3=R_press, 4=R_release.
+    from experiments.action_primitives.config import (
+        CLICK_IDLE, CLICK_L_PRESS, CLICK_L_RELEASE, CLICK_R_PRESS, CLICK_R_RELEASE,
+    )
+    click_class_names = {
+        CLICK_IDLE: "idle",
+        CLICK_L_PRESS: "l_press",
+        CLICK_L_RELEASE: "l_release",
+        CLICK_R_PRESS: "r_press",
+        CLICK_R_RELEASE: "r_release",
+    }
+    click_correct_per_class = {c: 0 for c in click_class_names}
+    click_total_per_class = {c: 0 for c in click_class_names}
+
     for idx in tqdm(range(len(val_ds)), desc="offline", unit="ep", dynamic_ncols=True):
         ep = val_ds[idx]
         # Dataset default (preprocess=True) returns preprocessed vision tensors,
@@ -64,8 +86,24 @@ def offline_eval(model: ActionPrimitivesACT, data_dir: Path, device: str) -> dic
                 tgt = ep[f"{head}_bins" if head in ("dx", "dy", "scroll") else "clicks" if head == "click" else "dones"].to(device)
                 correct[head] += int((preds == tgt).sum())
                 total_for_head = T
+                if head == "click":
+                    # Per-class recall: for each click class, count how often
+                    # the model predicts it correctly when that was the target.
+                    for cls_id in click_class_names:
+                        mask = (tgt == cls_id)
+                        n_cls = int(mask.sum())
+                        if n_cls > 0:
+                            click_correct_per_class[cls_id] += int((preds[mask] == cls_id).sum())
+                            click_total_per_class[cls_id] += n_cls
         total += T
-    return {k: correct[k] / max(1, total * (NUM_KEYS if k == "keys" else 1)) for k in correct}
+    results = {k: correct[k] / max(1, total * (NUM_KEYS if k == "keys" else 1)) for k in correct}
+    # Decomposed click metrics, reported as `click_<name>_recall`.
+    for cls_id, name in click_class_names.items():
+        n = click_total_per_class[cls_id]
+        key = f"click_{name}_recall"
+        results[key] = click_correct_per_class[cls_id] / n if n > 0 else float("nan")
+        results[f"click_{name}_support"] = n
+    return results
 
 
 def _decode_mouse(
@@ -225,8 +263,15 @@ def main() -> None:
     if not args.skip_offline:
         print("=== offline eval ===")
         off = offline_eval(model, Path(args.data_dir), args.device)
-        for k, v in off.items():
-            print(f"  {k}: {v:.4f}")
+        # Print aggregates first, then the click decomposition separately.
+        for head in ("dx", "dy", "click", "scroll", "keys", "done"):
+            print(f"  {head}: {off[head]:.4f}")
+        print("  --- click head decomposition (recall per class; support in brackets) ---")
+        for cls in ("idle", "l_press", "l_release", "r_press", "r_release"):
+            recall = off.get(f"click_{cls}_recall", float("nan"))
+            support = off.get(f"click_{cls}_support", 0)
+            recall_str = f"{recall:.4f}" if not np.isnan(recall) else "n/a"
+            print(f"    click_{cls:10s} recall={recall_str}  [support={support}]")
     print(f"=== closed-loop eval (decode={args.decode}) ===")
     cl = closed_loop_eval(
         model, args.device, n_episodes=args.n_rollouts,
