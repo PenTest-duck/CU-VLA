@@ -65,33 +65,55 @@ class SigLIP2Naflex(nn.Module):
         # Apply only to vision_model (text stays frozen)
         self.model.vision_model = get_peft_model(self.model.vision_model, lora_cfg)
 
-    def encode_image(self, images: list) -> NaflexOutput:
-        """Run vision tower on a list of PIL Images.
+    def preprocess(self, images: list) -> dict:
+        """Run the naflex processor on PIL images; returns CPU tensors.
 
-        Returns patch_embeds (B, N, d), attention_mask (B, N), spatial_shapes (B, 2).
+        Safe to call from a DataLoader worker process — no GPU ops, no
+        `self.model` access. Returns a dict of tensors with keys matching
+        what the processor emits: `pixel_values`, `pixel_attention_mask`,
+        `spatial_shapes`.
         """
         inputs = self.processor(
             images=images,
             return_tensors="pt",
             max_num_patches=self.max_num_patches,
         )
-        # Move to the same device as the model
-        device = next(self.model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        # Map processor's `pixel_attention_mask` to whichever kwarg name the
-        # installed transformers version accepts (detected in __init__).
-        vision_inputs = {
+        return {
             "pixel_values": inputs["pixel_values"],
-            self._mask_kwarg: inputs["pixel_attention_mask"],
+            "pixel_attention_mask": inputs["pixel_attention_mask"],
             "spatial_shapes": inputs["spatial_shapes"],
         }
+
+    def encode_preprocessed(self, batch: dict) -> NaflexOutput:
+        """Run the vision tower on an already-preprocessed batch.
+
+        Moves tensors to the model's device (non_blocking for pinned tensors)
+        and handles the transformers version-sensitive kwarg rename.
+        """
+        device = next(self.model.parameters()).device
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+        pixel_attention_mask = batch["pixel_attention_mask"].to(device, non_blocking=True)
+        spatial_shapes = batch["spatial_shapes"].to(device, non_blocking=True)
+        vision_inputs = {
+            "pixel_values": pixel_values,
+            self._mask_kwarg: pixel_attention_mask,
+            "spatial_shapes": spatial_shapes,
+        }
         out = self.model.vision_model(**vision_inputs)
-        # last_hidden_state: (B, N_patches, hidden); pixel_attention_mask: (B, N_patches)
         return NaflexOutput(
             patch_embeds=out.last_hidden_state,
-            attention_mask=inputs["pixel_attention_mask"],
-            spatial_shapes=inputs["spatial_shapes"],
+            attention_mask=pixel_attention_mask,
+            spatial_shapes=spatial_shapes,
         )
+
+    def encode_image(self, images: list) -> NaflexOutput:
+        """Convenience wrapper: preprocess + encode_preprocessed.
+
+        Kept for one-off PIL→vision flows (probes, closed-loop eval). Training
+        should call `preprocess` inside a DataLoader worker and
+        `encode_preprocessed` on the GPU path, to hide the processor cost.
+        """
+        return self.encode_preprocessed(self.preprocess(images))
 
     @torch.no_grad()
     def encode_text(self, texts: list[str]) -> torch.Tensor:

@@ -63,9 +63,17 @@ def decode_jpeg_bytes(b: bytes) -> Image.Image:
 
 
 class PhaseAEpisodeDataset(Dataset):
-    """Groups parquet rows into per-episode lists; returns (T, ...) per episode."""
+    """Groups parquet rows into per-episode lists; returns (T, ...) per episode.
 
-    def __init__(self, data_dir: Path, split: str = "train") -> None:
+    If ``preprocess=True`` (default), the SigLIP2 naflex processor runs inside
+    ``__getitem__`` and the returned dict contains preprocessed vision tensors
+    (`pixel_values`, `pixel_attention_mask`, `spatial_shapes`) instead of PIL
+    images. This lets a ``DataLoader(num_workers>0)`` hide the processor cost
+    behind the GPU forward. Set ``preprocess=False`` to get raw PIL images
+    back (used by tests that want to inspect image content).
+    """
+
+    def __init__(self, data_dir: Path, split: str = "train", preprocess: bool = True) -> None:
         ds = load_dataset("parquet", data_files=str(Path(data_dir) / "shard_*.parquet"))["train"]
         # Simple split by episode_id hash
         def split_fn(ex):
@@ -84,6 +92,12 @@ class PhaseAEpisodeDataset(Dataset):
         for i, ex in enumerate(self.ds):
             self.episode_index.setdefault(ex["episode_id"], []).append(i)
         self.episode_ids = sorted(self.episode_index.keys())
+        self.preprocess = preprocess
+        # Lazy-init the SigLIP2 processor; each DataLoader worker will create
+        # its own instance on first __getitem__ call. Deferring to first access
+        # keeps __init__ fast and avoids holding a large object across the
+        # worker fork.
+        self._processor = None
 
     def __len__(self) -> int:
         return len(self.episode_ids)
@@ -132,8 +146,7 @@ class PhaseAEpisodeDataset(Dataset):
             history_per_frame.append(build_action_history_vector(prev))
         # Instruction: for L-click only, use a single fixed string in Phase A
         instruction = f"click the {frames[0].get('theme', 'flat-modern')} button"
-        return {
-            "images": images,                                                     # list[PIL] length T
+        out = {
             "proprio": torch.from_numpy(np.stack(proprio_per_frame)),             # (T, 83)
             "history": torch.from_numpy(np.stack(history_per_frame)).float(),     # (T, K, 223)
             "dx_bins": torch.tensor(dx_bins, dtype=torch.long),                   # (T,)
@@ -144,3 +157,20 @@ class PhaseAEpisodeDataset(Dataset):
             "dones": torch.tensor(dones, dtype=torch.long),                       # (T,)
             "instruction": instruction,
         }
+        if self.preprocess:
+            # Run the SigLIP2 naflex processor here so workers do the CPU-side
+            # image → patch preprocessing. Lazy-create on first access.
+            if self._processor is None:
+                from transformers import AutoProcessor
+                self._processor = AutoProcessor.from_pretrained(MODEL.vision_model)
+            proc = self._processor(
+                images=images,
+                return_tensors="pt",
+                max_num_patches=MODEL.max_num_patches,
+            )
+            out["pixel_values"] = proc["pixel_values"]                             # (T, N, P*P*C)
+            out["pixel_attention_mask"] = proc["pixel_attention_mask"]             # (T, N)
+            out["spatial_shapes"] = proc["spatial_shapes"]                         # (T, 2)
+        else:
+            out["images"] = images  # list[PIL] length T
+        return out

@@ -35,14 +35,22 @@ class ActionPrimitivesACT(nn.Module):
 
     def forward(
         self,
-        images: list,                    # list of PIL.Image, len B
+        vision_input,                    # list[PIL.Image] OR dict[str, Tensor] of
+                                         # preprocessed (pixel_values,
+                                         # pixel_attention_mask, spatial_shapes).
         text_tokens: torch.Tensor,       # (B, T_text, d) — precomputed & cached
         text_mask: torch.Tensor,         # (B, T_text) — 1=real, 0=pad
         proprio: torch.Tensor,           # (B, PROPRIO_DIM)
         action_history: torch.Tensor,    # (B, K, HISTORY_INPUT_DIM)
     ) -> ACTOutput:
-        # 1. Vision encoder (trainable via LoRA)
-        vis = self.backbone.encode_image(images)
+        # 1. Vision encoder (trainable via LoRA).
+        #    Dispatch: pre-processed tensors (from DataLoader workers) take the
+        #    fast path; raw PIL lists (eval, probes) take the convenience
+        #    wrapper that runs the processor on the main process.
+        if isinstance(vision_input, dict):
+            vis = self.backbone.encode_preprocessed(vision_input)
+        else:
+            vis = self.backbone.encode_image(vision_input)
         # 2. Text tokens (frozen, passed in as cached argument)
         # 3. Proprio → single token
         proprio_tok = self.proprio_enc(proprio)             # (B, 1, d)

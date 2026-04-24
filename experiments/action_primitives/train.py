@@ -50,17 +50,21 @@ def _unwrap_single(batch: list) -> dict:
     return batch[0]
 
 
-def prefetching_loader(ds: PhaseAEpisodeDataset, num_workers: int) -> Iterator[dict]:
+def prefetching_loader(
+    ds: PhaseAEpisodeDataset,
+    num_workers: int,
+    pin_memory: bool = False,
+) -> Iterator[dict]:
     """Infinite loader backed by torch DataLoader with num_workers worker
     processes running `__getitem__` in parallel, prefetching 4× num_workers
     episodes ahead. Hides CPU-side JPEG decode + SigLIP2 processor +
     history-vector construction behind the GPU forward/backward.
 
     Follows the exp2/exp3 DataLoader pattern. Notes:
-    - batch_size=1 + custom collate because episode dicts contain PIL.Image
-      lists that torch's default collator can't stack.
-    - pin_memory=False because those same PIL lists are not pinnable; the
-      main win here is CPU-side prefetch, not host→device transfer speed.
+    - batch_size=1 + custom collate because episode dicts are keyed tensor
+      bundles; we yield the raw dict per pull and batch inside train_one_step.
+    - pin_memory defaults False but can be enabled when the dataset returns
+      only tensors (no PIL) — call with pin_memory=True when training on GPU.
     - persistent_workers=True so each worker pays the __init__ cost once
       (HF `load_dataset` + filter is a few seconds per worker).
     """
@@ -70,7 +74,7 @@ def prefetching_loader(ds: PhaseAEpisodeDataset, num_workers: int) -> Iterator[d
         shuffle=True,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
-        pin_memory=False,
+        pin_memory=pin_memory,
         prefetch_factor=4 if num_workers > 0 else None,
         collate_fn=_unwrap_single,
     )
@@ -80,9 +84,19 @@ def prefetching_loader(ds: PhaseAEpisodeDataset, num_workers: int) -> Iterator[d
 
 
 def flatten_episode_to_frames(ep: dict) -> dict:
-    """Turn (T, ...) per-episode tensors into (T, ...) frame tensors for loss."""
+    """Turn (T, ...) per-episode tensors into (T, ...) frame tensors for loss.
+
+    Dataset now preprocesses images in workers (`preprocess=True` path), so
+    `ep` contains `pixel_values`/`pixel_attention_mask`/`spatial_shapes` instead
+    of raw PIL. Returns a nested dict under `vision_preprocessed` for the
+    model's fast dispatch path.
+    """
     return {
-        "images": ep["images"],                                       # list[PIL] len T
+        "vision_preprocessed": {
+            "pixel_values": ep["pixel_values"],                       # (T, N, P*P*C)
+            "pixel_attention_mask": ep["pixel_attention_mask"],       # (T, N)
+            "spatial_shapes": ep["spatial_shapes"],                   # (T, 2)
+        },
         "proprio": ep["proprio"].float(),                             # (T, 83)
         "history": ep["history"].float(),                             # (T, K, 223)
         "dx":     ep["dx_bins"], "dy":     ep["dy_bins"],
@@ -130,7 +144,9 @@ def train_one_step(
         micro_eps = [next(iterator) for _ in range(micro_batch_episodes)]
         # Concatenate frames across the micro-batch
         with autocast_ctx:
-            flat_images: list = []
+            flat_pv: list = []
+            flat_pm: list = []
+            flat_ss: list = []
             flat_proprio: list = []
             flat_history: list = []
             flat_targets = {k: [] for k in ("dx", "dy", "click", "scroll", "keys", "done")}
@@ -143,8 +159,11 @@ def train_one_step(
             # For each episode, append all its frames
             for ep_idx, ep in enumerate(micro_eps):
                 flat = flatten_episode_to_frames(ep)
-                T = len(flat["images"])
-                flat_images.extend(flat["images"])
+                vp = flat["vision_preprocessed"]
+                T = vp["pixel_values"].shape[0]
+                flat_pv.append(vp["pixel_values"])
+                flat_pm.append(vp["pixel_attention_mask"])
+                flat_ss.append(vp["spatial_shapes"])
                 flat_proprio.append(flat["proprio"])
                 flat_history.append(flat["history"])
                 for k in flat_targets:
@@ -152,14 +171,20 @@ def train_one_step(
                 text_rep_parts.append(text_tokens[ep_idx:ep_idx+1].expand(T, -1, -1))
                 text_mask_parts.append(torch.ones(T, text_tokens.size(1), device=device))
 
+            vision_preprocessed = {
+                "pixel_values": torch.cat(flat_pv, dim=0),
+                "pixel_attention_mask": torch.cat(flat_pm, dim=0),
+                "spatial_shapes": torch.cat(flat_ss, dim=0),
+            }
             text_rep = torch.cat(text_rep_parts, dim=0)
             text_mask_rep = torch.cat(text_mask_parts, dim=0)
-            proprio = torch.cat(flat_proprio, dim=0).to(device)
-            history = torch.cat(flat_history, dim=0).to(device)
-            targets = {k: torch.cat(flat_targets[k], dim=0).to(device) for k in flat_targets}
+            proprio = torch.cat(flat_proprio, dim=0).to(device, non_blocking=True)
+            history = torch.cat(flat_history, dim=0).to(device, non_blocking=True)
+            targets = {k: torch.cat(flat_targets[k], dim=0).to(device, non_blocking=True) for k in flat_targets}
             targets["done"] = targets["done"].float()
 
-            out = model(flat_images, text_rep, text_mask_rep, proprio, history)
+            # Vision tensors are moved to device inside encode_preprocessed().
+            out = model(vision_preprocessed, text_rep, text_mask_rep, proprio, history)
             loss, per_head = total_loss(out.head_logits, targets, head_weights)
 
         (loss / macro_batch_episodes * micro_batch_episodes).backward()
@@ -276,7 +301,10 @@ def main() -> None:
 
     if args.num_workers > 0:
         print(f"Using prefetching loader with num_workers={args.num_workers}")
-        iterator = prefetching_loader(train_ds, num_workers=args.num_workers)
+        iterator = prefetching_loader(
+            train_ds, num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
     else:
         iterator = infinite_loader(train_ds, seed=42)
     model.train()
