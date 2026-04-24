@@ -39,8 +39,10 @@ def main() -> None:
     # project deps are declared in this script's header. cwd + sys.path lets
     # the `experiments.action_primitives.*` package import without install.
     sys.path.insert(0, workdir)
+    # -u: unbuffered stdout/stderr so `hf jobs logs` sees print() output in real
+    # time instead of in end-of-run batches.
     result = subprocess.run(
-        [sys.executable, "-m", "experiments.action_primitives.train", *sys.argv[1:]],
+        [sys.executable, "-u", "-m", "experiments.action_primitives.train", *sys.argv[1:]],
         cwd=workdir,
     )
     sys.exit(result.returncode)
