@@ -28,8 +28,12 @@ import sys
 
 def main() -> None:
     repo_url = os.environ.get("CU_VLA_REPO_URL", "https://github.com/PenTest-duck/CU-VLA.git")
+    branch = os.environ.get("CU_VLA_BRANCH", "feat/exp6-phase-a")
     workdir = "/workspace/CU-VLA"
-    subprocess.run(["git", "clone", "--depth", "1", repo_url, workdir], check=True)
+    subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", branch, repo_url, workdir],
+        check=True,
+    )
     os.chdir(workdir)
     # No `pip install -e .` — the UV-managed env in HF Jobs lacks pip and all
     # project deps are declared in this script's header. cwd + sys.path lets
