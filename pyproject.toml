@@ -17,6 +17,7 @@ dependencies = [
     "Pillow>=10.0",
     "pytest>=9.0.3",
     "peft>=0.10",
+    "wandb>=0.18",
 ]
 
 [tool.pytest.ini_options]
