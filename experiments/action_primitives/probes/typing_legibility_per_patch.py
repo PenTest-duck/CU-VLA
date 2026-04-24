@@ -2,7 +2,7 @@
 
 Renders ONE character at a known pixel position on a 720x450 white canvas,
 encodes through SigLIP2 naflex, locates the patch that covers the pixel via
-spatial_shapes, and trains a 63-way linear probe on that single patch's 768-d
+spatial_shapes, and trains a 62-way linear probe on that single patch's 768-d
 embedding. Reports top-1 train/test accuracy vs font size.
 
 Rationale vs the pooled string-level probe (typing_legibility.py): this
@@ -11,6 +11,11 @@ whether a pooled global feature encodes char presence. It's a closer analogue
 to what a cross-attention query in the real trunk would need to read out, and
 is a strictly harder test of spatial-plus-identity information in the feature
 map.
+
+Charset is A-Za-z0-9 (62 classes). We deliberately EXCLUDE space here: unlike
+the pooled probe (which uses space to signal 'char absent' in the multi-label
+presence task), a single all-white patch would give the linear probe a trivial
+'is this patch white?' shortcut instead of forcing it to learn char identity.
 
 DO NOT use pygame.font — circular-import bug on Python 3.14. PIL only.
 """
@@ -32,7 +37,7 @@ from experiments.action_primitives.config import ENV
 from experiments.action_primitives.probes.typing_legibility import _find_truetype_font
 
 
-CHARSET = string.ascii_letters + string.digits + " "  # 63 classes incl. space
+CHARSET = string.ascii_letters + string.digits  # 62 classes, no space (see module docstring)
 CHAR_TO_ID = {c: i for i, c in enumerate(CHARSET)}
 ID_TO_CHAR = {i: c for c, i in CHAR_TO_ID.items()}
 
@@ -83,10 +88,7 @@ def render_single_char(char: str, font_size: int, char_x: int, char_y: int) -> I
     """Render `char` centered at pixel (char_x, char_y) on a 720x450 white PIL image.
 
     Uses the TrueType font resolved by `_find_truetype_font` (cross-platform).
-    The space character renders as empty — its bbox is empty and the canvas
-    stays uniformly white. This is intentional: the probe needs the space class
-    to represent "no character under this patch" so the classifier can learn
-    "presence vs absence" alongside the 62 identity classes.
+    Charset excludes space; see module docstring.
     """
     img = Image.new("RGB", (ENV.canvas_w, ENV.canvas_h), (255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -115,7 +117,7 @@ def build_dataset_for_size(font_size: int, n_chars: int = 500) -> list[dict]:
     """Generate n_chars single-char records at `font_size`.
 
     Each record is a dict with keys:
-        - "char_id": int in [0, 62]
+        - "char_id": int in [0, 61]
         - "char_x":  float pixel coordinate
         - "char_y":  float pixel coordinate
         - "image":   PIL.Image of size (720, 450)
@@ -151,12 +153,12 @@ def build_dataset_for_size(font_size: int, n_chars: int = 500) -> list[dict]:
 def train_per_patch_probe(
     model: SigLIP2Naflex,
     records: list[dict],
-    charset_size: int = 63,
+    charset_size: int = 62,
     device: str = "cpu",
     epochs: int = 200,
 ) -> tuple[float, float]:
     """Encode each single-char image, pick the covering patch's embedding, train a
-    linear 63-way classifier. Returns (top1_train, top1_test) on an 80/20 split.
+    linear 62-way classifier. Returns (top1_train, top1_test) on an 80/20 split.
 
     Implementation notes:
     - We encode one image at a time so the naflex processor is free to pick the

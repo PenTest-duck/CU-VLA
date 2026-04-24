@@ -146,11 +146,18 @@ def test_build_dataset_for_size_returns_valid_records():
     for rec in records:
         # Expect dict-like with char_id, char_x, char_y, image
         assert rec["char_id"] in range(len(CHARSET))
-        assert 0 <= rec["char_id"] <= 62
+        assert 0 <= rec["char_id"] <= 61
         assert margin <= rec["char_x"] <= 720 - margin
         assert margin <= rec["char_y"] <= 450 - margin
         assert isinstance(rec["image"], Image.Image)
         assert rec["image"].size == (720, 450)
+
+
+def test_charset_excludes_space():
+    from experiments.action_primitives.probes.typing_legibility_per_patch import CHARSET
+
+    assert " " not in CHARSET
+    assert len(CHARSET) == 62
 
 
 # ---------- PerPatchProbeResult dataclass ----------
