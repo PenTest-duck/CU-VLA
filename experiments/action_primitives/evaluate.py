@@ -31,12 +31,20 @@ def offline_eval(model: ActionPrimitivesACT, data_dir: Path, device: str) -> dic
     total = 0
     for idx in range(len(val_ds)):
         ep = val_ds[idx]
-        T = len(ep["images"])
+        # Dataset default (preprocess=True) returns preprocessed vision tensors,
+        # not PIL images. Derive T from pixel_values and build the dict for
+        # model.forward's fast dispatch path.
+        T = ep["pixel_values"].shape[0]
         with torch.no_grad():
             text_tokens = model.backbone.encode_text([ep["instruction"]])  # (1, T_text, d)
             text_rep = text_tokens.expand(T, -1, -1)
             text_mask = torch.ones(T, text_tokens.size(1), device=device)
-            out = model(ep["images"], text_rep, text_mask,
+            vision_input = {
+                "pixel_values": ep["pixel_values"],
+                "pixel_attention_mask": ep["pixel_attention_mask"],
+                "spatial_shapes": ep["spatial_shapes"],
+            }
+            out = model(vision_input, text_rep, text_mask,
                         ep["proprio"].to(device), ep["history"].to(device).float())
         for head in HEAD_LOGITS:
             if head == "keys":
