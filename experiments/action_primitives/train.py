@@ -14,10 +14,8 @@ from typing import Iterator
 
 import numpy as np
 import torch
-import torch.nn as nn
 import wandb
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -58,6 +56,83 @@ def flatten_episode_to_frames(ep: dict) -> dict:
     }
 
 
+def train_one_step(
+    model: ActionPrimitivesACT,
+    opt: torch.optim.Optimizer,
+    iterator: Iterator[dict],
+    head_weights: dict[str, float],
+    device: torch.device,
+    autocast_ctx: torch.autocast,
+    lrs: list[float] | None = None,
+) -> dict[str, float]:
+    """Execute one macro-batch step: gradient accumulation over N micro-batches,
+    optimizer step, and return per-head losses. Caller manages LR schedule,
+    grad clipping, logging, and checkpointing.
+
+    If ``lrs`` is provided, each value is written to the corresponding param
+    group's ``lr`` before the optimizer step (applied deterministically at the
+    start, before any backward pass, so the scheduled LR is the one used for
+    this step's update).
+
+    Returns a dict of per-head float losses plus ``total`` and ``grad_norm``.
+    """
+    if lrs is not None:
+        for pg, lr in zip(opt.param_groups, lrs):
+            pg["lr"] = lr
+
+    opt.zero_grad(set_to_none=True)
+    step_per_head_loss = {k: 0.0 for k in ("dx", "dy", "click", "scroll", "keys", "done")}
+    n_micros = TRAIN.macro_batch_episodes // TRAIN.micro_batch_episodes
+    for _micro in range(n_micros):
+        micro_eps = [next(iterator) for _ in range(TRAIN.micro_batch_episodes)]
+        # Concatenate frames across the micro-batch
+        with autocast_ctx:
+            flat_images: list = []
+            flat_proprio: list = []
+            flat_history: list = []
+            flat_targets = {k: [] for k in ("dx", "dy", "click", "scroll", "keys", "done")}
+            text_rep_parts: list = []
+            text_mask_parts: list = []
+            # Pre-encode text (single string per episode in Phase A; cache across frames)
+            instructions = [e["instruction"] for e in micro_eps]
+            with torch.no_grad():
+                text_tokens = model.backbone.encode_text(instructions)    # (M, T_text, d)
+            # For each episode, append all its frames
+            for ep_idx, ep in enumerate(micro_eps):
+                flat = flatten_episode_to_frames(ep)
+                T = len(flat["images"])
+                flat_images.extend(flat["images"])
+                flat_proprio.append(flat["proprio"])
+                flat_history.append(flat["history"])
+                for k in flat_targets:
+                    flat_targets[k].append(flat[k])
+                text_rep_parts.append(text_tokens[ep_idx:ep_idx+1].expand(T, -1, -1))
+                text_mask_parts.append(torch.ones(T, text_tokens.size(1), device=device))
+
+            text_rep = torch.cat(text_rep_parts, dim=0)
+            text_mask_rep = torch.cat(text_mask_parts, dim=0)
+            proprio = torch.cat(flat_proprio, dim=0).to(device)
+            history = torch.cat(flat_history, dim=0).to(device)
+            targets = {k: torch.cat(flat_targets[k], dim=0).to(device) for k in flat_targets}
+            targets["done"] = targets["done"].float()
+
+            out = model(flat_images, text_rep, text_mask_rep, proprio, history)
+            loss, per_head = total_loss(out.head_logits, targets, head_weights)
+
+        (loss / TRAIN.macro_batch_episodes * TRAIN.micro_batch_episodes).backward()
+        for k, v in per_head.items():
+            step_per_head_loss[k] += float(v.detach()) / n_micros
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), TRAIN.grad_clip_norm)
+    opt.step()
+
+    step_per_head_loss["total"] = sum(
+        step_per_head_loss[k] for k in ("dx", "dy", "click", "scroll", "keys", "done")
+    )
+    step_per_head_loss["grad_norm"] = float(grad_norm)
+    return step_per_head_loss
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True)
@@ -66,6 +141,9 @@ def main() -> None:
     parser.add_argument("--out-dir", type=str, default="checkpoints/phase-a")
     parser.add_argument("--wandb-project", type=str, default="cu-vla-exp6")
     parser.add_argument("--wandb-run-name", type=str, default="phase-a-lclick")
+    parser.add_argument("--wandb-mode", type=str, default=None,
+                        choices=[None, "online", "offline", "disabled"],
+                        help="Override WANDB_MODE env var. 'disabled' short-circuits wandb (use for smoke tests).")
     parser.add_argument("--hf-upload-repo", type=str, default=None, help="HF repo for checkpoint upload")
     parser.add_argument("--hf-data-repo", type=str, default=None, help="HF dataset repo; overrides --data-dir")
     parser.add_argument("--resume", type=str, default=None, help="path to .pt checkpoint to resume from")
@@ -106,14 +184,13 @@ def main() -> None:
     max_steps = steps_per_epoch * args.epochs
     print(f"steps/epoch: {steps_per_epoch}  total: {max_steps}")
 
-    # Init per-head weights as placeholder 1.0; re-measure after first batch
+    # Uniform per-head weights for Phase A; Q2's loss rebalancing is Phase B.
     head_weights = {"dx": 1.0, "dy": 1.0, "click": 1.0, "scroll": 1.0, "keys": 1.0, "done": 1.0}
 
     # bf16 amp
     autocast = torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
-    scaler = None  # bf16 doesn't need gradient scaler
 
-    wandb.init(project=args.wandb_project, name=args.wandb_run_name, config={
+    wandb.init(project=args.wandb_project, name=args.wandb_run_name, mode=args.wandb_mode, config={
         "epochs": args.epochs, "macro_batch": TRAIN.macro_batch_episodes, "lr_trunk": TRAIN.lr_trunk,
         "lr_lora": TRAIN.lr_lora, "model": MODEL.vision_model, "max_num_patches": MODEL.max_num_patches,
     })
@@ -131,63 +208,17 @@ def main() -> None:
     model.train()
     step = start_step
     while step < max_steps:
-        # One macro-batch = 8 micro-batches × 8 episodes
-        opt.zero_grad(set_to_none=True)
-        step_per_head_loss = {k: 0.0 for k in ("dx", "dy", "click", "scroll", "keys", "done")}
-        for _micro in range(TRAIN.macro_batch_episodes // TRAIN.micro_batch_episodes):
-            micro_eps = [next(iterator) for _ in range(TRAIN.micro_batch_episodes)]
-            # Concatenate frames across the micro-batch
-            with autocast:
-                flat_images: list = []
-                flat_proprio: list = []
-                flat_history: list = []
-                flat_targets = {k: [] for k in ("dx", "dy", "click", "scroll", "keys", "done")}
-                # Pre-encode text (single string per episode in Phase A; cache across frames)
-                instructions = [e["instruction"] for e in micro_eps]
-                with torch.no_grad():
-                    text_tokens = model.backbone.encode_text(instructions)    # (M, T_text, d)
-                # For each episode, append all its frames
-                for ep_idx, ep in enumerate(micro_eps):
-                    flat = flatten_episode_to_frames(ep)
-                    T = len(flat["images"])
-                    flat_images.extend(flat["images"])
-                    flat_proprio.append(flat["proprio"])
-                    flat_history.append(flat["history"])
-                    for k in flat_targets:
-                        flat_targets[k].append(flat[k])
-                    # Repeat text tokens per frame of this episode
-                    if ep_idx == 0:
-                        text_rep = text_tokens[ep_idx:ep_idx+1].expand(T, -1, -1)
-                        text_mask_rep = torch.ones(T, text_tokens.size(1), device=device)
-                    else:
-                        text_rep = torch.cat([text_rep, text_tokens[ep_idx:ep_idx+1].expand(T, -1, -1)], dim=0)
-                        text_mask_rep = torch.cat([text_mask_rep, torch.ones(T, text_tokens.size(1), device=device)], dim=0)
-                proprio = torch.cat(flat_proprio, dim=0).to(device)
-                history = torch.cat(flat_history, dim=0).to(device)
-                targets = {k: torch.cat(flat_targets[k], dim=0).to(device) for k in flat_targets}
-                targets["done"] = targets["done"].float()
-
-                out = model(flat_images, text_rep, text_mask_rep, proprio, history)
-                loss, per_head = total_loss(out.head_logits, targets, head_weights)
-
-            (loss / TRAIN.macro_batch_episodes * TRAIN.micro_batch_episodes).backward()
-            for k, v in per_head.items():
-                step_per_head_loss[k] += float(v.detach()) / (TRAIN.macro_batch_episodes // TRAIN.micro_batch_episodes)
-
-        # Apply LR schedule
-        for pg, base in zip(opt.param_groups, [TRAIN.lr_trunk, TRAIN.lr_lora]):
-            pg["lr"] = cosine_lr(step, max_steps, TRAIN.warmup_steps, base, TRAIN.cosine_min_lr_frac)
-
-        # Gradient clip and step
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), TRAIN.grad_clip_norm)
-        opt.step()
+        lrs = [cosine_lr(step, max_steps, TRAIN.warmup_steps, base, TRAIN.cosine_min_lr_frac)
+               for base in (TRAIN.lr_trunk, TRAIN.lr_lora)]
+        metrics = train_one_step(model, opt, iterator, head_weights, device, autocast, lrs=lrs)
+        total_loss_avg = metrics["total"]
+        grad_norm = metrics["grad_norm"]
 
         # Log
-        total_loss_avg = sum(step_per_head_loss.values())
-        log = {"step": step, "loss/total": total_loss_avg, "grad_norm": float(grad_norm),
+        log = {"step": step, "loss/total": total_loss_avg, "grad_norm": grad_norm,
                "lr/trunk": opt.param_groups[0]["lr"], "lr/lora": opt.param_groups[1]["lr"]}
-        for k, v in step_per_head_loss.items():
-            log[f"loss/{k}"] = v
+        for k in ("dx", "dy", "click", "scroll", "keys", "done"):
+            log[f"loss/{k}"] = metrics[k]
         wandb.log(log)
         if step % 20 == 0:
             print(f"[step {step}] loss={total_loss_avg:.4f}  grad_norm={grad_norm:.3f}")
