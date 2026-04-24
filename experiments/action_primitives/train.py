@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import wandb
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -36,11 +37,46 @@ def cosine_lr(step: int, max_steps: int, warmup_steps: int, base_lr: float, min_
 
 
 def infinite_loader(ds: PhaseAEpisodeDataset, seed: int = 0) -> Iterator[dict]:
+    """Simple single-process infinite generator. No prefetching."""
     rng = np.random.default_rng(seed)
     while True:
         perm = rng.permutation(len(ds))
         for i in perm:
             yield ds[int(i)]
+
+
+def _unwrap_single(batch: list) -> dict:
+    """Identity collate for batch_size=1 + non-tensor items (PIL lists etc.)."""
+    return batch[0]
+
+
+def prefetching_loader(ds: PhaseAEpisodeDataset, num_workers: int) -> Iterator[dict]:
+    """Infinite loader backed by torch DataLoader with num_workers worker
+    processes running `__getitem__` in parallel, prefetching 4× num_workers
+    episodes ahead. Hides CPU-side JPEG decode + SigLIP2 processor +
+    history-vector construction behind the GPU forward/backward.
+
+    Follows the exp2/exp3 DataLoader pattern. Notes:
+    - batch_size=1 + custom collate because episode dicts contain PIL.Image
+      lists that torch's default collator can't stack.
+    - pin_memory=False because those same PIL lists are not pinnable; the
+      main win here is CPU-side prefetch, not host→device transfer speed.
+    - persistent_workers=True so each worker pays the __init__ cost once
+      (HF `load_dataset` + filter is a few seconds per worker).
+    """
+    loader = DataLoader(
+        ds,
+        batch_size=1,
+        shuffle=True,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        pin_memory=False,
+        prefetch_factor=4 if num_workers > 0 else None,
+        collate_fn=_unwrap_single,
+    )
+    while True:
+        for ep in loader:
+            yield ep
 
 
 def flatten_episode_to_frames(ep: dict) -> dict:
@@ -160,6 +196,12 @@ def main() -> None:
     parser.add_argument("--micro-batch-episodes", type=int, default=TRAIN.micro_batch_episodes,
                         help=f"Episodes per forward/backward pass (default {TRAIN.micro_batch_episodes}). "
                              "Drop to 1 or 2 on 24 GB GPUs to avoid OOM.")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader worker processes for CPU-side prefetch. "
+                             "0 = simple single-process generator (default, matches "
+                             "behaviour for local tests). 4 is a good starting point "
+                             "on HF Jobs L4 / L40S to hide JPEG decode + processor "
+                             "cost behind the GPU forward.")
     args = parser.parse_args()
     if args.macro_batch_episodes % args.micro_batch_episodes != 0:
         parser.error(
@@ -218,6 +260,7 @@ def main() -> None:
         "epochs": args.epochs,
         "macro_batch": args.macro_batch_episodes,
         "micro_batch": args.micro_batch_episodes,
+        "num_workers": args.num_workers,
         "lr_trunk": TRAIN.lr_trunk,
         "lr_lora": TRAIN.lr_lora, "model": MODEL.vision_model, "max_num_patches": MODEL.max_num_patches,
     })
@@ -231,7 +274,11 @@ def main() -> None:
         start_step = ckpt["step"]
         print(f"resumed from step {start_step}")
 
-    iterator = infinite_loader(train_ds, seed=42)
+    if args.num_workers > 0:
+        print(f"Using prefetching loader with num_workers={args.num_workers}")
+        iterator = prefetching_loader(train_ds, num_workers=args.num_workers)
+    else:
+        iterator = infinite_loader(train_ds, seed=42)
     model.train()
     step = start_step
     while step < max_steps:
