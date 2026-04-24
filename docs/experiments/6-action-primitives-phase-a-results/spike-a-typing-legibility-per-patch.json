@@ -1,0 +1,58 @@
+[
+  {
+    "font_size": 8,
+    "top1_test": 0.36000001430511475,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  },
+  {
+    "font_size": 10,
+    "top1_test": 0.5699999928474426,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  },
+  {
+    "font_size": 12,
+    "top1_test": 0.7400000095367432,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  },
+  {
+    "font_size": 14,
+    "top1_test": 0.7400000095367432,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  },
+  {
+    "font_size": 16,
+    "top1_test": 0.8500000238418579,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  },
+  {
+    "font_size": 20,
+    "top1_test": 0.8399999737739563,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  },
+  {
+    "font_size": 24,
+    "top1_test": 0.8799999952316284,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  },
+  {
+    "font_size": 32,
+    "top1_test": 0.8500000238418579,
+    "top1_train": 1.0,
+    "n_samples": 500,
+    "probe_type": "per_patch_single_char"
+  }
+]

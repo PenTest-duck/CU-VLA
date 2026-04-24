@@ -1,0 +1,42 @@
+[
+  {
+    "font_size": 8,
+    "top1_accuracy": 0.0,
+    "n_samples": 80
+  },
+  {
+    "font_size": 10,
+    "top1_accuracy": 0.008510638028383255,
+    "n_samples": 80
+  },
+  {
+    "font_size": 12,
+    "top1_accuracy": 0.06143791228532791,
+    "n_samples": 80
+  },
+  {
+    "font_size": 14,
+    "top1_accuracy": 0.051020409911870956,
+    "n_samples": 80
+  },
+  {
+    "font_size": 16,
+    "top1_accuracy": 0.03846153989434242,
+    "n_samples": 80
+  },
+  {
+    "font_size": 20,
+    "top1_accuracy": 0.12345679849386215,
+    "n_samples": 80
+  },
+  {
+    "font_size": 24,
+    "top1_accuracy": 0.08456789702177048,
+    "n_samples": 80
+  },
+  {
+    "font_size": 32,
+    "top1_accuracy": 0.1881401687860489,
+    "n_samples": 80
+  }
+]
