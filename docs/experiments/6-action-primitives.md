@@ -2669,3 +2669,57 @@ Stratified batching from Q2 ensures balanced exposure per primitive. All heads t
 **What this trades:** early-cancel compute savings for simplicity. If a run is going to fail, Q40 diagnostics catch it in epoch 1 (~30 min of wall-clock). If it passes epoch 1 but fails later, we've spent a few hours of L40S — acceptable cost for workflow simplicity.
 
 **Confidence: 8/10** — matches your manual-review-after-full-run workflow preference.
+
+---
+
+## Amendments (Phase A findings, 2026-04-24)
+
+Revisions to the questions above based on Spike A, B, C, E results. Phase B planning should treat these as authoritative overrides. Full derivations in [docs/experiments/6-action-primitives-phase-a-results/](6-action-primitives-phase-a-results/).
+
+### Q7 — Pygame generator throughput (revised)
+
+- **Was:** "pygame env generates at ≥200 eps/sec on consumer CPU."
+- **Now:** **≥20 eps/s single-process on M1** (measured 3.61 eps/s at N=1000 in Spike E). Naive `multiprocessing.Pool.imap` at default `chunksize=1` is *slower* than serial (1.79 eps/s at workers=4 on M1) because of spawn+pygame init cost per worker and IPC payload size. The 200 eps/s target is only achievable with a **worker-writes-shards redesign** where workers own episode ranges and write their own parquet shards, eliminating the IPC round-trip.
+- **Phase B implication:** schedule the multiproc redesign before Phase B data gen (24,500 eps × 2.5 eps/s serial = 2.7 h). With redesign, target 6-8× speedup on 8-core M1.
+
+### Q8 — Per-primitive window length (revised)
+
+- **Was:** `max_frames_lclick = 30`.
+- **Now:** `max_frames_lclick = 45`. At 30, slow-tempo + long-distance episodes overflowed the window (~5% label-noise rate: expert never reached press, `done_gt=0` on all rows — model would learn "never predict done" from these). At 45, rate drops to ~0.25%.
+- **Phase B implication:** size other primitives' windows by the same "slow-tempo + long-distance + settle + press/release" worst case, with ~15% headroom. Document per-primitive window lengths in Q9.
+
+### Q15 — Trainable parameter budget (revised)
+
+- **Was:** "~118M total params, ~30M trainable."
+- **Now:** **408.8M total** (vision 93M frozen + text 282M frozen + trunk 28M + heads 4M + encoders 1M + LoRA 0.6M), **33.6M trainable**.
+- **L4 fits** `micro_batch_episodes=4` with bf16 autocast (14.5 GB peak). `micro=8` OOMs (43 GB activations).
+- **Phase B note:** the **text tower is 282M of frozen dead weight** for Phase A (no language variation in L-click). Phase B consideration: cache instruction embeddings offline and drop the text tower from the runtime model. Saves 1.1 GB GPU memory. Zero quality cost if the instruction set is enumerable at training time, which it is.
+
+### Q2/Q8 — Micro batch sizing (new constraint)
+
+- **New default:** `micro_batch_episodes=4` on L4 24 GB, `num_workers=4` for DataLoader prefetch, `macro_batch_episodes=64` (unchanged → 16 micros/step).
+- Larger GPUs (L40S 48 GB, A100 80 GB) can run `micro=8` or `16`; adjust `num_workers` accordingly.
+- The default in config.py (`micro_batch_episodes=8`) is now documented as "development-time default, override on L4 via `--micro-batch-episodes 4`".
+
+### Q5/Q6 — Typing legibility at `max_num_patches=256` (confirmed)
+
+- **Design stands.** Per-patch char identity probe gives 74% top-1 at 14pt on 62-way identity (46× chance, 46× better than random). SigLIP2 preserves per-patch char identity — the original string-presence probe was pooling-limited, not feature-limited.
+- **Caveats for Phase B:**
+  - Use the per-patch probe, not mean-pool or attention-pool presence, if re-measuring legibility for a new font/size regime.
+  - Residual ~12-15% error even at 32pt is consistent with patch-boundary aliasing. If typing primitives underperform, first hypothesis is glyphs straddling patch edges; test by snapping rendered text to patch centers.
+
+### Q40 — Epoch-1 diagnostics (add new signal)
+
+- Existing list (loss descending, no NaN, grad norms stable, no head dominating) stands.
+- **Add:** log `frac(dx_bin == 10)` and `frac(dy_bin == 10)` per step. Bin 10 is zero-motion. If the model outputs bin 10 on frames where the expert was moving >5 px/frame, it's collapsing to a "safe" zero-motion attractor. Spike B visual n=20 suggests this is the dominant "stuck far away" failure mode — confirm/refute with n=200 data.
+
+### Q25 — Eval cadence on M1 (pending)
+
+- Design assumes Spike C M1 timing ≈ 7.6 Hz per-frame effective rate.
+- **Pending** Spike C measurement (T24). If measured Hz is substantially lower (e.g., <3 Hz), Phase B Tier-B eval cadence (400 rollouts every 2000 steps) needs adjustment — either drop to every 4000 steps or trim rollout count.
+
+### Convention notes (not parameter changes, but tooling)
+
+- **pygame → pygame-ce.** Project dep swapped because pygame 2.6.1 + Python 3.14 has a circular-import bug on `pygame.font`. pygame-ce 2.5.7 is a drop-in replacement.
+- **`--num-workers` DataLoader prefetch + dataset-side SigLIP2 preprocessing.** Training loop hides JPEG decode + naflex processor + history-vector construction in DataLoader workers. Without this, GPU util oscillates 0-30 ↔ 100% on L4 because data prep is synchronous with the forward. Default on L4: `--num-workers 4`.
+- **HF Jobs entry script workflow.** `scripts/hf_job_train_exp6.py` skips `pip install -e .` (UV env has no pip), clones an explicit branch via `CU_VLA_BRANCH` env var, and sets `HF_HUB_DISABLE_PROGRESS_BARS` + `HF_DATASETS_DISABLE_PROGRESS_BARS` to keep HF Jobs logs readable. See `docs/research/hf-jobs-gotchas.md` for the full debugging journey.
