@@ -96,12 +96,19 @@ class LClickEnv:
         btn_y = int(self.rng.integers(margin, ENV.canvas_h - btn_h - margin))
         self.target_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
         self.target_color = self.theme["button"]
-        # Cursor starts at random position far from target
-        while True:
+        # Cursor starts at random position far from target. Bound the retry
+        # loop to avoid an unbounded spin in degenerate cases (very large
+        # button, small canvas).
+        for _ in range(100):
             cx = int(self.rng.integers(10, ENV.canvas_w - 10))
             cy = int(self.rng.integers(10, ENV.canvas_h - 10))
             if not self.target_rect.collidepoint(cx, cy):
                 break
+        else:
+            raise RuntimeError(
+                f"Could not find a cursor-off-target position after 100 tries. "
+                f"Target rect {self.target_rect} vs canvas ({ENV.canvas_w}x{ENV.canvas_h})."
+            )
         self.cursor_x = float(cx)
         self.cursor_y = float(cy)
         self.held_keys = np.zeros(NUM_KEYS, dtype=bool)

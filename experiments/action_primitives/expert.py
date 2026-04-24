@@ -7,11 +7,11 @@ Includes tempo variability (slow / normal / fast / superhuman) per Q5/Q9.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Iterator
 
 import numpy as np
 
-from experiments.action_primitives.config import ENV, MOUSE_CAP_PX, NUM_KEYS
+from experiments.action_primitives.config import MOUSE_CAP_PX, NUM_KEYS
 from experiments.action_primitives.env import Action
 
 
@@ -21,6 +21,10 @@ TEMPO_PROFILES = {
     "fast":       {"peak_speed_px": 60.0, "settle_frames": (0, 2)},
     "superhuman": {"peak_speed_px": 95.0, "settle_frames": (0, 1)},
 }
+# `settle_frames` = (low, high) interpreted as half-open `rng.integers(low, high)`;
+# the state machine adds +1 to the sample so effective settle count is in
+# [low+1, high]. New profiles must satisfy high > low (else `rng.integers(n, n)`
+# raises `ValueError: high <= low`).
 
 
 @dataclass
@@ -48,9 +52,16 @@ class LClickExpert:
         self.cursor = np.array(cursor_xy, dtype=np.float64)
         self.target = np.array(target_center, dtype=np.float64)
         self.profile = TEMPO_PROFILES[cfg.tempo]
+        # Guard the half-open interval convention; rng.integers(n, n) raises.
+        low, high = self.profile["settle_frames"]
+        if high <= low:
+            raise ValueError(
+                f"Tempo '{cfg.tempo}' has settle_frames={self.profile['settle_frames']}; "
+                "high must be strictly greater than low (rng.integers is half-open)."
+            )
         # State machine: move -> settle -> press -> release -> done
         self.state = "move"
-        self.settle_remaining = int(self.rng.integers(*self.profile["settle_frames"]) + 1)
+        self.settle_remaining = int(self.rng.integers(low, high) + 1)
         self._overshoot_done = False
 
     def _move_step(self) -> Action:

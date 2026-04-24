@@ -51,9 +51,20 @@ class SigLIP2Naflex(nn.Module):
             )
 
     def apply_lora(self, rank: int = 8) -> None:
-        """Apply LoRA adapters to vision tower attention projections (Q15)."""
-        from peft import LoraConfig, get_peft_model
+        """Apply LoRA adapters to vision tower attention projections (Q15).
 
+        Idempotency-guarded: calling a second time raises RuntimeError rather
+        than silently stacking adapters (PEFT emits warnings but continues,
+        which is hard to debug). Safe to call exactly once, typically from
+        ActionPrimitivesACT.__init__.
+        """
+        from peft import LoraConfig, PeftModel, get_peft_model
+
+        if isinstance(self.model.vision_model, PeftModel):
+            raise RuntimeError(
+                "apply_lora() has already been called on this SigLIP2Naflex; "
+                "vision_model is already a PeftModel. Refusing to stack adapters."
+            )
         lora_cfg = LoraConfig(
             r=rank,
             lora_alpha=rank * 2,

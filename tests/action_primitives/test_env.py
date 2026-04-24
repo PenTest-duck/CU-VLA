@@ -1,8 +1,5 @@
 """Unit tests for LClickEnv."""
 
-import numpy as np
-import pytest
-
 from experiments.action_primitives.env import Action, LClickEnv
 
 
