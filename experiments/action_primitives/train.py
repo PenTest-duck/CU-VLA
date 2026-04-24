@@ -135,7 +135,8 @@ def train_one_step(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Local parquet dataset directory. Mutually exclusive with --hf-data-repo.")
     parser.add_argument("--epochs", type=int, default=TRAIN.phase_a_epochs)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", type=str, default="checkpoints/phase-a")
@@ -153,7 +154,12 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    # Data
+    # Data — exactly one of --data-dir or --hf-data-repo must be provided
+    if (args.data_dir is None) == (args.hf_data_repo is None):
+        parser.error(
+            "exactly one of --data-dir or --hf-data-repo must be provided "
+            f"(got data_dir={args.data_dir!r}, hf_data_repo={args.hf_data_repo!r})"
+        )
     if args.hf_data_repo is not None:
         from experiments.action_primitives.hf_sync import download_hf_dataset
         data_dir = download_hf_dataset(args.hf_data_repo)
