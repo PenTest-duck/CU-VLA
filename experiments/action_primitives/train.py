@@ -64,6 +64,8 @@ def train_one_step(
     device: torch.device,
     autocast_ctx: torch.autocast,
     lrs: list[float] | None = None,
+    macro_batch_episodes: int = TRAIN.macro_batch_episodes,
+    micro_batch_episodes: int = TRAIN.micro_batch_episodes,
 ) -> dict[str, float]:
     """Execute one macro-batch step: gradient accumulation over N micro-batches,
     optimizer step, and return per-head losses. Caller manages LR schedule,
@@ -74,6 +76,11 @@ def train_one_step(
     start, before any backward pass, so the scheduled LR is the one used for
     this step's update).
 
+    ``macro_batch_episodes`` / ``micro_batch_episodes`` default to TRAIN config
+    but can be overridden by the caller (e.g. to shrink micro batch for GPU
+    memory pressure). The macro:micro ratio determines how many gradient
+    accumulation passes happen per optimizer step.
+
     Returns a dict of per-head float losses plus ``total`` and ``grad_norm``.
     """
     if lrs is not None:
@@ -82,9 +89,9 @@ def train_one_step(
 
     opt.zero_grad(set_to_none=True)
     step_per_head_loss = {k: 0.0 for k in ("dx", "dy", "click", "scroll", "keys", "done")}
-    n_micros = TRAIN.macro_batch_episodes // TRAIN.micro_batch_episodes
+    n_micros = macro_batch_episodes // micro_batch_episodes
     for _micro in range(n_micros):
-        micro_eps = [next(iterator) for _ in range(TRAIN.micro_batch_episodes)]
+        micro_eps = [next(iterator) for _ in range(micro_batch_episodes)]
         # Concatenate frames across the micro-batch
         with autocast_ctx:
             flat_images: list = []
@@ -119,7 +126,7 @@ def train_one_step(
             out = model(flat_images, text_rep, text_mask_rep, proprio, history)
             loss, per_head = total_loss(out.head_logits, targets, head_weights)
 
-        (loss / TRAIN.macro_batch_episodes * TRAIN.micro_batch_episodes).backward()
+        (loss / macro_batch_episodes * micro_batch_episodes).backward()
         for k, v in per_head.items():
             step_per_head_loss[k] += float(v.detach()) / n_micros
 
@@ -148,7 +155,17 @@ def main() -> None:
     parser.add_argument("--hf-upload-repo", type=str, default=None, help="HF repo for checkpoint upload")
     parser.add_argument("--hf-data-repo", type=str, default=None, help="HF dataset repo; overrides --data-dir")
     parser.add_argument("--resume", type=str, default=None, help="path to .pt checkpoint to resume from")
+    parser.add_argument("--macro-batch-episodes", type=int, default=TRAIN.macro_batch_episodes,
+                        help=f"Episodes per optimizer step (default {TRAIN.macro_batch_episodes}).")
+    parser.add_argument("--micro-batch-episodes", type=int, default=TRAIN.micro_batch_episodes,
+                        help=f"Episodes per forward/backward pass (default {TRAIN.micro_batch_episodes}). "
+                             "Drop to 1 or 2 on 24 GB GPUs to avoid OOM.")
     args = parser.parse_args()
+    if args.macro_batch_episodes % args.micro_batch_episodes != 0:
+        parser.error(
+            f"--macro-batch-episodes ({args.macro_batch_episodes}) must be a multiple of "
+            f"--micro-batch-episodes ({args.micro_batch_episodes})."
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -186,9 +203,10 @@ def main() -> None:
         weight_decay=TRAIN.weight_decay,
     )
     # Estimate max_steps
-    steps_per_epoch = math.ceil(len(train_ds) / TRAIN.macro_batch_episodes)
+    steps_per_epoch = math.ceil(len(train_ds) / args.macro_batch_episodes)
     max_steps = steps_per_epoch * args.epochs
-    print(f"steps/epoch: {steps_per_epoch}  total: {max_steps}")
+    print(f"steps/epoch: {steps_per_epoch}  total: {max_steps}  "
+          f"macro={args.macro_batch_episodes}  micro={args.micro_batch_episodes}")
 
     # Uniform per-head weights for Phase A; Q2's loss rebalancing is Phase B.
     head_weights = {"dx": 1.0, "dy": 1.0, "click": 1.0, "scroll": 1.0, "keys": 1.0, "done": 1.0}
@@ -197,7 +215,10 @@ def main() -> None:
     autocast = torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
 
     wandb.init(project=args.wandb_project, name=args.wandb_run_name, mode=args.wandb_mode, config={
-        "epochs": args.epochs, "macro_batch": TRAIN.macro_batch_episodes, "lr_trunk": TRAIN.lr_trunk,
+        "epochs": args.epochs,
+        "macro_batch": args.macro_batch_episodes,
+        "micro_batch": args.micro_batch_episodes,
+        "lr_trunk": TRAIN.lr_trunk,
         "lr_lora": TRAIN.lr_lora, "model": MODEL.vision_model, "max_num_patches": MODEL.max_num_patches,
     })
 
@@ -216,7 +237,12 @@ def main() -> None:
     while step < max_steps:
         lrs = [cosine_lr(step, max_steps, TRAIN.warmup_steps, base, TRAIN.cosine_min_lr_frac)
                for base in (TRAIN.lr_trunk, TRAIN.lr_lora)]
-        metrics = train_one_step(model, opt, iterator, head_weights, device, autocast, lrs=lrs)
+        metrics = train_one_step(
+            model, opt, iterator, head_weights, device, autocast,
+            lrs=lrs,
+            macro_batch_episodes=args.macro_batch_episodes,
+            micro_batch_episodes=args.micro_batch_episodes,
+        )
         total_loss_avg = metrics["total"]
         grad_norm = metrics["grad_norm"]
 
