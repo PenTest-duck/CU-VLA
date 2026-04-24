@@ -13,6 +13,8 @@ wheels/
 experiments/*/data/
 experiments/*/checkpoints/
 experiments/*/results/
+/data/
+/checkpoints/
 
 .firecrawl
 .pytest_cache
