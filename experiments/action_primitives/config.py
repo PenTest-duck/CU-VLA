@@ -16,7 +16,7 @@ class EnvConfig:
     canvas_w: int = 720
     canvas_h: int = 450  # 16:10 full-screen task window (Q7)
     fps: int = 30        # logical 30Hz (Q5, Q16)
-    max_frames_lclick: int = 30  # per-primitive window (Q8)
+    max_frames_lclick: int = 45  # per-primitive window (Q8 amended by Spike E)
 
 
 ENV = EnvConfig()

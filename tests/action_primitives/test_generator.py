@@ -92,3 +92,36 @@ def test_generate_all_refuses_to_overwrite_existing_shards(tmp_path: Path):
     # Second call with same out_dir must refuse
     with pytest.raises(RuntimeError, match="already contains"):
         generate_all(n_episodes=2, out_dir=tmp_path, shard_size=1)
+
+
+def test_generate_all_parallel_matches_serial(tmp_path):
+    """workers=2 should produce byte-identical parquet shards to workers=1 for the same seeds."""
+    from experiments.action_primitives.generate_data import generate_all
+
+    out_serial = tmp_path / "serial"
+    out_parallel = tmp_path / "parallel"
+    generate_all(n_episodes=4, out_dir=out_serial, shard_size=2, workers=1)
+    generate_all(n_episodes=4, out_dir=out_parallel, shard_size=2, workers=2)
+
+    # Load both via HF datasets and compare
+    from datasets import load_dataset
+    ds_serial = load_dataset("parquet", data_files=str(out_serial / "shard_*.parquet"))["train"]
+    ds_parallel = load_dataset("parquet", data_files=str(out_parallel / "shard_*.parquet"))["train"]
+    assert len(ds_serial) == len(ds_parallel)
+    for i in range(len(ds_serial)):
+        # Compare a handful of deterministic columns
+        assert ds_serial[i]["episode_id"] == ds_parallel[i]["episode_id"]
+        assert ds_serial[i]["action_dx"] == ds_parallel[i]["action_dx"]
+        assert ds_serial[i]["action_click"] == ds_parallel[i]["action_click"]
+        # Image bytes are deterministic too (same JPEG encoder on same pixels)
+        assert ds_serial[i]["image_bytes"] == ds_parallel[i]["image_bytes"]
+
+
+def test_generate_all_parallel_respects_idempotency_guard(tmp_path):
+    """workers>1 path must also refuse to overwrite existing shards."""
+    from experiments.action_primitives.generate_data import generate_all
+    import pytest
+
+    generate_all(n_episodes=2, out_dir=tmp_path, shard_size=1, workers=2)
+    with pytest.raises(RuntimeError, match="already contains"):
+        generate_all(n_episodes=2, out_dir=tmp_path, shard_size=1, workers=2)
