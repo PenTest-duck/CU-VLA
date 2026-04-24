@@ -40,3 +40,21 @@ def test_model_parameter_counts_reasonable():
     # lands near ~408M. Assertion widened to reflect measured reality while still
     # guarding against silent architecture drift.
     assert 380e6 < total < 430e6, f"unexpected param count: {total / 1e6:.1f}M"
+
+
+def test_lora_adapters_are_trainable():
+    from experiments.action_primitives.model import ActionPrimitivesACT
+
+    model = ActionPrimitivesACT()
+    lora_params = [n for n, p in model.named_parameters() if "lora_" in n and p.requires_grad]
+    assert len(lora_params) > 0, "no trainable LoRA params found"
+
+
+def test_text_tower_still_frozen_after_lora():
+    from experiments.action_primitives.model import ActionPrimitivesACT
+
+    model = ActionPrimitivesACT()
+    text_trainable = [
+        n for n, p in model.backbone.model.text_model.named_parameters() if p.requires_grad
+    ]
+    assert len(text_trainable) == 0, f"text tower has trainable params: {text_trainable}"

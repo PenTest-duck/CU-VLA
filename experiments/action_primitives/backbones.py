@@ -35,6 +35,21 @@ class SigLIP2Naflex(nn.Module):
         for p in self.model.text_model.parameters():
             p.requires_grad = False
 
+    def apply_lora(self, rank: int = 8) -> None:
+        """Apply LoRA adapters to vision tower attention projections (Q15)."""
+        from peft import LoraConfig, get_peft_model
+
+        lora_cfg = LoraConfig(
+            r=rank,
+            lora_alpha=rank * 2,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+            modules_to_save=[],
+            bias="none",
+            lora_dropout=0.0,
+        )
+        # Apply only to vision_model (text stays frozen)
+        self.model.vision_model = get_peft_model(self.model.vision_model, lora_cfg)
+
     def encode_image(self, images: list) -> NaflexOutput:
         """Run vision tower on a list of PIL Images.
 

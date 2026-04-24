@@ -27,6 +27,7 @@ class ActionPrimitivesACT(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.backbone = SigLIP2Naflex()
+        self.backbone.apply_lora(rank=MODEL.lora_rank)
         self.proprio_enc = ProprioEncoder()
         self.history_enc = HistoryEncoder()
         self.trunk = Trunk()
