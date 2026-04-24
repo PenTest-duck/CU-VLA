@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 from experiments.action_primitives.config import (
     ENV, HEAD_LOGITS, MODEL, MOUSE_BIN_CENTERS, NUM_KEYS, PROPRIO_DIM,
@@ -29,7 +30,7 @@ def offline_eval(model: ActionPrimitivesACT, data_dir: Path, device: str) -> dic
     val_ds = PhaseAEpisodeDataset(data_dir, split="val")
     correct = {k: 0 for k in HEAD_LOGITS}
     total = 0
-    for idx in range(len(val_ds)):
+    for idx in tqdm(range(len(val_ds)), desc="offline", unit="ep", dynamic_ncols=True):
         ep = val_ds[idx]
         # Dataset default (preprocess=True) returns preprocessed vision tensors,
         # not PIL images. Derive T from pixel_values and build the dict for
@@ -120,7 +121,14 @@ def closed_loop_eval(
     Prints per-episode success as it goes so the user can track live.
     """
     results = []
-    for i in range(n_episodes):
+    # Visual mode prints per-episode lines; non-visual shows a tqdm bar with
+    # running success rate in the postfix so you can track progress.
+    iterator = range(n_episodes)
+    pbar = None
+    if not visual:
+        pbar = tqdm(iterator, desc="closed-loop", unit="ep", dynamic_ncols=True)
+        iterator = pbar
+    for i in iterator:
         env = LClickEnv(seed=10000 + i, visual=visual, fps=fps)
         res = rollout_one_episode(model, env, device)
         # For tolerance curves, we check cursor distance to target center at episode end
@@ -130,12 +138,14 @@ def closed_loop_eval(
         dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5
         res["dist_px"] = dist
         results.append(res)
+        running = sum(r["success"] for r in results) / len(results)
         if visual:
-            running = sum(r["success"] for r in results) / len(results)
             tag = "✓" if res["success"] else "✗"
             print(f"  [{i+1:>3}/{n_episodes}] {tag}  "
                   f"frames={res['frames']:>2}  dist={res['dist_px']:.1f}px  "
                   f"running_success={running:.3f}", flush=True)
+        elif pbar is not None:
+            pbar.set_postfix(success=f"{running:.3f}")
     out = {"n_episodes": n_episodes, "success_rate": sum(r["success"] for r in results) / n_episodes}
     for tol in tolerances_px:
         out[f"click_within_{tol}px"] = sum(1 for r in results if r["dist_px"] <= tol) / n_episodes
