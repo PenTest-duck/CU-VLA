@@ -39,11 +39,19 @@ def main() -> None:
     # project deps are declared in this script's header. cwd + sys.path lets
     # the `experiments.action_primitives.*` package import without install.
     sys.path.insert(0, workdir)
+    # Silence per-batch progress bars from huggingface_hub (snapshot_download)
+    # and datasets (load_dataset + ds.filter). They spam the HF Jobs log with
+    # hundreds of `Filter: 37%|... ` lines per run.
+    env = os.environ.copy()
+    env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    env["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
+
     # -u: unbuffered stdout/stderr so `hf jobs logs` sees print() output in real
     # time instead of in end-of-run batches.
     result = subprocess.run(
         [sys.executable, "-u", "-m", "experiments.action_primitives.train", *sys.argv[1:]],
         cwd=workdir,
+        env=env,
     )
     sys.exit(result.returncode)
 
