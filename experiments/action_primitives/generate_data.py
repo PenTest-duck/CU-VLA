@@ -6,7 +6,6 @@ parquet shard set.
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from pathlib import Path
 
@@ -28,6 +27,7 @@ FEATURES = Features({
     "target_bbox_w": Value("int64"),
     "target_bbox_h": Value("int64"),
     "done_gt": Value("int8"),
+    "env_done_frame": Value("int64"),
     "action_dx": Value("float32"),
     "action_dy": Value("float32"),
     "action_click": Value("int8"),
@@ -43,6 +43,12 @@ FEATURES = Features({
 
 def generate_all(n_episodes: int, out_dir: Path, shard_size: int = 500) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    existing = list(out_dir.glob("shard_*.parquet"))
+    if existing:
+        raise RuntimeError(
+            f"{out_dir} already contains {len(existing)} shard(s). "
+            f"Delete them before re-running, or pass a different --out-dir."
+        )
     shard_rows: list[dict] = []
     shard_idx = 0
     t0 = time.time()

@@ -7,8 +7,7 @@ uses no-op actions.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
-from typing import Iterator
+import warnings
 
 import numpy as np
 from PIL import Image
@@ -75,7 +74,8 @@ def generate_one_episode(
     expert = LClickExpert(expert_cfg, cursor_xy, target_center)
 
     rows: list[dict] = []
-    done_frame = None
+    done_frame: int | None = None
+    env_done_frame: int | None = None
 
     # Drive expert until done, padding with no-ops up to max_frames
     frame_idx = 0
@@ -107,7 +107,30 @@ def generate_one_episode(
         row.update(_proprio_to_row(obs["proprio"]))
         rows.append(row)
         obs, env_done, info = env.step(action)
-        # Sanity: env.done should align with expert-done within a 2-frame window
+        if env_done and env_done_frame is None:
+            env_done_frame = frame_idx
         frame_idx += 1
+
+    # Drift check: compare env-reported done vs expert-reported done.
+    # Expected offset is 1 frame (env.step flips done_flag on the release
+    # frame, but the row for that frame was already appended above).
+    if env_done_frame is None:
+        warnings.warn(
+            f"episode_id={episode_id} seed={seed}: env never signalled success "
+            f"(expert done_frame={done_frame}); possible label noise.",
+            stacklevel=2,
+        )
+    elif done_frame is not None and abs(env_done_frame - done_frame) > 2:
+        warnings.warn(
+            f"episode_id={episode_id} seed={seed}: env_done_frame={env_done_frame} "
+            f"drifts from expert done_frame={done_frame} by "
+            f"{abs(env_done_frame - done_frame)} frames; possible label noise.",
+            stacklevel=2,
+        )
+
+    # Episode-level metadata stamped onto every row (-1 sentinel for "env never signalled")
+    env_done_sentinel = env_done_frame if env_done_frame is not None else -1
+    for row in rows:
+        row["env_done_frame"] = int(env_done_sentinel)
 
     return rows
