@@ -1,17 +1,17 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.13,<3.14"
 # dependencies = [
-#   "torch",
-#   "torchvision",
-#   "transformers",
-#   "datasets",
-#   "peft",
+#   "torch>=2.6,<2.11",
+#   "torchvision>=0.21,<0.22",
+#   "transformers>=4.50",
+#   "datasets>=3.0",
+#   "peft>=0.10",
 #   "accelerate",
-#   "pygame",
+#   "pygame-ce>=2.5",
 #   "wandb",
-#   "huggingface_hub",
+#   "huggingface_hub>=0.30",
 #   "pillow",
-#   "numpy",
+#   "numpy>=2.0",
 # ]
 # ///
 """HF Jobs training entrypoint for Experiment 6 Phase A.
@@ -27,13 +27,19 @@ import sys
 
 
 def main() -> None:
-    # Clone repo
     repo_url = os.environ.get("CU_VLA_REPO_URL", "https://github.com/PenTest-duck/CU-VLA.git")
-    subprocess.run(["git", "clone", "--depth", "1", repo_url, "/workspace/CU-VLA"], check=True)
-    os.chdir("/workspace/CU-VLA")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-e", "."], check=True)
-    # Forward all args to the training script
-    subprocess.run([sys.executable, "-m", "experiments.action_primitives.train", *sys.argv[1:]], check=True)
+    workdir = "/workspace/CU-VLA"
+    subprocess.run(["git", "clone", "--depth", "1", repo_url, workdir], check=True)
+    os.chdir(workdir)
+    # No `pip install -e .` — the UV-managed env in HF Jobs lacks pip and all
+    # project deps are declared in this script's header. cwd + sys.path lets
+    # the `experiments.action_primitives.*` package import without install.
+    sys.path.insert(0, workdir)
+    result = subprocess.run(
+        [sys.executable, "-m", "experiments.action_primitives.train", *sys.argv[1:]],
+        cwd=workdir,
+    )
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":
