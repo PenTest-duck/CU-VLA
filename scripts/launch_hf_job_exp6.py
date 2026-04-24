@@ -37,6 +37,10 @@ def main() -> None:
     token = get_token()
     if token:
         secrets["HF_TOKEN"] = token
+    # Forward WANDB_API_KEY so wandb.init inside the Job can authenticate.
+    # If unset, user can pass `--wandb-mode disabled` in the train args.
+    if "WANDB_API_KEY" in os.environ:
+        secrets["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
     kwargs = {}
     if args.namespace:
