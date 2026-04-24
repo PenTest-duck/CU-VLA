@@ -1,0 +1,67 @@
+"""Full ACT model for Experiment 6 Phase A.
+
+Wires SigLIP2 naflex vision+text, proprio encoder, action-history encoder,
+trunk, and output heads per the Q15 wiring spec.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+
+from experiments.action_primitives.backbones import SigLIP2Naflex
+from experiments.action_primitives.config import MODEL
+from experiments.action_primitives.heads import ActionHeads
+from experiments.action_primitives.history import HISTORY_INPUT_DIM, HistoryEncoder
+from experiments.action_primitives.proprio import ProprioEncoder
+from experiments.action_primitives.trunk import Trunk
+
+
+@dataclass
+class ACTOutput:
+    head_logits: dict[str, torch.Tensor]  # {head_name: (B, n_logits)}
+
+
+class ActionPrimitivesACT(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = SigLIP2Naflex()
+        self.proprio_enc = ProprioEncoder()
+        self.history_enc = HistoryEncoder()
+        self.trunk = Trunk()
+        self.heads = ActionHeads()
+
+    def forward(
+        self,
+        images: list,                    # list of PIL.Image, len B
+        text_tokens: torch.Tensor,       # (B, T_text, d) — precomputed & cached
+        text_mask: torch.Tensor,         # (B, T_text) — 1=real, 0=pad
+        proprio: torch.Tensor,           # (B, PROPRIO_DIM)
+        action_history: torch.Tensor,    # (B, K, HISTORY_INPUT_DIM)
+    ) -> ACTOutput:
+        # 1. Vision encoder (trainable via LoRA)
+        vis = self.backbone.encode_image(images)
+        # 2. Text tokens (frozen, passed in as cached argument)
+        # 3. Proprio → single token
+        proprio_tok = self.proprio_enc(proprio)             # (B, 1, d)
+        # 4. Action history → K tokens
+        history_toks = self.history_enc(action_history)     # (B, K, d)
+        # 5. Concat K/V pool: vision + text + proprio + history
+        kv = torch.cat([vis.patch_embeds, text_tokens, proprio_tok, history_toks], dim=1)
+        # Build key-padding mask (True == pad; torch convention)
+        vis_pad = ~vis.attention_mask.bool()
+        text_pad = ~text_mask.bool()
+        proprio_pad = torch.zeros(proprio.size(0), 1, dtype=torch.bool, device=kv.device)
+        history_pad = torch.zeros(proprio.size(0), history_toks.size(1), dtype=torch.bool, device=kv.device)
+        kv_mask = torch.cat([vis_pad, text_pad, proprio_pad, history_pad], dim=1)
+        # 6. Trunk: queries cross/self-attend
+        query_out = self.trunk(kv, kv_key_padding_mask=kv_mask)
+        # 7. Heads
+        head_logits = self.heads(query_out)
+        return ACTOutput(head_logits=head_logits)
+
+    def trainable_parameters_summary(self) -> str:
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return f"total={total / 1e6:.1f}M  trainable={trainable / 1e6:.1f}M"
