@@ -313,5 +313,49 @@ def filter_eval_split(df, slice_name: str):
         raise ValueError(f"Unknown slice_name: {slice_name!r}. Valid: phase_a_holdout, multi_btn_generic, multi_btn_composite, scenario_recovery, adversarial")
 
 
+def classify_adversarial_tier(scene, target_id, used_attrs):
+    """Identify which attribute is ambiguous (forcing the composite).
+
+    Returns:
+        "color-ambiguous": single-attr instruction, used_attrs is exactly the one that
+            disambiguates while another attribute (color/shape/size/position) is shared
+        "shape-ambiguous", "size-ambiguous", "position-ambiguous": likewise
+        "2-attr-needed": used_attrs has length 2 (composite)
+        "3-attr-needed": used_attrs has length 3 (full composite)
+        "single-unique": single-attr but no other attr shared (no ambiguity to flag)
+    """
+    target = scene.buttons[target_id]
+    ambiguous_attrs: list[str] = []
+    for attr in ("color", "shape", "size", "position"):
+        target_val = _attr_value_for_classify(target, attr)
+        for j, other in enumerate(scene.buttons):
+            if j == target_id:
+                continue
+            if _attr_value_for_classify(other, attr) == target_val:
+                ambiguous_attrs.append(attr)
+                break
+    if len(used_attrs) >= 3:
+        return "3-attr-needed"
+    if len(used_attrs) == 2:
+        return "2-attr-needed"
+    # used_attrs == 1 (single-attr instruction)
+    if len(ambiguous_attrs) == 0:
+        return "single-unique"
+    # Pick the first ambiguous attr name as the tier label.
+    return f"{ambiguous_attrs[0]}-ambiguous"
+
+
+def _attr_value_for_classify(b, attr):
+    if attr == "position":
+        return b.pos_zone
+    if attr == "color":
+        return b.color
+    if attr == "shape":
+        return b.shape
+    if attr == "size":
+        return b.size
+    raise ValueError(f"Unknown attribute: {attr}")
+
+
 if __name__ == "__main__":
     main()
