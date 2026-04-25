@@ -1,0 +1,3 @@
+# SageMaker container requirements — installed by SourceCode at job start.
+# Populated by Task 5 (sm_job_train.py entrypoint task). For now this file
+# is a placeholder so Pydantic validation in sagemaker_trainer.py passes.
