@@ -167,3 +167,33 @@ def generate_instruction(scene: Scene, rng: np.random.Generator) -> InstructionR
         used_attrs=used_attrs,
         composite_tier=chosen_tier,
     )
+
+
+TYPO_RATE: float = 0.04  # 4% of instructions get a typo
+
+
+def inject_typo(s: str, rng: np.random.Generator, n_changes: int = 1) -> str:
+    """Inject n_changes character-level perturbations: swap/drop/insert."""
+    if n_changes == 0 or len(s) < 2:
+        return s
+    chars = list(s)
+    for _ in range(n_changes):
+        if len(chars) < 2:
+            break
+        op = rng.integers(0, 3)  # 0=swap, 1=drop, 2=insert
+        idx = int(rng.integers(0, len(chars)))
+        if op == 0 and idx + 1 < len(chars):
+            chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
+        elif op == 1:
+            del chars[idx]
+        else:  # insert
+            insert_char = chr(int(rng.integers(ord("a"), ord("z") + 1)))
+            chars.insert(idx, insert_char)
+    return "".join(chars)
+
+
+def maybe_typo(s: str, rng: np.random.Generator, rate: float = TYPO_RATE) -> str:
+    """With probability `rate`, inject a typo; else return s unchanged."""
+    if rng.random() < rate:
+        return inject_typo(s, rng=rng, n_changes=1)
+    return s

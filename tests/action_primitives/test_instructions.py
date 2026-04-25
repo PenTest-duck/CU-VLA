@@ -78,3 +78,22 @@ def _get_attr(b: Button, a: str):
     if a == "size": return b.size
     if a == "position": return b.pos_zone
     raise ValueError(a)
+
+
+from experiments.action_primitives.instructions import inject_typo
+
+
+def test_inject_typo_changes_string():
+    rng = np.random.default_rng(0)
+    s = "click the red button"
+    out = inject_typo(s, rng=rng)
+    assert out != s  # at least one char changed
+    assert len(out) >= len(s) - 1  # bounded growth/shrinkage
+
+
+def test_inject_typo_idempotent_at_zero_rate():
+    """Calling with no perturbation should be a no-op."""
+    rng = np.random.default_rng(0)
+    s = "click the red button"
+    out = inject_typo(s, rng=rng, n_changes=0)
+    assert out == s
