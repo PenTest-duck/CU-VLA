@@ -18,6 +18,8 @@ dependencies = [
     "pytest>=9.0.3",
     "peft>=0.10",
     "wandb>=0.18",
+    "boto3>=1.35",        # NEW: AWS SDK for sm_jobs CLI + entrypoint Parameter Store reads
+    "sagemaker>=2.230",   # NEW: SageMaker Python SDK for launcher
 ]
 
 [tool.pytest.ini_options]
