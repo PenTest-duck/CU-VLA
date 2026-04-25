@@ -1,5 +1,11 @@
+"""Tests for scene primitives (Phase B0)."""
 import pytest
-from experiments.action_primitives.scene import Button, DecorativeShape
+import numpy as np
+
+from experiments.action_primitives.scene import (
+    Button, DecorativeShape, Scene, generate_scene,
+)
+from experiments.action_primitives.config import ENV
 
 
 def test_button_has_attributes():
@@ -22,10 +28,6 @@ def test_decorative_shape_is_not_clickable():
     assert d.is_clickable is False
 
 
-import numpy as np
-from experiments.action_primitives.scene import generate_scene, Scene
-
-
 def test_generate_scene_basic():
     rng = np.random.default_rng(42)
     scene = generate_scene(rng=rng)
@@ -36,7 +38,6 @@ def test_generate_scene_basic():
     ids = [b.button_id for b in scene.buttons]
     assert len(ids) == len(set(ids))
     # All buttons fit on canvas
-    from experiments.action_primitives.config import ENV
     for b in scene.buttons:
         assert b.x >= 0 and b.y >= 0
         assert b.x + b.w <= ENV.canvas_w
@@ -74,3 +75,45 @@ def test_button_rejects_out_of_bounds_pos_zone():
     with pytest.raises(ValueError, match="pos_zone"):
         Button(button_id=0, color="red", shape="circle", size="medium",
                pos_zone=(5, 5), x=100, y=100, w=80, h=60)
+
+
+def test_generate_scene_square_buttons_have_equal_wh():
+    """All square buttons must have w == h (enforced by generator + Button validator)."""
+    rng = np.random.default_rng(0)
+    n_squares_seen = 0
+    for _ in range(50):
+        scene = generate_scene(rng=rng)
+        for b in scene.buttons:
+            if b.shape == "square":
+                assert b.w == b.h, f"square button has w={b.w}, h={b.h}"
+                n_squares_seen += 1
+    assert n_squares_seen > 0, "test sample didn't include any squares (sample more)"
+
+
+def test_button_rejects_square_with_non_equal_wh():
+    with pytest.raises(ValueError, match="square"):
+        Button(button_id=0, color="red", shape="square", size="medium",
+               pos_zone=(1, 1), x=100, y=100, w=80, h=60)
+
+
+def test_decorations_do_not_overlap_buttons():
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        scene = generate_scene(rng=rng)
+        for d in scene.decorative_shapes:
+            for b in scene.buttons:
+                # AABB overlap test — must NOT overlap
+                overlaps = (d.x < b.x + b.w and d.x + d.w > b.x and
+                            d.y < b.y + b.h and d.y + d.h > b.y)
+                assert not overlaps, (
+                    f"decoration ({d.x},{d.y},{d.w}x{d.h}) overlaps "
+                    f"button {b.button_id} ({b.x},{b.y},{b.w}x{b.h})"
+                )
+
+
+def test_generate_scene_rejects_invalid_n_buttons():
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="n_buttons"):
+        generate_scene(rng=rng, n_buttons=0)
+    with pytest.raises(ValueError, match="n_buttons"):
+        generate_scene(rng=rng, n_buttons=10)  # >9 (3x3 grid)
