@@ -172,3 +172,49 @@ def generate_scene(
         decorative_shapes=tuple(decorative_shapes),
         bg_color=bg_color,
     )
+
+
+ATTRIBUTE_KEYS: tuple[str, ...] = ("color", "shape", "size", "position")
+
+
+def _attr_value(b: Button, attr: str) -> str | tuple[int, int]:
+    if attr == "color": return b.color
+    if attr == "shape": return b.shape
+    if attr == "size":  return b.size
+    if attr == "position": return b.pos_zone
+    raise ValueError(f"unknown attribute {attr}")
+
+
+def compute_disambiguators(scene: Scene) -> list[set[str]]:
+    """For each button, return the set of single attributes that uniquely identify it.
+
+    Empty set means no single attribute is sufficient (adversarial w.r.t. that button).
+    """
+    out: list[set[str]] = []
+    for i, b in enumerate(scene.buttons):
+        unique_attrs: set[str] = set()
+        for attr in ATTRIBUTE_KEYS:
+            val = _attr_value(b, attr)
+            if all(_attr_value(other, attr) != val for j, other in enumerate(scene.buttons) if j != i):
+                unique_attrs.add(attr)
+        out.append(unique_attrs)
+    return out
+
+
+NON_POSITION_ATTRIBUTES: tuple[str, ...] = ("color", "shape", "size")
+
+
+def is_adversarial(scene: Scene) -> bool:
+    """A scene is adversarial if NO button has any non-position single-attribute disambiguator.
+
+    Position is excluded because `generate_scene` enforces distinct zones — position
+    trivially disambiguates and would make adversarial scenes vanishingly rare. We
+    care about scenes where the categorical (non-spatial) attributes alone don't
+    suffice — those are the ones that exercise compositional V+L grounding.
+    """
+    if len(scene.buttons) <= 1:
+        return False
+    dis = compute_disambiguators(scene)
+    # Each button's disambiguator set; restrict to non-position attributes.
+    non_pos_dis = [d & set(NON_POSITION_ATTRIBUTES) for d in dis]
+    return any(len(d) == 0 for d in non_pos_dis)

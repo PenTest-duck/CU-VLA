@@ -3,7 +3,7 @@ import pytest
 import numpy as np
 
 from experiments.action_primitives.scene import (
-    Button, DecorativeShape, Scene, generate_scene,
+    Button, DecorativeShape, Scene, compute_disambiguators, generate_scene, is_adversarial,
 )
 from experiments.action_primitives.config import ENV
 
@@ -117,3 +117,86 @@ def test_generate_scene_rejects_invalid_n_buttons():
         generate_scene(rng=rng, n_buttons=0)
     with pytest.raises(ValueError, match="n_buttons"):
         generate_scene(rng=rng, n_buttons=10)  # >9 (3x3 grid)
+
+
+def test_compute_disambiguators_single_button():
+    rng = np.random.default_rng(0)
+    scene = generate_scene(rng=rng, n_buttons=1)
+    dis = compute_disambiguators(scene)
+    # 1-button scene: any attribute trivially disambiguates
+    assert len(dis) == 1
+    assert "color" in dis[0] and "shape" in dis[0]
+
+
+def test_is_adversarial_two_same_color_diff_shape():
+    """Two red buttons differing in shape — not adversarial (shape disambiguates)."""
+    scene = Scene(
+        buttons=(
+            Button(0, "red", "circle", "medium", (0, 0), 10, 10, 60, 60),
+            Button(1, "red", "square", "medium", (1, 0), 100, 10, 60, 60),
+        ),
+        decorative_shapes=(),
+        bg_color=(245, 245, 248),
+    )
+    assert is_adversarial(scene) is False
+
+
+def test_is_adversarial_all_unique_on_some_attribute():
+    """Three buttons each with a unique color — not adversarial."""
+    scene = Scene(
+        buttons=(
+            Button(0, "red", "circle", "medium", (0, 0), 10, 10, 60, 60),
+            Button(1, "blue", "circle", "medium", (1, 0), 100, 10, 60, 60),
+            Button(2, "green", "circle", "medium", (2, 0), 200, 10, 60, 60),
+        ),
+        decorative_shapes=(),
+        bg_color=(245, 245, 248),
+    )
+    # Each button has unique color → single-attribute disambiguates → not adversarial.
+    assert is_adversarial(scene) is False
+
+
+def test_is_adversarial_color_and_shape_shared():
+    """Two red circles differing only in size+position — color and shape are
+    shared (each ambiguous), so categorical disambiguation requires composite.
+    Adversarial = True under the non-position definition.
+    """
+    scene = Scene(
+        buttons=(
+            Button(0, "red", "circle", "small", (0, 0), 10, 10, 40, 40),
+            Button(1, "red", "circle", "large", (1, 0), 100, 10, 100, 100),
+        ),
+        decorative_shapes=(),
+        bg_color=(245, 245, 248),
+    )
+    # Size DOES disambiguate (small vs large), so each button has a non-position
+    # single-attr disambiguator → not adversarial under the new definition.
+    assert is_adversarial(scene) is False
+
+
+def test_is_adversarial_all_categorical_shared():
+    """Two buttons sharing color, shape, AND size — only position differs.
+    Adversarial under the non-position definition.
+    """
+    scene = Scene(
+        buttons=(
+            Button(0, "red", "circle", "small", (0, 0), 10, 10, 40, 40),
+            Button(1, "red", "circle", "small", (1, 0), 100, 10, 40, 40),
+        ),
+        decorative_shapes=(),
+        bg_color=(245, 245, 248),
+    )
+    # color/shape/size all shared → no non-position disambiguator → adversarial.
+    assert is_adversarial(scene) is True
+
+
+def test_is_adversarial_returns_false_for_single_button():
+    """Trivial 1-button scene is never adversarial."""
+    scene = Scene(
+        buttons=(
+            Button(0, "red", "circle", "small", (0, 0), 10, 10, 40, 40),
+        ),
+        decorative_shapes=(),
+        bg_color=(245, 245, 248),
+    )
+    assert is_adversarial(scene) is False
