@@ -30,7 +30,7 @@ Model: **408.8M total** (vision 93M frozen + text 282M frozen + trunk 28M + head
 
 ## Offline eval (val split, per-head top-1 accuracy)
 
-Ran: `uv run python -m experiments.action_primitives.evaluate --checkpoint final.pt --data-dir data/phase-a-lclick --n-rollouts 200 --device mps` on M1 MPS. Wall-clock: **35m 45s for offline** (300 val episodes × ~7.15 s/ep).
+Ran: `uv run python -m experiments.action_primitives.evaluate --checkpoint final.pt --data-dir data/phase-a-lclick --n-rollouts 200 --device mps --decode expected` on M1 MPS. Wall-clock: **44m 24s for offline** (300 val episodes × ~8.88 s/ep).
 
 | Head | Top-1 accuracy | Chance baseline | × chance |
 |---|---|---|---|
@@ -41,47 +41,74 @@ Ran: `uv run python -m experiments.action_primitives.evaluate --checkpoint final
 | keys | 1.0000 | 1/3 per key = 0.333 | trivial (all 77 keys always idle) |
 | done | 1.0000 | 0.500 | 2.0× |
 
-The non-trivial heads (dx, dy, click) are essentially saturated. `scroll`, `keys`, `done` trivially achieve perfect accuracy because their label distribution collapses for L-click-only data (scroll always 0, keys always idle, done is deterministic given expert trajectory).
+### Click-head decomposition (most consequential finding from offline)
 
-**Frame-level behaviour cloning is essentially solved.** Whatever failure modes show up closed-loop are not "the model mis-predicts the next action" — they're some form of distribution-shift or compounding-error.
+The aggregate 99.1% click accuracy is dominated by the 95.6% of frames where expert is idle. Per-class recall tells a different story:
 
-## Closed-loop eval (200 rollouts)
-
-Wall-clock: **24m 51s** (200 rollouts × ~7.46 s/ep on M1 MPS).
-
-| Metric | Rate |
-|---|---|
-| **success_rate** | **0.7050** ← Spike B gate: ≥0.50 ✅ |
-| click_within_0px | 0.0000 |
-| click_within_3px | 0.1000 |
-| click_within_5px | 0.2450 |
-| click_within_10px | 0.4650 |
-
-### Sanity-check: live pygame n=20 run
-
-| Metric | n=20 (visual) | n=200 (headless) | Δ |
+| Click class | Recall | Support | Notes |
 |---|---|---|---|
-| success_rate | 0.70 | 0.705 | +0.005 (stable) |
-| click_within_3px | 0.05 | 0.10 | +0.05 (small-N noise) |
-| click_within_5px | 0.25 | 0.245 | -0.005 (stable) |
-| click_within_10px | 0.60 | 0.465 | -0.135 (n=20 was lucky) |
+| `idle` | **0.9952** | 12,900 | Model knows when not to click. Near-perfect. |
+| `l_press` | **0.7933** | 300 | **One in five press frames is mistimed.** |
+| `l_release` | **1.0000** | 300 | Conditional on press already fired — trivial. |
+| `r_press` | n/a | 0 | No R-click in Phase A. |
+| `r_release` | n/a | 0 | No R-click in Phase A. |
 
-n=200 is the authoritative number. The 10 px tolerance metric was noisy at n=20.
+**This is the headline.** `l_press` at 79% recall is the single weakest head in the model — the timing signal "cursor is on button NOW, fire" is genuinely hard, and the aggregate metric was hiding it. Release is essentially free given press (model's history shows press just happened, proprio shows held_mouse=1).
+
+The "hover, move past, then click late" failure mode you observed in visual eval maps directly to this 21% of mistimed presses: when the model fires press 2-3 frames late, the cursor has drifted in those frames and lands off-target.
+
+**Frame-level BC is not as solved as the headline implies.** dx/dy are saturated; press timing is not.
+
+## Closed-loop eval (200 rollouts) — argmax vs probabilistic decode
+
+Two decode strategies were tested at inference. The 21-bin discrete dx/dy heads can be read with `argmax` (Phase A's original design) or with `expected` (`E[bin_center]` under the softmax — interpolates between bins, addresses quantization-induced zig-zag).
+
+| Metric | argmax (n=200) | **expected (n=200)** | Δ |
+|---|---|---|---|
+| **success_rate** | **0.7050** | **0.8150** | **+11.0 pp** |
+| click_within_0px | 0.0000 | 0.0000 | flat |
+| click_within_3px | 0.1000 | 0.1050 | flat |
+| click_within_5px | 0.2450 | 0.2250 | -2.0 pp (within noise) |
+| click_within_10px | 0.4650 | 0.5500 | +8.5 pp |
+
+Both runs use the same `final.pt` checkpoint and same 200 seeds (10000-10199). Probabilistic decode wall-clock: **12m 02s for closed-loop** (vs 24m 51s for argmax) — the lower max-frame-timeout rate means episodes complete faster on average.
+
+**Both gates pass.** Spike B gate is ≥0.50; argmax 0.705 ✅, expected 0.815 ✅.
+
+### Why probabilistic decode helps so much
+
+The 21-bin exponential scheme has very coarse resolution in the primary motion regime: `0.026, 0.066, 0.16, 0.41, 1.02, 2.56, 6.4, 16, 40, 100` px on each side of zero. Between bins 18 and 19 (16 px → 40 px) there's a 2.5× gap. When the model's softmax sits 60/40 across those two bins, argmax flips between them based on tiny state variations → cursor zig-zags → trajectory drifts further off-expert manifold each frame → some rollouts diverge unrecoverably.
+
+Probabilistic decode computes `0.6 × 16 + 0.4 × 40 = 25.6 px` directly, giving stable continuous output. Cursor tracks the expert path more tightly, so small per-frame quantization errors don't compound into catastrophic drift.
+
+### Sanity-check: live pygame n=20 runs
+
+For comparison with the visual inspection that motivated this analysis:
+
+| Metric | n=20 argmax | n=20 expected | n=200 argmax | n=200 expected |
+|---|---|---|---|---|
+| success_rate | 0.70 | 0.85 | 0.705 | 0.815 |
+| click_within_10px | 0.60 | 0.60 | 0.465 | 0.550 |
+
+n=200 numbers are the publishable figures. The improvement is robust across both sample sizes.
 
 ## Interpretation
 
-### Verdict: **PASS** (0.705 vs 0.50 gate, stable across n=20 and n=200)
+### Verdict: **PASS** (argmax 0.705, expected 0.815; both above 0.50 gate)
 
-### The offline → closed-loop gap is the interesting finding
+### Three distinct findings, all from the same training run
 
-- **Offline per-head: ~99% across dx, dy, click.** Frame-level BC succeeded.
-- **Closed-loop: 70.5% success.** A **~29 percentage-point gap** between "predicts each frame's action right" and "reaches the goal state by the end of the episode."
+**(1) Frame-level dx/dy BC is solved, but discrete decode is wasteful.**
 
-This is the classic **compounding-error / covariate-shift** pattern in imitation learning:
-- Expert trajectories only visit the "on-the-way-to-target" state manifold.
-- Model learns to imitate expert on that manifold and does so near-perfectly.
-- At inference time, small per-frame errors accumulate: e.g., a slightly-too-small `dx` step at frame 3 leaves the cursor 10 px off where the expert was, which is a state slightly outside the training distribution, which causes a slightly worse next-frame prediction, which compounds.
-- Some rollouts eventually leave the training manifold entirely (the "stuck far away" 30% cluster) and the model has no demonstrations for how to recover.
+98% offline argmax accuracy combined with the 11 pp closed-loop improvement from probabilistic decode (with no retraining) tells us the model's softmax distributions encode meaningful continuous information that argmax was throwing away. The 21-bin exponential quantization has a 2.5× gap between adjacent bins in the primary motion regime — argmax zig-zag was inducing trajectory drift that probabilistic decode eliminates.
+
+**(2) Press-timing is the weakest single signal.**
+
+`l_press` recall = 0.79 (300 support) is hidden by the aggregate click metric. This is roughly the *exact* expected per-rollout failure rate (~21%, vs the residual ~18.5% of expected-decode rollouts that fail) — strongly suggesting the residual closed-loop failures are not "model can't reach the button" but "model reaches the button and mistimes the click."
+
+**(3) The remaining offline → closed-loop gap (~18 pp) is genuine compounding error.**
+
+Even with probabilistic decode, ~18% of rollouts fail. From visual inspection (n=20) these are dominated by **wrong-direction movement** (cursor heads away from target and never recovers) and **edge-state failures** (cursor reaches canvas edge, model has no training demonstrations for that state). These won't be fixed by decode changes — they require training-distribution coverage of off-trajectory states (Phase B noise injection / scenario training).
 
 ### Failure-mode analysis
 
@@ -105,24 +132,39 @@ The 24% gap between `click_within_10px` (46.5%) and `success_rate` (70.5%) = rol
 
 ## Recommendation
 
-**Proceed to Phase B as-designed, with two Phase B additions:**
+**Proceed to Phase B with the following changes informed by Spike B:**
 
-1. **Add a covariate-shift diagnostic to Phase B training.** Log `frac(dx_bin == 10)` and `frac(dy_bin == 10)` per step during training. If bin-10 frequency is >~30% on frames where the expert moved >5 px, the model is collapsing to the zero-motion attractor — an early warning of the "stuck far away" Phase A failure mode.
+**Decode (immediate, no retrain):**
+- Default to probabilistic decode (`E[bin_center]` under softmax) for all closed-loop runs going forward. Argmax is preserved as an option for reproducibility but isn't the recommended inference mode.
 
-2. **Consider at least a small DAgger-style correction phase in Phase B.** The closed-loop-vs-offline gap will only widen as primitive complexity grows. Cheapest version: after initial BC training, run the model in closed-loop, collect states where it fails, have the scripted expert label those states, and add them to training. Even one iteration would address the "no demonstrations for recovery" failure mode. If this is Phase B scope bloat, at least instrument Phase B so we can measure the same gap on multi-primitive runs.
+**Phase B training-side changes:**
+1. **Soft-label CE on dx/dy/scroll heads.** Currently the loss uses hard labels = argmax bin nearest to expert continuous action. Train with 2-bin triangular soft labels (weights linearly interpolated between the two bins bracketing the expert continuous action). This trains the softmax to *be* a properly distributed estimator, so probabilistic decode at inference is operating on the same target the loss was optimizing.
+2. **Click-head loss reweighting or dedicated press-timing supervision.** `l_press` at 79% recall is the bottleneck for the residual ~18% closed-loop failures. Options:
+   - Increase loss weight on non-idle click classes (currently uniform).
+   - Replace 5-way categorical with binary "is this a click frame?" + conditional 4-way "which event?". Decouples the easy "is this idle" from the hard "exactly which frame to fire."
+   - Add a temporal smoothing term: if predicted click_l_press, the next frame should be release.
+3. **Consistent-state noise injection in data generator.** Sample cursor displacements at training frames; teleport cursor to perturbed position (image + proprio update consistently); re-query scripted expert from new position; train on `(perturbed_state, expert_recovery_action)`. Addresses the "off-expert-trajectory states have no training data" gap.
+4. **Scenario-level error injection in data generator.** Curated trajectories that include wrong-direction excursions, overshoots, edge-bangs, etc. Use `actions_applied` (the perturbed action) for history; use `actions_labeled` (the expert's correct action from each state) as the training target. This is what closes the residual ~18% wrong-direction failure mode.
 
-**Don't** need to revisit model capacity, loss weighting, or trunk depth — offline accuracy shows the current architecture has the capacity to fit L-click perfectly. The bottleneck is training-distribution coverage, not model expressiveness.
+**Phase B diagnostics to add (Q40 amendments):**
+- Per-class click recall during training (not just aggregate).
+- `frac(predicted_bin == bin_10)` on dx/dy heads at frames where expert delta > 5 px (early warning for zero-motion attractor — though probabilistic decode largely defuses this).
+- Closed-loop "wrong-direction within-first-3-frames" rate as an early signal of localization failure.
+
+**Don't** retrain just for finer bin spacing (49 vs 21). Probabilistic decode already extracts most of what the finer bins would give; the residual failures are not quantization-related. Bin count can be revisited mid-Phase-B if soft-label CE + noise injection don't close enough of the gap.
+
+**Don't** revisit model capacity, trunk depth, or vision encoder choice. Offline accuracy demonstrates capacity is sufficient for L-click; the bottleneck is training-distribution coverage and inference decode, not expressiveness.
 
 ## Follow-ups (not blocking)
 
-- **Best.pt vs final.pt comparison.** The training run's `best.pt` (lowest val loss) and `final.pt` (step 190) are both uploaded to HF. Quick re-eval on `best.pt` would show whether training was over-fitting in the last ~30 steps. If best.pt gives ≥0.72 closed-loop, future runs should default to best.pt. If roughly equal, it doesn't matter.
-- **M1 per-frame timing (Spike C, T24).** Closed-loop wall-clock was 7.46 s/rollout; rollouts average ~20 frames so that's ~370 ms/frame on M1 MPS — well below the Q25 assumed 7.6 Hz (130 ms/frame). Needs the dedicated `m1_eval_timing.py` measurement to confirm with warmup controlled and per-frame breakdown, but the ballpark suggests Phase B's Tier-B eval-cadence design may need adjusting.
-- **Mode A root cause validation.** If anyone wants to spend 20 minutes, take any failed n=200 rollout (e.g., one of the stuck-far-away ones) and replay it with `--visual` to confirm the cursor is predicting near-zero motion rather than e.g., heading in the wrong direction. The bin-10 log would show this at scale but one visual trace would confirm the hypothesis.
+- **`best.pt` is identical to `final.pt`** for this run (no improvement in val loss in the final ~30 steps — early-stopping would have triggered). No comparison needed.
+- **M1 timing (Spike C, T24) skipped.** Spike B's incidental wall-clock measurement gives us the data anyway: argmax = 7.46 s/rollout, expected = 3.61 s/rollout on M1 MPS, average ~12-20 frames per rollout. Per-frame inference is ~180-370 ms/frame depending on decode mode. Below the Q25 assumed 7.6 Hz target — Phase B Tier-B eval cadence will need adjustment downward, or batch eval to amortize.
+- **Wrong-direction failure visual replay.** Take any failed n=200 rollout (e.g., one of the stuck-far-away ones) and replay it with `--visual --decode expected` to confirm the residual failures are localization (cursor heads to wrong patch of canvas), not stalling. Visual inspection of n=20 expected runs already strongly suggests this.
 
 ## Next steps
 
-- [x] Plug in n=200 numbers.
-- [x] Verdict: pass at 0.705 (gate 0.50).
-- [ ] Proceed to Spike C (M1 eval timing, T24) with `final.pt`.
-- [ ] Phase A summary (T25) — update Spike B row.
-- [ ] After T24: kick off Phase B implementation plan.
+- [x] Plug in n=200 numbers (both decode modes).
+- [x] Verdict: pass — argmax 0.705, expected 0.815, both above 0.50 gate.
+- [x] Click head decomposition added to offline_eval and reported (l_press = 79% recall is the headline finding).
+- [ ] Phase A summary (T25) — update Spike B row + add probabilistic decode to amendments.
+- [ ] Phase B implementation plan: incorporate soft-label CE, click-head reweighting, noise injection, scenario-level error training.

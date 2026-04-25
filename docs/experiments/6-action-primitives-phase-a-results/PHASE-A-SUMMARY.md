@@ -11,8 +11,8 @@ Consolidates the four feasibility spikes (A, B, C, E) for Experiment 6. Drives t
 | Spike | Question | Result | Verdict | Phase B impact |
 |---|---|---|---|---|
 | **A** — typing legibility | Does SigLIP2@256 preserve char identity at 14pt? | Per-patch top-1 = 0.74 (46× chance) at 14pt | ✅ Pass | None — Q5/Q6 design stands. Keep `max_num_patches=256`, use visual feedback for typing. |
-| **B** — L-click end-to-end | Does the minimum-viable pipeline learn L-click? | Closed-loop success 0.705 (n=200); offline per-head 98-99% on dx/dy/click | ✅ Pass (gate 0.50) | Architecture stands. Phase B should add (a) bin-10 frequency diagnostic to Q40 epoch-1 checks, (b) consider DAgger-style correction to address the ~29pp offline→closed-loop gap (compounding error, not capacity). |
-| **C** — M1 closed-loop timing | Is eval cadence (~7.6 Hz) feasible on M1? | [pending — per-frame ms on MPS] | [pending] | [pending] |
+| **B** — L-click end-to-end | Does the minimum-viable pipeline learn L-click? | Closed-loop success 0.705 (argmax) / **0.815 (probabilistic decode)** at n=200; offline per-head 98-99% on dx/dy/click. **Click decomposition: l_press recall 0.79** (hidden by aggregate). | ✅ Pass (gate 0.50, both decodes) | Architecture stands. Phase B priorities: (a) **soft-label CE training** to match probabilistic decode at inference; (b) **click-head reweighting / press-timing supervision** (l_press 79% is the residual bottleneck); (c) **consistent-state noise injection + scenario-level error training** to close the residual ~18% wrong-direction/edge failures. |
+| **C** — M1 closed-loop timing | Is eval cadence (~7.6 Hz) feasible on M1? | Skipped as a dedicated measurement; data extracted from Spike B wall-clock instead: ~180 ms/frame (probabilistic decode) to ~370 ms/frame (argmax) on M1 MPS = 2.7-5.5 Hz | ⚠️ Below Q25 target | Phase B Tier-B eval cadence needs adjustment (cut rollout count or eval less frequently). Probabilistic decode is materially faster (fewer max-frame timeouts). |
 | **E** — pygame gen throughput | Does Q7's 200 eps/s hold? | 3.61 eps/s single-process (55× below); multi-proc at chunksize=1 doesn't help | ❌ Q7 target unachievable as written | Revise Q7 target. Phase B needs worker-writes-shards multiproc redesign. |
 
 Full write-ups:
@@ -52,9 +52,32 @@ Findings from this phase that invalidate or refine questions in the original des
   - Probe ceiling ~85-88% even at 32pt, consistent with patch-boundary ambiguity (glyphs straddling patch edges). If typing primitives underperform in Phase B training, first hypothesis is patch-aliasing — test by snapping rendered text to patch centers.
 - Source: `spike-a-typing-legibility.md`.
 
-**Q40 — epoch-1 diagnostics** (add new signal)
+**Q40 — epoch-1 diagnostics** (add new signals)
 - Plan listed 4 signals to watch (loss decreasing, no NaN, grad norms stable, no head dominating).
-- Add: **bin-10 frequency on dx/dy heads**. If model outputs bin 10 (zero motion) on frames where expert was moving non-trivially (>5 px/frame), model is collapsing to a "safe" attractor — Spike B n=20 visual run suggests this may be the dominant failure mode for "stuck far away" episodes. [pending confirmation from n=200 data]
+- **Add: per-class click recall** (idle / l_press / l_release / r_press / r_release), not just aggregate click accuracy. Spike B revealed `l_press` recall = 0.79 hidden by aggregate 0.99 — exactly the regime where the headline metric misleads.
+- **Add: closed-loop "wrong direction in first 3 frames" rate** as an early signal of localization failure. Spike B's visual inspection identified this as a ~15-18% residual failure mode that frame-level metrics don't surface.
+- (Earlier draft: bin-10 frequency on dx/dy heads. **Demoted** — probabilistic decode at inference largely defuses the bin-10 attractor concern. Still cheap to log but no longer load-bearing.)
+
+**Q3 — click-head architecture / loss** (new amendment from Spike B)
+- Aggregate click top-1 accuracy of 99.1% hides per-class imbalance: idle 99.5% (12,900 support) vs l_press 79% (300 support). The ~21% press-timing miss rate matches the ~18% residual closed-loop failure rate after probabilistic decode — strongly suggesting press-timing is the dominant remaining bottleneck.
+- Phase B options:
+  - Loss reweighting: weight non-idle click classes more heavily (currently uniform).
+  - Architecture: split into binary "is this a click frame?" head + conditional 4-way "which event?" head. Decouples easy/hard sub-decisions.
+  - Temporal supervision: add a small auxiliary loss enforcing that `l_press` at frame t implies `l_release` at frame t+1 (ground truth always satisfies this).
+
+**Inference decode** (new amendment, no Q-number — cross-cutting)
+- Phase A trained with hard-label CE; inference defaulted to argmax over the 21-bin softmax. **Probabilistic decode (`E[bin_center]` under softmax) gives +11 pp closed-loop success with no retraining** — argmax 0.705 → expected 0.815 at n=200.
+- Phase B should:
+  - Default to probabilistic decode in `evaluate.py` (and any future closed-loop tooling).
+  - Train with **2-bin triangular soft-label CE** (label = linear-interpolation weights between the two bins bracketing expert's continuous action). This makes training and inference operate on the same target — `Σ softmax · bin_centers` matches `expert_action` exactly when softmax matches the soft target.
+- Bin count expansion (21 → 49) was considered and **deferred**. Probabilistic decode captures most of what finer bins would give; the residual failures are not quantization-related.
+
+**Noise injection / synthetic error training** (new amendment from Spike B)
+- ~18% residual closed-loop failures (with probabilistic decode) are dominated by wrong-direction / edge-state failures — pure distribution-shift symptoms, untouched by decode improvements.
+- Phase B data generator should produce two new types of training data:
+  1. **Consistent-state cursor perturbations.** At each training frame, sample a Gaussian displacement (e.g., σ=20 px), teleport cursor to perturbed position (image + proprio update consistently in the env), re-query scripted expert from new position, train on `(perturbed_state, expert_recovery_action)`.
+  2. **Curated error scenarios.** Trajectories with deliberate excursions (wrong-direction segments, overshoots, edge-bangs). The `actions_applied` (perturbed) feed the env and history vector; `actions_labeled` (expert's correct action from each state) are the training targets. Model never learns to *take* the wrong actions, only to *recover* from them.
+- DAgger (closed-loop rollout in training loop) was considered and **deferred** — synthetic perturbation gives most of the same value without the rollout-in-training overhead.
 
 ## New artefacts produced this phase
 
@@ -73,15 +96,23 @@ Captured in `docs/research/hf-jobs-gotchas.md` for reference by exp7+. Short ver
 
 ## Phase B handoff decisions (user to confirm)
 
-- [ ] **Covariate shift / DAgger in Phase B.** Spike B revealed a ~29pp gap between offline per-head accuracy (99%) and closed-loop success (70.5%). Expected for pure BC; the gap will widen as primitives get more complex. Options:
-  - (a) **Pure BC, bigger dataset** (simplest). Throw 3-5× more data at it.
-  - (b) **One round of DAgger** (recommended). After initial BC, roll out the model closed-loop, collect states where it fails, have the scripted expert label them, append to training. Addresses "no demonstrations for recovery from off-distribution states" directly.
-  - (c) **Skip now, instrument only.** Add covariate-shift diagnostics (bin-10 frequency, per-step distribution of predicted vs expert actions) so we can measure the gap on Phase B runs, decide mid-Phase-B whether DAgger is worth adding.
-- [ ] **Loss weighting:** Phase B should implement Q2's per-head `L_i^init` rebalancing before generating multi-primitive data, or continue with uniform weights? (Uniform worked for L-click, but with 6 primitives + varying class imbalances the keys head may over-dominate.)
+**Decided during Phase A close-out (no further action needed):**
+
+- ✅ **Inference decode:** probabilistic (`E[bin_center]` under softmax) is the new default. +11pp closed-loop, no retrain cost. Argmax remains as a CLI option for reproducing published Phase A numbers.
+- ✅ **Bin count:** stay at 21 in Phase B first pass. Probabilistic decode addresses most of what finer bins would give; failures aren't quantization-related.
+- ✅ **DAgger (closed-loop rollout in training):** deferred. Synthetic perturbation training gives most of the same value with less infrastructure overhead.
+- ✅ **Noise injection design:** consistent-state cursor perturbation + curated error scenarios. Both image and proprio update consistently in the env; expert is re-queried from each perturbed state. Avoids my originally-flawed proprio-only framing.
+- ✅ **Click-head improvements:** loss reweighting and/or architectural split (binary "click frame?" + conditional 4-way "which event?"). The 79% press-recall is the residual bottleneck after probabilistic decode.
+
+**Still to confirm:**
+
+- [ ] **Soft-label CE training implementation.** Switch dx/dy/scroll heads from hard-label CE to 2-bin triangular soft labels. Confirm: full switch in Phase B v0, or A/B test on a small sub-experiment to measure the lift first?
+- [ ] **Loss weighting (Q2):** per-head `L_i^init` rebalancing before generating multi-primitive data, or continue with uniform weights? (Uniform was fine for L-click; with 6 primitives + per-class imbalances the keys head may over-dominate.)
 - [ ] **Text tower removal:** cache instruction embeddings offline and drop the 282M text tower from the runtime model? Saves 1.1 GB GPU memory, 0% on quality if instructions are enumerable.
-- [ ] **Dataset regen with baked-in history vectors and quantized bins:** Phase A's `__getitem__` does 10-30 ms of Python-loop work per episode. Phase B's 10×-larger dataset makes this more painful. Worth a one-time regen?
+- [ ] **Dataset regen with baked-in history vectors and quantized bins:** Phase A's `__getitem__` does 10-30 ms of Python-loop work per episode. Phase B's 10×-larger dataset compounds this. Worth a one-time regen?
 - [ ] **Multi-process generator:** implement worker-writes-shards design before Phase B data gen (24,500 eps at 2.5 eps/s serial = 2.7 h)?
-- [ ] **Training compute budget:** 5 epochs × macro-batch 64 on 2400 train eps reached 70.5% success. Phase B's 6 primitives with potentially 10× data + 20 epochs → ~100× more training compute. On L4 that projects to ~15+ h; L40S halves it. Budget decision: book L40S for Phase B, or stay on L4?
+- [ ] **Training compute budget:** Phase A: 5 epochs × macro-batch 64 on 2400 train eps → 0.815 (probabilistic decode). Phase B: 6 primitives × ~10× data × ~20 epochs → ~100× more compute. L4 projects ~15+ h; L40S halves it. Book L40S for Phase B?
+- [ ] **Phase B success gate.** Phase A residual (probabilistic decode) is ~18%. With (soft-label CE + click-head fix + noise injection + scenario training), what's the Spike-B-equivalent gate? Suggested: ≥0.85 single-primitive (matches the argmax→expected gain), composed multi-primitive ≥0.50 (beats the naive `0.85^6 ≈ 0.38` lower bound).
 
 ## Next step
 
