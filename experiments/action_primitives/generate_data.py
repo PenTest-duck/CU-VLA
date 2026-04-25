@@ -1,7 +1,12 @@
-"""Phase A batched episode generator.
+"""Phase A / Phase B0 batched episode generator.
 
-Generates N L-click episodes and writes a HuggingFace `datasets`-compatible
-parquet shard set.
+Phase A: ``generate_all`` writes a HuggingFace ``datasets``-compatible parquet
+shard set for L-click episodes.
+
+Phase B0: ``generate_dataset_multiproc`` is the new worker-writes-shards
+multiproc driver — each worker owns an episode-id range and writes its own
+parquet shards directly to disk, eliminating IPC for episode payloads (the
+bottleneck observed in Phase A's ``Pool.imap`` design).
 """
 from __future__ import annotations
 
@@ -10,10 +15,14 @@ import multiprocessing as mp
 import time
 from pathlib import Path
 
+import pandas as pd
 from datasets import Dataset, Features, Sequence, Value
 
 from experiments.action_primitives.config import PHASE_A_DATA
-from experiments.action_primitives.generator import generate_one_episode
+from experiments.action_primitives.generator import (
+    generate_one_b0_episode,
+    generate_one_episode,
+)
 
 
 FEATURES = Features({
@@ -90,6 +99,89 @@ def generate_all(n_episodes: int, out_dir: Path, shard_size: int = 500, workers:
     print(f"Generated {n_episodes} episodes in {elapsed:.1f}s  ({n_episodes / elapsed:.2f} eps/s)  workers={workers}")
 
 
+# ---------------------------------------------------------------------------
+# Phase B0 worker-writes-shards multiproc generator
+# ---------------------------------------------------------------------------
+
+
+def _flush_shard(buffer: list[dict], output_dir: Path, worker_id: int, shard_idx: int) -> None:
+    df = pd.DataFrame(buffer)
+    out_path = output_dir / f"shard_w{worker_id:02d}_s{shard_idx:04d}.parquet"
+    df.to_parquet(out_path, compression="zstd", index=False)
+
+
+def _worker_run_episodes(
+    worker_id: int,
+    episode_id_start: int,
+    n_episodes_for_worker: int,
+    output_dir: Path,
+    base_seed: int,
+    episodes_per_shard: int,
+) -> tuple[int, int]:
+    """Run a worker that generates n episodes and writes them as parquet shards.
+
+    Each worker initializes its own pygame instance ONCE on first call to
+    ``generate_one_b0_episode`` (which constructs ``LClickEnv``, which
+    initializes pygame). Subsequent episodes reuse the same pygame state.
+
+    Returns ``(worker_id, n_episodes_written)``.
+    """
+    buffer: list[dict] = []
+    shard_idx = 0
+    episodes_in_shard = 0
+    n_done = 0
+    for offset in range(n_episodes_for_worker):
+        episode_id = episode_id_start + offset
+        seed = base_seed + episode_id
+        rows = generate_one_b0_episode(episode_id=episode_id, seed=seed)
+        buffer.extend(rows)
+        episodes_in_shard += 1
+        n_done += 1
+        if episodes_in_shard >= episodes_per_shard:
+            _flush_shard(buffer, output_dir, worker_id, shard_idx)
+            buffer = []
+            episodes_in_shard = 0
+            shard_idx += 1
+    if buffer:
+        _flush_shard(buffer, output_dir, worker_id, shard_idx)
+    return worker_id, n_done
+
+
+def generate_dataset_multiproc(
+    n_episodes: int,
+    output_dir: Path,
+    n_workers: int = 4,
+    seed: int = 0,
+    episodes_per_shard: int = 200,
+) -> None:
+    """Generate ``n_episodes`` B0 episodes via worker-writes-shards multiproc.
+
+    No IPC for episode payloads — each worker writes its own parquet shards.
+    Episode ids are partitioned across workers so there is no overlap.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    eps_per_worker = n_episodes // n_workers
+    remainder = n_episodes % n_workers
+
+    args_list: list[tuple] = []
+    cursor = 0
+    for w in range(n_workers):
+        n_for_w = eps_per_worker + (1 if w < remainder else 0)
+        args_list.append((w, cursor, n_for_w, output_dir, seed, episodes_per_shard))
+        cursor += n_for_w
+
+    if n_workers == 1:
+        # Skip multiprocessing for single-worker case — useful for tests/debug
+        for args in args_list:
+            _worker_run_episodes(*args)
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=n_workers) as pool:
+            results = pool.starmap(_worker_run_episodes, args_list)
+            print(f"Workers completed: {results}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--n-episodes", type=int, default=PHASE_A_DATA.n_episodes)
@@ -108,5 +200,26 @@ def main() -> None:
     generate_all(args.n_episodes, Path(args.out_dir), args.shard_size, args.workers)
 
 
+def _main_b0() -> None:
+    """CLI entry for B0 multiproc generation (worker-writes-shards)."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-n", "--n-episodes", type=int, default=10000)
+    parser.add_argument("-o", "--output-dir", type=Path, default=Path("data/phase-b0-lclick"))
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--episodes-per-shard", type=int, default=200)
+    args = parser.parse_args()
+    print(f"Generating {args.n_episodes} eps with {args.workers} workers → {args.output_dir}")
+    t0 = time.time()
+    generate_dataset_multiproc(
+        n_episodes=args.n_episodes, output_dir=args.output_dir,
+        n_workers=args.workers, seed=args.seed,
+        episodes_per_shard=args.episodes_per_shard,
+    )
+    elapsed = time.time() - t0
+    eps_per_sec = args.n_episodes / elapsed
+    print(f"Done in {elapsed:.1f}s ({eps_per_sec:.1f} eps/s)")
+
+
 if __name__ == "__main__":
-    main()
+    _main_b0()
