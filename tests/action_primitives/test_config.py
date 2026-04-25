@@ -45,10 +45,19 @@ def test_total_logits_matches_design():
 
 def test_b0_attribute_palettes_defined():
     from experiments.action_primitives.config import (
-        B0_COLORS, B0_SHAPES, B0_SIZES, B0_POSITION_GRID,
+        B0_COLORS, B0_SHAPES, B0_SIZES, B0_POSITION_GRID, B0_BG_COLORS,
     )
-    assert len(B0_COLORS) >= 8 and len(B0_COLORS) <= 10
+    assert len(B0_COLORS) == 10
     assert all(isinstance(c, tuple) and len(c) == 3 for c in B0_COLORS.values())
     assert set(B0_SHAPES) >= {"rect", "circle", "triangle", "square", "hexagon"}
     assert set(B0_SIZES) == {"small", "medium", "large"}
+    # Each size value is a (min, max) tuple of ints with min < max
+    for name, value in B0_SIZES.items():
+        assert isinstance(value, tuple) and len(value) == 2, f"B0_SIZES[{name!r}] must be a 2-tuple"
+        assert all(isinstance(v, int) for v in value), f"B0_SIZES[{name!r}] entries must be ints"
+        assert value[0] < value[1], f"B0_SIZES[{name!r}] must have min < max"
     assert B0_POSITION_GRID == (3, 3)
+    # Each background is a 3-tuple of ints in [0, 255]
+    for bg in B0_BG_COLORS:
+        assert isinstance(bg, tuple) and len(bg) == 3
+        assert all(isinstance(c, int) and 0 <= c <= 255 for c in bg)

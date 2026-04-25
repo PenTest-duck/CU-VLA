@@ -154,6 +154,7 @@ B0_COLORS: dict[str, tuple[int, int, int]] = {
     "black":  (30,  30,  30),
 }
 
+# rect: w != h (aspect ratio varies); square: w == h (enforced by generator)
 B0_SHAPES: tuple[str, ...] = ("rect", "circle", "triangle", "square", "hexagon")
 
 B0_SIZES: dict[str, tuple[int, int]] = {
@@ -164,6 +165,7 @@ B0_SIZES: dict[str, tuple[int, int]] = {
 
 B0_POSITION_GRID: tuple[int, int] = (3, 3)  # 3 cols × 3 rows of zones
 
+# 6 pastel canvas backgrounds, sampled per episode
 B0_BG_COLORS: tuple[tuple[int, int, int], ...] = (
     (245, 245, 248),
     (240, 246, 240),
