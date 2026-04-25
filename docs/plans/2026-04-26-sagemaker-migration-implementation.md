@@ -27,7 +27,7 @@
 
 **Files:**
 - Modify: `pyproject.toml` (add `sagemaker` and `boto3` to deps)
-- Create: `requirements-sagemaker.txt` (deps to install in the SageMaker training container, on top of the pre-built PyTorch DLC)
+- Create: `scripts/requirements-sagemaker.txt` (deps to install in the SageMaker training container, on top of the pre-built PyTorch DLC; lives inside `scripts/` because V3's `SourceCode.requirements` validator requires it to be within `source_dir`)
 
 The SageMaker SDK + boto3 are needed locally (for the launcher and `sm_jobs.py` CLI). The training container uses a pre-built AWS DLC that already has torch + torchvision; we install the rest via `requirements.txt` that SageMaker reads automatically.
 
@@ -67,9 +67,11 @@ Run: `cd /Users/pentest-duck/Desktop/CU-VLA && uv run python -c "import sagemake
 
 Expected: prints two version numbers (e.g. `2.234.1 1.35.99`). No `ImportError`.
 
-- [ ] **Step 4: Create `requirements-sagemaker.txt` (deps for the training container)**
+- [ ] **Step 4: Create `scripts/requirements-sagemaker.txt` (deps for the training container)**
 
-Create `requirements-sagemaker.txt` at the repo root:
+Note: V3's `SourceCode.requirements` validator requires the file to live *within* `source_dir`. Since the SageMaker `source_dir` is `scripts/` (set in Task 4), the requirements file lives there too — co-located with the entrypoint.
+
+Create `/Users/pentest-duck/Desktop/CU-VLA/scripts/requirements-sagemaker.txt`:
 
 ```text
 # Deps installed inside the SageMaker training container, on top of the
@@ -92,7 +94,7 @@ huggingface_hub>=0.30
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pyproject.toml uv.lock requirements-sagemaker.txt
+git add pyproject.toml uv.lock scripts/requirements-sagemaker.txt
 git commit -m "deps(sm-migration): add sagemaker + boto3; container requirements"
 ```
 
@@ -605,7 +607,7 @@ def make_trainer(
     source_code = SourceCode(
         source_dir=str(REPO_ROOT / "scripts"),
         entry_script="sm_job_train.py",
-        requirements=str(REPO_ROOT / "requirements-sagemaker.txt"),
+        requirements="requirements-sagemaker.txt",  # relative to source_dir per V3 validator
     )
 
     stopping_condition = StoppingCondition(
@@ -2307,7 +2309,7 @@ Expected: see the chain of migration commits — deps, train.py patch, factory, 
 
 | # | Task | Files |
 |---|------|-------|
-| 1 | Add SDK deps + requirements-sagemaker.txt | `pyproject.toml`, `requirements-sagemaker.txt` |
+| 1 | Add SDK deps + requirements-sagemaker.txt | `pyproject.toml`, `scripts/requirements-sagemaker.txt` |
 | 2 | Submit GPU quota request | (AWS console / CLI only) |
 | 3 | Patch train.py for best_val_loss restore | `experiments/action_primitives/train.py:579`, `tests/action_primitives/test_resume_best_val_loss.py` |
 | 4 | sagemaker_trainer.py V3 factory + tests | `scripts/sagemaker_trainer.py`, `tests/scripts/test_sagemaker_trainer.py` |
