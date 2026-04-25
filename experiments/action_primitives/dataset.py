@@ -177,3 +177,204 @@ class PhaseAEpisodeDataset(Dataset):
         else:
             out["images"] = images  # list[PIL] length T
         return out
+
+
+# ---------------------------------------------------------------------------
+# Phase B0 dataset
+# ---------------------------------------------------------------------------
+
+
+def _split_click_5way(c: int) -> tuple[int, int]:
+    """Map the legacy 5-way click event to two parallel 3-way labels.
+
+    5-way: {0=idle, 1=L_press, 2=L_release, 3=R_press, 4=R_release}.
+    Each 3-way head emits {0=idle, 1=press, 2=release}.
+    """
+    if c == 1:
+        return (1, 0)  # L_press
+    if c == 2:
+        return (2, 0)  # L_release
+    if c == 3:
+        return (0, 1)  # R_press
+    if c == 4:
+        return (0, 2)  # R_release
+    return (0, 0)      # idle
+
+
+class PhaseB0EpisodeDataset(PhaseAEpisodeDataset):
+    """B0 episode dataset: distractor scenes + grounded instructions + recovery + loss masking.
+
+    Differences from Phase A:
+    - Action history vector is built from `action_*` columns (applied actions —
+      these may be DART-noisy or wrong-segment; matches inference distribution).
+    - Training targets come from `action_label_*` columns (clean expert) and are
+      returned under an ``action_label`` dict.
+    - The legacy 5-way ``action_label_click`` is split on-the-fly into
+      ``click_left`` / ``click_right`` 3-way labels (idle/press/release each).
+    - ``loss_mask`` (T,) per-frame mask is returned as a float tensor.
+    - ``instruction`` is the per-episode NL instruction string (pulled from row 0).
+    - Episode-level metadata (composite_tier, is_adversarial, scenario_type, etc.)
+      is returned for eval slicing.
+
+    Splits use the same episode_id-hash pattern as Phase A. Adds ``"all"`` for
+    tests/eval that want to iterate every episode.
+    """
+
+    def __init__(self, data_dir: Path, split: str = "train", preprocess: bool = True) -> None:
+        # NOTE: bypass PhaseAEpisodeDataset.__init__ because B0 supports the
+        # "all" split that Phase A does not. We re-implement the minimal init.
+        ds = load_dataset("parquet", data_files=str(Path(data_dir) / "shard_*.parquet"))["train"]
+
+        def split_fn(ex):
+            eid = ex["episode_id"]
+            bucket = eid % 10
+            if split == "all":
+                return True
+            if split == "train":
+                return bucket < 8
+            if split == "val":
+                return bucket == 8
+            if split == "test":
+                return bucket == 9
+            return False
+
+        self.ds = ds.filter(split_fn)
+        self.episode_index: dict[int, list[int]] = {}
+        for i, ex in enumerate(self.ds):
+            self.episode_index.setdefault(ex["episode_id"], []).append(i)
+        self.episode_ids = sorted(self.episode_index.keys())
+        self.preprocess = preprocess
+        self._processor = None
+
+    def __getitem__(self, idx: int) -> dict:
+        eid = self.episode_ids[idx]
+        row_indices = self.episode_index[eid]
+        # Sort rows by frame_idx to ensure temporal order (worker shards may
+        # interleave but generator emits in order; sorting is cheap insurance).
+        frames = sorted((self.ds[i] for i in row_indices), key=lambda f: f["frame_idx"])
+
+        # ---- Vision -----------------------------------------------------
+        images = [decode_jpeg_bytes(f["image_bytes"]) for f in frames]
+
+        # ---- Applied actions (for history vector) -----------------------
+        applied_dx_bins = [quantize_to_bin(f["action_dx"], MOUSE_BIN_CENTERS) for f in frames]
+        applied_dy_bins = [quantize_to_bin(f["action_dy"], MOUSE_BIN_CENTERS) for f in frames]
+        applied_scroll_bins = [
+            quantize_to_bin(f["action_scroll"], SCROLL_BIN_CENTERS) for f in frames
+        ]
+        applied_clicks = [int(f["action_click"]) for f in frames]
+        applied_keys = [
+            np.asarray(f["action_key_events"], dtype=np.int64) for f in frames
+        ]
+        dones = [int(f["done_gt"]) for f in frames]
+
+        # ---- Proprio ----------------------------------------------------
+        proprio_per_frame = []
+        for f in frames:
+            proprio_per_frame.append(np.concatenate([
+                np.array([f["cursor_x"], f["cursor_y"]], dtype=np.float32),
+                np.asarray(f["held_keys"], dtype=np.float32),
+                np.asarray(f["held_mouse"], dtype=np.float32),
+                np.array([f["capslock"]], dtype=np.float32),
+            ]))
+
+        # ---- Action history (from APPLIED actions) ----------------------
+        K = MODEL.action_history_len
+        history_per_frame = []
+        zero_action = {
+            "dx_bin": NUM_BINS_MOUSE // 2,
+            "dy_bin": NUM_BINS_MOUSE // 2,
+            "click": 0,
+            "scroll_bin": NUM_BINS_MOUSE // 2,
+            "key_events": [2] * NUM_KEYS,
+            "done_gt": 0,
+        }
+        for t in range(len(frames)):
+            prev = []
+            for k in range(K, 0, -1):
+                j = t - k
+                if j < 0:
+                    prev.append(zero_action)
+                else:
+                    prev.append({
+                        "dx_bin": applied_dx_bins[j],
+                        "dy_bin": applied_dy_bins[j],
+                        "click": applied_clicks[j],
+                        "scroll_bin": applied_scroll_bins[j],
+                        "key_events": applied_keys[j].tolist(),
+                        "done_gt": dones[j],
+                    })
+            history_per_frame.append(build_action_history_vector(prev))
+
+        # ---- Clean expert labels (training targets) ---------------------
+        label_dx_bins = [
+            quantize_to_bin(f["action_label_dx"], MOUSE_BIN_CENTERS) for f in frames
+        ]
+        label_dy_bins = [
+            quantize_to_bin(f["action_label_dy"], MOUSE_BIN_CENTERS) for f in frames
+        ]
+        label_scroll_bins = [
+            quantize_to_bin(f["action_label_scroll"], SCROLL_BIN_CENTERS) for f in frames
+        ]
+        label_clicks_5way = [int(f["action_label_click"]) for f in frames]
+        click_left, click_right = [], []
+        for c in label_clicks_5way:
+            cl, cr = _split_click_5way(c)
+            click_left.append(cl)
+            click_right.append(cr)
+        label_key_events = [
+            np.asarray(f["action_label_key_events"], dtype=np.int64) for f in frames
+        ]
+
+        # ---- Loss mask + instruction (per-frame mask, per-episode str) --
+        loss_mask = [float(f["loss_mask"]) for f in frames]
+        instruction = str(frames[0]["instruction"])
+
+        # ---- Episode metadata (constant across frames; pull from row 0) -
+        meta = {
+            "episode_id": int(frames[0]["episode_id"]),
+            "primitive_type": str(frames[0]["primitive_type"]),
+            "tempo": str(frames[0]["tempo"]),
+            "n_buttons": int(frames[0]["n_buttons"]),
+            "composite_tier": int(frames[0]["composite_tier"]),
+            "is_adversarial": int(frames[0]["is_adversarial"]),
+            "is_scenario_error": int(frames[0]["is_scenario_error"]),
+            "scenario_type": str(frames[0]["scenario_type"]),
+            "k_wrong_frames": int(frames[0]["k_wrong_frames"]),
+            "target_button_id": int(frames[0]["target_button_id"]),
+        }
+
+        out: dict = {
+            "proprio": torch.from_numpy(np.stack(proprio_per_frame)),               # (T, 83)
+            "action_history": torch.from_numpy(np.stack(history_per_frame)).float(), # (T, K, 223)
+            "loss_mask": torch.tensor(loss_mask, dtype=torch.float32),               # (T,)
+            "instruction": instruction,
+            "action_label": {
+                "dx_bins": torch.tensor(label_dx_bins, dtype=torch.long),            # (T,)
+                "dy_bins": torch.tensor(label_dy_bins, dtype=torch.long),            # (T,)
+                "click_left": torch.tensor(click_left, dtype=torch.long),            # (T,)
+                "click_right": torch.tensor(click_right, dtype=torch.long),          # (T,)
+                "scroll_bins": torch.tensor(label_scroll_bins, dtype=torch.long),    # (T,)
+                "key_events": torch.from_numpy(np.stack(label_key_events)),          # (T, 77)
+                "dones": torch.tensor(dones, dtype=torch.long),                      # (T,)
+            },
+            "metadata": meta,
+        }
+        if self.preprocess:
+            if self._processor is None:
+                from transformers import AutoProcessor
+                self._processor = AutoProcessor.from_pretrained(MODEL.vision_model)
+            proc = self._processor(
+                images=images,
+                return_tensors="pt",
+                max_num_patches=MODEL.max_num_patches,
+            )
+            out["pixel_values"] = proc["pixel_values"]
+            out["pixel_attention_mask"] = proc["pixel_attention_mask"]
+            out["spatial_shapes"] = proc["spatial_shapes"]
+            # Also expose the raw image list for callers that want both;
+            # B0 keeps `images` for downstream eval/visualization. To keep
+            # memory low when preprocess=True we omit `images` by default.
+        else:
+            out["images"] = images
+        return out
