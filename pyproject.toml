@@ -18,8 +18,8 @@ dependencies = [
     "pytest>=9.0.3",
     "peft>=0.10",
     "wandb>=0.18",
-    "boto3>=1.35",        # NEW: AWS SDK for sm_jobs CLI + entrypoint Parameter Store reads
-    "sagemaker>=2.230",   # NEW: SageMaker Python SDK for launcher
+    "boto3>=1.35",        # AWS SDK for sm_jobs CLI + entrypoint Parameter Store reads
+    "sagemaker>=3.0",     # SageMaker Python SDK V3 — uses unified ModelTrainer (V3 dropped V2 PyTorch estimator)
 ]
 
 [tool.pytest.ini_options]

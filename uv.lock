@@ -498,7 +498,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=10.0" },
     { name = "pygame-ce", specifier = ">=2.5" },
     { name = "pytest", specifier = ">=9.0.3" },
-    { name = "sagemaker", specifier = ">=2.230" },
+    { name = "sagemaker", specifier = ">=3.0" },
     { name = "torch", specifier = ">=2.11" },
     { name = "torchvision", specifier = ">=0.22" },
     { name = "transformers", specifier = ">=4.52" },

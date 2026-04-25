@@ -6,7 +6,7 @@
 
 **Architecture:** Two-tier launcher pattern mirroring today's HF Jobs scripts. A pure factory module (`sagemaker_estimator.py`) builds `sagemaker.pytorch.PyTorch` estimators; a generic launcher (`launch_sm_job.py`) wraps it for CLI use; a per-experiment override (`launch_sm_job_exp6.py`) sets defaults. An in-container entrypoint (`sm_job_train.py`) clones the branch, restores `WANDB_RUN_ID` for spot-reclaim continuity, detects existing step checkpoints in the S3-synced `/opt/ml/checkpoints/`, and execs the training module with `--resume` if applicable. Operator UX comes from one CLI helper (`sm_jobs.py`) keyed on a stable `cu-vla-<exp>-<phase>-YYYYMMDD-HHMMSS` naming convention.
 
-**Tech Stack:** Python 3.14, `sagemaker` SDK ≥2.230, `boto3`, AWS SageMaker pre-built PyTorch DLC (framework_version=2.6, py312), AWS SSM Parameter Store SecureString (secrets), AWS S3 (in-flight checkpoint sync), HF Hub (canonical data + final ckpts), wandb (training metrics), CloudWatch (container stdout).
+**Tech Stack:** Python 3.14, `sagemaker` SDK ≥3.0 (V3 unified `ModelTrainer` API; replaces V2's framework-specific `PyTorch` estimator class — see [V3 migration guide](https://github.com/aws/sagemaker-python-sdk/blob/master/migration.md)), `boto3`, AWS SageMaker pre-built PyTorch DLC (`pytorch-training:2.6.0-gpu-py312`, resolved via `image_uris.retrieve`), AWS SSM Parameter Store SecureString (secrets), AWS S3 (in-flight checkpoint sync), HF Hub (canonical data + final ckpts), wandb (training metrics), CloudWatch (container stdout).
 
 **Spec:** [`docs/plans/2026-04-26-sagemaker-migration-design.md`](2026-04-26-sagemaker-migration-design.md) (commits `4d455df` + `38bc426`).
 
@@ -50,8 +50,8 @@ dependencies = [
     "pytest>=9.0.3",
     "peft>=0.10",
     "wandb>=0.18",
-    "boto3>=1.35",        # NEW: AWS SDK for sm_jobs CLI + entrypoint Parameter Store reads
-    "sagemaker>=2.230",   # NEW: SageMaker Python SDK for launcher
+    "boto3>=1.35",        # AWS SDK for sm_jobs CLI + entrypoint Parameter Store reads
+    "sagemaker>=3.0",     # SageMaker Python SDK V3 — uses unified ModelTrainer (V3 dropped V2 PyTorch estimator)
 ]
 ```
 
@@ -288,14 +288,16 @@ checkpoint at the next val eval. Required for SageMaker spot resume."
 
 ---
 
-## Task 4: Create scripts/sagemaker_estimator.py (factory) + tests
+## Task 4: Create scripts/sagemaker_trainer.py (V3 ModelTrainer factory) + tests
 
 **Files:**
-- Create: `scripts/sagemaker_estimator.py`
+- Create: `scripts/sagemaker_trainer.py`
 - Create: `tests/scripts/__init__.py` (new test directory)
-- Create: `tests/scripts/test_sagemaker_estimator.py`
+- Create: `tests/scripts/test_sagemaker_trainer.py`
 
-Pure factory: `make_estimator(...)` builds and returns a `sagemaker.pytorch.PyTorch` estimator with all CU-VLA defaults. No I/O, no `.fit()`. Easy to unit-test by mocking the `PyTorch` constructor and asserting kwargs.
+Pure factory: `make_trainer(...)` builds and returns a SageMaker V3 `ModelTrainer` with all CU-VLA defaults. No I/O, no `.train()`. Easy to unit-test by mocking the SDK classes and asserting kwargs.
+
+**V3 API note:** SageMaker SDK V3 (Nov 2025) replaced the framework-specific `PyTorch`/`TensorFlow`/`SKLearn` estimators with a unified `ModelTrainer` class. Configuration is now spread across composable Pydantic models: `Compute`, `SourceCode`, `StoppingCondition`, `CheckpointConfig`, `OutputDataConfig`. The training image URI must be resolved explicitly via `image_uris.retrieve()`. See the [V3 migration guide](https://github.com/aws/sagemaker-python-sdk/blob/master/migration.md).
 
 - [ ] **Step 1: Create the tests package init**
 
@@ -303,139 +305,174 @@ Create `tests/scripts/__init__.py` with a single blank line.
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `tests/scripts/test_sagemaker_estimator.py`:
+Create `tests/scripts/test_sagemaker_trainer.py`:
 
 ```python
-"""Unit tests for scripts/sagemaker_estimator.py. We mock sagemaker.pytorch.PyTorch
-and assert the factory forwards kwargs correctly. No network calls."""
+"""Unit tests for scripts/sagemaker_trainer.py.
+
+We mock both ModelTrainer (the V3 unified trainer) and image_uris.retrieve so
+no network calls are made. Each test asserts the factory forwards the right
+config to the right place — Compute for instance/spot, StoppingCondition for
+runtime, CheckpointConfig for spot resume sync.
+"""
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from scripts.sagemaker_estimator import make_estimator, DEFAULTS
+from scripts.sagemaker_trainer import make_trainer, DEFAULTS
 
 
-@patch("scripts.sagemaker_estimator.PyTorch")
-def test_factory_uses_spot_by_default(mock_pt):
-    make_estimator(
+def _make_kwargs(**overrides):
+    """Build a baseline kwargs dict for make_trainer, with overrides."""
+    kwargs = dict(
         train_module="experiments.action_primitives.train",
         instance_type="ml.g6e.xlarge",
         role_arn="arn:aws:iam::123:role/SageMakerExecutionRole-CU-VLA",
         s3_bucket="cu-vla-sm-123",
         job_name="cu-vla-test-20260101-000000",
     )
-    kwargs = mock_pt.call_args.kwargs
-    assert kwargs["use_spot_instances"] is True
-    assert kwargs["max_run"] == DEFAULTS["max_run"]
-    assert kwargs["max_wait"] == DEFAULTS["max_wait"]
-    assert kwargs["max_wait"] >= 2 * kwargs["max_run"], "max_wait must be >= 2*max_run for spot retries"
+    kwargs.update(overrides)
+    return kwargs
 
 
-@patch("scripts.sagemaker_estimator.PyTorch")
-def test_factory_no_spot_omits_max_wait(mock_pt):
-    make_estimator(
-        train_module="experiments.action_primitives.train",
-        instance_type="ml.g6e.xlarge",
-        role_arn="arn:aws:iam::123:role/x",
-        s3_bucket="cu-vla-sm-123",
-        job_name="cu-vla-test-20260101-000000",
-        use_spot=False,
-    )
-    kwargs = mock_pt.call_args.kwargs
-    assert kwargs["use_spot_instances"] is False
-    assert "max_wait" not in kwargs or kwargs["max_wait"] is None
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_uses_spot_by_default(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "1234.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.6.0-gpu-py312"
+    make_trainer(**_make_kwargs())
+
+    kwargs = mock_mt.call_args.kwargs
+    compute = kwargs["compute"]
+    stopping = kwargs["stopping_condition"]
+
+    assert compute.enable_managed_spot_training is True
+    assert stopping.max_runtime_in_seconds == DEFAULTS["max_run"]
+    assert stopping.max_wait_time_in_seconds == DEFAULTS["max_wait"]
+    assert stopping.max_wait_time_in_seconds >= 2 * stopping.max_runtime_in_seconds, \
+        "max_wait must be >= 2*max_run for spot retries"
 
 
-@patch("scripts.sagemaker_estimator.PyTorch")
-def test_factory_sets_checkpoint_s3_uri_only_for_spot(mock_pt):
-    make_estimator(
-        train_module="experiments.action_primitives.train",
-        instance_type="ml.g6e.xlarge",
-        role_arn="arn:aws:iam::123:role/x",
-        s3_bucket="cu-vla-sm-123",
-        job_name="cu-vla-test-20260101-000000",
-        use_spot=True,
-    )
-    kwargs = mock_pt.call_args.kwargs
-    assert kwargs["checkpoint_s3_uri"] == "s3://cu-vla-sm-123/checkpoints/cu-vla-test-20260101-000000"
-    assert kwargs["checkpoint_local_path"] == "/opt/ml/checkpoints"
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_no_spot_omits_max_wait(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "img"
+    make_trainer(**_make_kwargs(use_spot=False))
+
+    kwargs = mock_mt.call_args.kwargs
+    assert kwargs["compute"].enable_managed_spot_training is False
+    assert kwargs["stopping_condition"].max_wait_time_in_seconds is None
 
 
-@patch("scripts.sagemaker_estimator.PyTorch")
-def test_factory_sets_environment_with_branch_and_train_module(mock_pt):
-    make_estimator(
-        train_module="experiments.action_primitives.train",
-        instance_type="ml.g6e.xlarge",
-        role_arn="arn:aws:iam::123:role/x",
-        s3_bucket="cu-vla-sm-123",
-        job_name="cu-vla-test-20260101-000000",
-        branch="feat/exp6-phase-b1",
-    )
-    kwargs = mock_pt.call_args.kwargs
-    env = kwargs["environment"]
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_sets_checkpoint_config_only_for_spot(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "img"
+    make_trainer(**_make_kwargs(use_spot=True))
+
+    kwargs = mock_mt.call_args.kwargs
+    cc = kwargs["checkpoint_config"]
+    assert cc is not None
+    assert cc.s3_uri == "s3://cu-vla-sm-123/checkpoints/cu-vla-test-20260101-000000"
+    assert cc.local_path == "/opt/ml/checkpoints"
+
+
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_no_checkpoint_config_when_no_spot(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "img"
+    make_trainer(**_make_kwargs(use_spot=False))
+    # On-demand training has no need for the S3 sync volume — final/best.pt go
+    # to HF Hub directly.
+    assert mock_mt.call_args.kwargs["checkpoint_config"] is None
+
+
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_sets_environment_with_branch_and_train_module(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "img"
+    make_trainer(**_make_kwargs(branch="feat/exp6-phase-b1"))
+
+    env = mock_mt.call_args.kwargs["environment"]
     assert env["CU_VLA_BRANCH"] == "feat/exp6-phase-b1"
     assert env["TRAIN_MODULE"] == "experiments.action_primitives.train"
+    assert env["SDL_VIDEODRIVER"] == "dummy"
 
 
-@patch("scripts.sagemaker_estimator.PyTorch")
-def test_factory_passes_hyperparameters_for_train_args(mock_pt):
-    make_estimator(
-        train_module="experiments.action_primitives.train",
-        instance_type="ml.g6e.xlarge",
-        role_arn="arn:aws:iam::123:role/x",
-        s3_bucket="cu-vla-sm-123",
-        job_name="cu-vla-test-20260101-000000",
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_encodes_train_args_as_env_var(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "img"
+    make_trainer(**_make_kwargs(
         train_args=["--epochs", "5", "--out-dir", "/opt/ml/checkpoints"],
-    )
-    kwargs = mock_pt.call_args.kwargs
-    # train_args must end up forwarded to the entrypoint somehow — we encode
-    # them as a single string env var the entrypoint parses.
-    assert "TRAIN_ARGS" in kwargs["environment"]
-    assert "--epochs 5" in kwargs["environment"]["TRAIN_ARGS"]
-    assert "--out-dir /opt/ml/checkpoints" in kwargs["environment"]["TRAIN_ARGS"]
+    ))
+
+    env = mock_mt.call_args.kwargs["environment"]
+    assert "TRAIN_ARGS" in env
+    assert "--epochs 5" in env["TRAIN_ARGS"]
+    assert "--out-dir /opt/ml/checkpoints" in env["TRAIN_ARGS"]
 
 
-@patch("scripts.sagemaker_estimator.PyTorch")
-def test_factory_pins_framework_and_python_version(mock_pt):
-    make_estimator(
-        train_module="experiments.action_primitives.train",
-        instance_type="ml.g6e.xlarge",
-        role_arn="arn:aws:iam::123:role/x",
-        s3_bucket="cu-vla-sm-123",
-        job_name="cu-vla-test-20260101-000000",
-    )
-    kwargs = mock_pt.call_args.kwargs
-    assert kwargs["framework_version"] == "2.6"
-    assert kwargs["py_version"] == "py312"
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_resolves_pytorch_dlc_image_uri(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "1234.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.6.0-gpu-py312"
+    make_trainer(**_make_kwargs())
+
+    # Verify the image_uris.retrieve call has the right framework + version.
+    call_kwargs = mock_image.retrieve.call_args.kwargs
+    assert call_kwargs["framework"] == "pytorch"
+    assert call_kwargs["version"] == "2.6.0"
+    assert call_kwargs["py_version"] == "py312"
+    assert call_kwargs["instance_type"] == "ml.g6e.xlarge"
+    assert call_kwargs["image_scope"] == "training"
+    assert call_kwargs["region"] == "us-west-2"
+
+    # And the URI is forwarded as ModelTrainer's training_image kwarg.
+    assert mock_mt.call_args.kwargs["training_image"] == \
+        "1234.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.6.0-gpu-py312"
 
 
-@patch("scripts.sagemaker_estimator.PyTorch")
-def test_factory_volume_size_at_least_100(mock_pt):
-    make_estimator(
-        train_module="experiments.action_primitives.train",
-        instance_type="ml.g6e.xlarge",
-        role_arn="arn:aws:iam::123:role/x",
-        s3_bucket="cu-vla-sm-123",
-        job_name="cu-vla-test-20260101-000000",
-    )
-    kwargs = mock_pt.call_args.kwargs
-    assert kwargs["volume_size"] >= 100, "EBS volume must be ≥100GB to avoid disk-full at /opt/ml/checkpoints"
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_volume_size_at_least_100(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "img"
+    make_trainer(**_make_kwargs())
+    assert mock_mt.call_args.kwargs["compute"].volume_size_in_gb >= 100, \
+        "EBS volume must be ≥100GB to avoid disk-full at /opt/ml/checkpoints"
+
+
+@patch("scripts.sagemaker_trainer.image_uris")
+@patch("scripts.sagemaker_trainer.ModelTrainer")
+def test_factory_passes_source_code_with_requirements(mock_mt, mock_image):
+    mock_image.retrieve.return_value = "img"
+    make_trainer(**_make_kwargs())
+
+    sc = mock_mt.call_args.kwargs["source_code"]
+    assert sc.entry_script == "sm_job_train.py"
+    assert sc.requirements is not None
+    assert "requirements-sagemaker.txt" in sc.requirements
 ```
 
 - [ ] **Step 3: Run tests to verify they fail (no factory yet)**
 
-Run: `cd /Users/pentest-duck/Desktop/CU-VLA && uv run pytest tests/scripts/test_sagemaker_estimator.py -v`
+Run: `cd /Users/pentest-duck/Desktop/CU-VLA && uv run pytest tests/scripts/test_sagemaker_trainer.py -v`
 
-Expected: all 7 tests FAIL with `ModuleNotFoundError: No module named 'scripts.sagemaker_estimator'`.
+Expected: all 9 tests FAIL with `ModuleNotFoundError: No module named 'scripts.sagemaker_trainer'`.
 
-- [ ] **Step 4: Create `scripts/sagemaker_estimator.py` to make tests pass**
+- [ ] **Step 4: Create `scripts/sagemaker_trainer.py` to make tests pass**
 
 ```python
-"""SageMaker estimator factory for CU-VLA training jobs.
+"""SageMaker V3 ModelTrainer factory for CU-VLA training jobs.
 
-Pure config builder — no I/O, no .fit() call. Builds and returns a
-sagemaker.pytorch.PyTorch estimator with our defaults (spot, L40S, 4h max,
-S3-synced checkpoints, Parameter Store secrets via IAM execution role).
+Pure config builder — no I/O, no .train() call. Builds and returns a
+sagemaker.train.ModelTrainer with our defaults (managed spot, L40S, 4h max,
+S3-synced checkpoints via CheckpointConfig, Parameter Store secrets via
+IAM execution role).
+
+V3 API note: V3 (Nov 2025) replaced the V2 PyTorch estimator class with the
+unified ModelTrainer. Configuration is now spread across Compute,
+SourceCode, StoppingCondition, CheckpointConfig, OutputDataConfig. The
+PyTorch DLC image URI must be resolved explicitly via image_uris.retrieve.
 
 Used by scripts/launch_sm_job.py and scripts/launch_sm_job_<exp>.py.
 """
@@ -444,30 +481,38 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterable
 
-from sagemaker.pytorch import PyTorch
+from sagemaker.core import image_uris
+from sagemaker.core.shapes.shapes import (
+    CheckpointConfig,
+    OutputDataConfig,
+    StoppingCondition,
+)
+from sagemaker.train import ModelTrainer
+from sagemaker.train.configs import Compute, SourceCode
 
 
 # Repo root, used as source_dir for SageMaker. The SDK tars and uploads this
 # directory; the entrypoint sm_job_train.py git-clones the actual source from
 # the configured branch on container start, so the upload is small (just the
-# entrypoint script + requirements).
+# entrypoint script + requirements file).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # Default config — overridden by per-experiment launchers and CLI flags.
 DEFAULTS: dict[str, Any] = {
-    "framework_version": "2.6",
+    "framework": "pytorch",
+    "version": "2.6.0",              # PyTorch DLC version — matches train.py's torch>=2.11 (DLC has 2.6+)
     "py_version": "py312",
     "instance_count": 1,
-    "use_spot_instances": True,
+    "use_spot": True,
     "max_run": 4 * 3600,             # 4h per attempt — covers Phase B0 with margin
     "max_wait": 8 * 3600,            # 2× max_run; allows 1–2 reclaim retries
-    "volume_size": 100,              # GB EBS for /opt/ml/{input,model,checkpoints}
+    "volume_size_in_gb": 100,        # EBS for /opt/ml/{input,model,checkpoints}
     "keep_alive_period_in_seconds": 0,
 }
 
 
-def make_estimator(
+def make_trainer(
     *,
     train_module: str,
     instance_type: str,
@@ -480,11 +525,11 @@ def make_estimator(
     max_run: int | None = None,
     max_wait: int | None = None,
     instance_count: int | None = None,
-    volume_size: int | None = None,
+    volume_size_in_gb: int | None = None,
     region: str = "us-west-2",
     extra_environment: dict[str, str] | None = None,
-) -> PyTorch:
-    """Construct a SageMaker PyTorch estimator with CU-VLA defaults.
+) -> ModelTrainer:
+    """Construct a SageMaker V3 ModelTrainer with CU-VLA defaults.
 
     Args:
         train_module: dotted path of the training module to invoke inside the
@@ -492,28 +537,28 @@ def make_estimator(
             entrypoint reads this from the TRAIN_MODULE env var and runs
             `python -u -m <train_module> [TRAIN_ARGS]`.
         instance_type: e.g. "ml.g6e.xlarge" (1×L40S 48GB).
-        role_arn: ARN of the SageMakerExecutionRole-CU-VLA IAM role. Read
-            from ~/.cu-vla/sagemaker.toml or AWS account env in the launcher.
+        role_arn: ARN of the SageMakerExecutionRole-CU-VLA IAM role.
         s3_bucket: bare bucket name (no s3:// prefix), e.g. "cu-vla-sm-123".
-        job_name: full SageMaker job name; we use this for both the SM job
-            and the WANDB_RUN_ID so wandb continues across spot reclaims.
+        job_name: full SageMaker job name; passed via base_job_name and used
+            for the spot-resume CheckpointConfig prefix.
         branch: git branch to clone in the container.
         train_args: list of CLI args passed through to the train module.
-        use_spot, max_run, max_wait, instance_count, volume_size: override
-            DEFAULTS. None means "use the default."
-        region: AWS region for the estimator (must match where the role and
-            bucket live).
+        use_spot, max_run, max_wait, instance_count, volume_size_in_gb:
+            override DEFAULTS. None means "use the default."
+        region: AWS region (must match where role and bucket live).
         extra_environment: additional env vars to set in the container.
 
     Returns:
-        Configured sagemaker.pytorch.PyTorch instance, ready to call .fit() on.
+        Configured sagemaker.train.ModelTrainer, ready to call .train() on.
     """
-    use_spot = DEFAULTS["use_spot_instances"] if use_spot is None else use_spot
+    use_spot = DEFAULTS["use_spot"] if use_spot is None else use_spot
     max_run = DEFAULTS["max_run"] if max_run is None else max_run
     instance_count = DEFAULTS["instance_count"] if instance_count is None else instance_count
-    volume_size = DEFAULTS["volume_size"] if volume_size is None else volume_size
+    volume_size_in_gb = (
+        DEFAULTS["volume_size_in_gb"] if volume_size_in_gb is None else volume_size_in_gb
+    )
 
-    # max_wait is only meaningful for spot. For on-demand we omit it entirely.
+    # max_wait is only meaningful for spot. For on-demand we set it to None.
     if use_spot:
         max_wait = (DEFAULTS["max_wait"] if max_wait is None else max_wait)
         if max_wait < 2 * max_run:
@@ -524,6 +569,16 @@ def make_estimator(
     else:
         max_wait = None
 
+    # Resolve the pre-built PyTorch DLC image URI for this region + framework.
+    training_image = image_uris.retrieve(
+        framework=DEFAULTS["framework"],
+        region=region,
+        version=DEFAULTS["version"],
+        py_version=DEFAULTS["py_version"],
+        instance_type=instance_type,
+        image_scope="training",
+    )
+
     environment: dict[str, str] = {
         "CU_VLA_BRANCH": branch,
         "TRAIN_MODULE": train_module,
@@ -532,54 +587,94 @@ def make_estimator(
         # pygame.display, this prevents an SDL init crash.
         "SDL_VIDEODRIVER": "dummy",
         "AWS_REGION": region,
-        # Silence HF Hub progress bars in CloudWatch (mirrors hf_job_train_exp6.py).
+        # Silence HF Hub progress bars in CloudWatch.
         "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         "HF_DATASETS_DISABLE_PROGRESS_BARS": "1",
     }
     if extra_environment:
         environment.update(extra_environment)
 
-    kwargs: dict[str, Any] = {
-        "entry_point": "sm_job_train.py",
-        "source_dir": str(REPO_ROOT / "scripts"),
-        "framework_version": DEFAULTS["framework_version"],
-        "py_version": DEFAULTS["py_version"],
-        "instance_type": instance_type,
-        "instance_count": instance_count,
-        "role": role_arn,
-        "use_spot_instances": use_spot,
-        "max_run": max_run,
-        "volume_size": volume_size,
-        "keep_alive_period_in_seconds": DEFAULTS["keep_alive_period_in_seconds"],
-        "environment": environment,
-        "base_job_name": None,    # we set job_name explicitly via .fit(job_name=...)
-        "code_location": f"s3://{s3_bucket}/tmp",
-        "output_path": f"s3://{s3_bucket}/output",
-        "dependencies": [str(REPO_ROOT / "requirements-sagemaker.txt")],
-    }
-    if use_spot:
-        kwargs["max_wait"] = max_wait
-        kwargs["checkpoint_s3_uri"] = f"s3://{s3_bucket}/checkpoints/{job_name}"
-        kwargs["checkpoint_local_path"] = "/opt/ml/checkpoints"
+    compute = Compute(
+        instance_type=instance_type,
+        instance_count=instance_count,
+        volume_size_in_gb=volume_size_in_gb,
+        keep_alive_period_in_seconds=DEFAULTS["keep_alive_period_in_seconds"],
+        enable_managed_spot_training=use_spot,
+    )
 
-    return PyTorch(**kwargs)
+    source_code = SourceCode(
+        source_dir=str(REPO_ROOT / "scripts"),
+        entry_script="sm_job_train.py",
+        requirements=str(REPO_ROOT / "requirements-sagemaker.txt"),
+    )
+
+    stopping_condition = StoppingCondition(
+        max_runtime_in_seconds=max_run,
+        max_wait_time_in_seconds=max_wait,  # None for on-demand
+    )
+
+    checkpoint_config = None
+    if use_spot:
+        checkpoint_config = CheckpointConfig(
+            s3_uri=f"s3://{s3_bucket}/checkpoints/{job_name}",
+            local_path="/opt/ml/checkpoints",
+        )
+
+    output_data_config = OutputDataConfig(
+        s3_output_path=f"s3://{s3_bucket}/output",
+    )
+
+    return ModelTrainer(
+        training_image=training_image,
+        source_code=source_code,
+        compute=compute,
+        stopping_condition=stopping_condition,
+        checkpoint_config=checkpoint_config,
+        output_data_config=output_data_config,
+        environment=environment,
+        role=role_arn,
+        base_job_name=job_name,    # SDK appends a UUID/timestamp suffix automatically
+    )
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cd /Users/pentest-duck/Desktop/CU-VLA && uv run pytest tests/scripts/test_sagemaker_estimator.py -v`
+Run: `cd /Users/pentest-duck/Desktop/CU-VLA && uv run pytest tests/scripts/test_sagemaker_trainer.py -v`
 
-Expected: all 7 tests PASS.
+Expected: all 9 tests PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Smoke-test that the factory can build a real ModelTrainer (no AWS calls)**
+
+Run: `cd /Users/pentest-duck/Desktop/CU-VLA && uv run python -c "
+import warnings; warnings.filterwarnings('ignore')
+from scripts.sagemaker_trainer import make_trainer
+t = make_trainer(
+    train_module='experiments.action_primitives.train',
+    instance_type='ml.g6e.xlarge',
+    role_arn='arn:aws:iam::123:role/x',
+    s3_bucket='cu-vla-sm-123',
+    job_name='cu-vla-smoke-20260101-000000',
+)
+print('built:', type(t).__name__)
+print('  spot:', t.compute.enable_managed_spot_training)
+print('  ckpt s3:', t.checkpoint_config.s3_uri if t.checkpoint_config else None)
+print('  image:', t.training_image)
+"
+`
+
+Expected: prints `built: ModelTrainer`, `spot: True`, an S3 URI, and the resolved DLC URI (e.g. `763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.6.0-gpu-py312`). Validates that V3 `image_uris.retrieve()` and Pydantic validation accept all our fields.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add scripts/sagemaker_estimator.py tests/scripts/__init__.py tests/scripts/test_sagemaker_estimator.py
-git commit -m "feat(sm-migration): sagemaker_estimator.py factory + tests
+git add scripts/sagemaker_trainer.py tests/scripts/__init__.py tests/scripts/test_sagemaker_trainer.py
+git commit -m "feat(sm-migration): sagemaker_trainer.py V3 ModelTrainer factory + tests
 
-Pure config builder for sagemaker.pytorch.PyTorch with CU-VLA defaults
-(spot, L40S, checkpoint_s3_uri, framework_version=2.6/py312, volume=100GB).
-No I/O. Tests mock the constructor and assert kwargs."
+Pure config builder for sagemaker.train.ModelTrainer (V3 API, replaces the
+V2 PyTorch estimator). Composes Compute, SourceCode, StoppingCondition,
+CheckpointConfig, OutputDataConfig with CU-VLA defaults (spot, L40S,
+volume=100GB, image_uris.retrieve for PyTorch 2.6.0/py312). No I/O.
+Tests mock both ModelTrainer and image_uris."
 ```
 
 ---
@@ -909,7 +1004,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from scripts.sagemaker_estimator import make_estimator
+from scripts.sagemaker_trainer import make_trainer
 
 
 DEFAULT_REPO_URL = "https://github.com/PenTest-duck/CU-VLA.git"
@@ -1018,7 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
     s3_bucket = _resolve_s3_bucket(args)
     job_name = build_job_name(experiment=args.experiment, phase=args.phase)
 
-    estimator = make_estimator(
+    trainer = make_trainer(
         train_module=args.train_module,
         instance_type=args.instance_type,
         instance_count=args.instance_count,
@@ -1030,21 +1125,26 @@ def main(argv: list[str] | None = None) -> int:
         use_spot=args.spot,
         max_run=args.max_run,
         max_wait=args.max_wait,
-        volume_size=args.volume_size,
+        volume_size_in_gb=args.volume_size,
         region=args.region,
     )
 
-    print(f"[launch_sm_job] launching job: {job_name}")
+    print(f"[launch_sm_job] launching job: {job_name}* (SDK appends a suffix)")
     print(f"[launch_sm_job]   instance_type: {args.instance_type}  spot: {args.spot}  branch: {args.branch}")
     print(f"[launch_sm_job]   train_module: {args.train_module}")
     print(f"[launch_sm_job]   train_args: {' '.join(args.train_args) if args.train_args else '(none)'}")
 
-    estimator.fit(wait=not args.detach, job_name=job_name)
+    # V3 ModelTrainer.train(wait=, logs=) — replaces V2 .fit(). logs=True
+    # streams CloudWatch to the local terminal (same UX as V2's wait=True).
+    trainer.train(wait=not args.detach, logs=not args.detach)
 
     if args.detach:
-        print(f"[launch_sm_job] detached. Watch with: uv run python scripts/sm_jobs.py logs {job_name} --follow")
+        print(f"[launch_sm_job] detached. Watch with: uv run python scripts/sm_jobs.py logs latest --follow")
     else:
-        print(f"[launch_sm_job] job {job_name} finished. Status: {estimator.latest_training_job.describe()['TrainingJobStatus']}")
+        # V3 logs=True already streamed the actual job name + status during training.
+        # Use sm_jobs.py for post-hoc inspection.
+        print(f"[launch_sm_job] training run finished. "
+              f"Inspect with: uv run python scripts/sm_jobs.py status latest")
     return 0
 
 
@@ -1067,6 +1167,8 @@ Expected: prints the help message, exits 0.
 Run: `cd /Users/pentest-duck/Desktop/CU-VLA && uv run python scripts/launch_sm_job.py --train-module experiments.action_primitives.train --branch nonexistent-branch-xyz`
 
 Expected: prints `ERROR: branch 'nonexistent-branch-xyz' does not exist on ...` and exits 1. Validates the branch pre-check works.
+
+**Note on Task 6's tests:** the test file mentions `from scripts.launch_sm_job import (parse_args, validate_remote_branch, build_job_name, DEFAULT_REPO_URL)`. The function names are stable; only the *internal* call inside `main()` changed from `make_estimator(...)` to `make_trainer(...)`. The existing tests do not exercise `main()`, so they pass unchanged.
 
 - [ ] **Step 6: Commit**
 
@@ -2208,7 +2310,7 @@ Expected: see the chain of migration commits — deps, train.py patch, factory, 
 | 1 | Add SDK deps + requirements-sagemaker.txt | `pyproject.toml`, `requirements-sagemaker.txt` |
 | 2 | Submit GPU quota request | (AWS console / CLI only) |
 | 3 | Patch train.py for best_val_loss restore | `experiments/action_primitives/train.py:579`, `tests/action_primitives/test_resume_best_val_loss.py` |
-| 4 | sagemaker_estimator.py factory + tests | `scripts/sagemaker_estimator.py`, `tests/scripts/test_sagemaker_estimator.py` |
+| 4 | sagemaker_trainer.py V3 factory + tests | `scripts/sagemaker_trainer.py`, `tests/scripts/test_sagemaker_trainer.py` |
 | 5 | sm_job_train.py entrypoint + tests | `scripts/sm_job_train.py`, `tests/scripts/test_sm_job_train.py` |
 | 6 | launch_sm_job.py generic CLI + tests | `scripts/launch_sm_job.py`, `tests/scripts/test_launch_sm_job.py` |
 | 7 | launch_sm_job_exp6.py exp6 override | `scripts/launch_sm_job_exp6.py` |

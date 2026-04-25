@@ -7,7 +7,7 @@ Migrate the GPU training infrastructure for CU-VLA experiments from Hugging Face
 ## Scope
 
 **In scope:**
-- Replacement launcher + entrypoint scripts for SageMaker (`scripts/launch_sm_job*.py`, `scripts/sm_job_train.py`, `scripts/sagemaker_estimator.py`).
+- Replacement launcher + entrypoint scripts for SageMaker (`scripts/launch_sm_job*.py`, `scripts/sm_job_train.py`, `scripts/sagemaker_trainer.py`).
 - Operator CLI helper (`scripts/sm_jobs.py`) for ls / status / logs / stop / describe / url / cost / reconcile-ckpts.
 - One-time AWS bootstrap (region pick, IAM execution role, S3 bucket, SSM Parameter Store secrets, GPU quota request, Budget alerts).
 - Spot-instance auto-resume mechanics (`checkpoint_s3_uri` + entrypoint resume detection + wandb run continuation).
@@ -29,19 +29,19 @@ Migrate the GPU training infrastructure for CU-VLA experiments from Hugging Face
 | Compute footprint | 1×L40S (`ml.g6e.xlarge`) now, leave room for 4×GPU later | Mirrors current HF Jobs setup; multi-GPU added when an experiment actually needs it |
 | Spot vs on-demand | Spot-first with auto-resume; `--no-spot` escape hatch | ~70% spot discount stretches $10k from ~5k → ~15k+ GPU-hours. `train.py` already supports `--resume`. |
 | Persistence layer | HF Hub canonical for data + final/best ckpts; S3 for in-flight spot ckpts | Zero code change in `hf_sync.py`/`load_dataset()`; S3 is forced by spot-resume mechanics anyway |
-| Container image | Pre-built SageMaker PyTorch DLC (framework_version=2.6, py312) + `requirements-sagemaker.txt` | torch+torchvision baked in; ~1–2 min install for the small remaining list (transformers, peft, pygame-ce, wandb, datasets). Zero Docker maintenance. |
+| Container image | Pre-built SageMaker PyTorch DLC (`pytorch-training:2.6.0-gpu-py312`, resolved via SDK V3's `image_uris.retrieve`) + `requirements-sagemaker.txt` | torch+torchvision baked in; ~1–2 min install for the small remaining list (transformers, peft, pygame-ce, wandb, datasets). Zero Docker maintenance. V3 dropped the framework-specific `PyTorch` estimator class in favor of unified `ModelTrainer` + explicit image URI. |
 | Source delivery | Git-clone-on-startup inside container (mirrors today's `hf_job_train.py` flow) | Matches existing mental model; `CU_VLA_BRANCH` env var preserved; no risk of launching dirty local state |
 | Region | us-west-2 | ~70% spot discount (vs ~45% in ap-southeast-2), broad L40S spot capacity, ~$2k more effective credits than Sydney. Latency irrelevant for async `.fit()`. |
 | Secrets | AWS Systems Manager Parameter Store SecureString | $0/month (vs Secrets Manager $0.40/secret/month). KMS decrypt via `alias/aws/ssm` is free. Token rotation = `put-parameter --overwrite`, no relaunch needed. |
 | Launcher pattern | Generic launcher + factory + per-experiment override (mirrors today's HF Jobs two-tier) | New experiments add ~30-LOC override; production paths come from a branch (no dirty launches) |
-| File split | `sagemaker_estimator.py` (factory, no I/O) + `sm_job_train.py` (entrypoint) + `launch_sm_job.py` (generic CLI) + `launch_sm_job_exp6.py` (override) | Each file single-purpose, testable in isolation |
+| File split | `sagemaker_trainer.py` (factory, no I/O) + `sm_job_train.py` (entrypoint) + `launch_sm_job.py` (generic CLI) + `launch_sm_job_exp6.py` (override) | Each file single-purpose, testable in isolation |
 | Observability | wandb (training metrics) + CloudWatch (stdout) + SageMaker console + Budget alerts (cost) | One canonical tool per layer, no duplicates. wandb continues across spot reclaims via `WANDB_RUN_ID=$SM_TRAINING_JOB_NAME`. |
 
 ## File Layout
 
 ```
 scripts/
-├── sagemaker_estimator.py      [NEW] ~80 LOC — pure factory: make_estimator(...)
+├── sagemaker_trainer.py      [NEW] ~110 LOC — pure factory: make_trainer(...) returning V3 ModelTrainer
 ├── sm_job_train.py             [NEW] ~60 LOC — in-container entrypoint
 ├── launch_sm_job.py            [NEW] ~80 LOC — generic launcher CLI
 ├── launch_sm_job_exp6.py       [NEW] ~30 LOC — exp6 defaults (Phase B0/B1, branch, instance)
@@ -69,7 +69,7 @@ experiments/action_primitives/train.py   [MOD] +3 LOC — restore best_val_loss 
                      │      │
                      │      └─→ scripts/launch_sm_job.py  (generic launcher CLI, ~80 LOC)
                      │             │
-                     │             └─→ scripts/sagemaker_estimator.py  (factory, ~80 LOC)
+                     │             └─→ scripts/sagemaker_trainer.py  (factory, ~80 LOC)
                      │                    │
                      │                    └─→ sagemaker.pytorch.PyTorch(...)
                      │                              │
@@ -238,7 +238,7 @@ Submit via Service Quotas console: **SageMaker → `ml.g6e.xlarge` for spot trai
 
 **Translation:** spot turns $10k into ~12k–18k GPU-hours = ~100–150 B0-class runs of 4 hours each, or ~25–35 multi-day full-pipeline runs.
 
-**Defaults in `sagemaker_estimator.py`:**
+**Defaults in `sagemaker_trainer.py`:**
 ```python
 DEFAULTS = dict(
     use_spot_instances=True,
