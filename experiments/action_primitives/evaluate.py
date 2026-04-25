@@ -377,5 +377,52 @@ def compute_wrong_direction_first_3_frames(
     return end_dist > start_dist  # got farther from target
 
 
+def build_zero_instruction_embedding(emb_dim: int = 768) -> torch.Tensor:
+    """Construct an all-zero text embedding for the zero-instruction probe.
+
+    Returns a (1, emb_dim) tensor — typically used to replace the model's
+    instruction-encoder output at inference time.
+    """
+    return torch.zeros(1, emb_dim)
+
+
+def build_shuffled_instruction(
+    rng: np.random.Generator,
+    val_instructions: list[str],
+    exclude: str | None = None,
+) -> str:
+    """Return a random instruction from val_instructions, optionally excluding `exclude`.
+
+    Used for the shuffled-instruction probe — tests language reliance robustness
+    (zero-embedding may be OOD; a shuffled real instruction is in-distribution).
+    """
+    if exclude is None:
+        return val_instructions[int(rng.integers(0, len(val_instructions)))]
+    candidates = [s for s in val_instructions if s != exclude]
+    if not candidates:
+        return val_instructions[0]  # only one unique instruction; return it
+    return candidates[int(rng.integers(0, len(candidates)))]
+
+
+def build_wrong_instruction(scene, target_id: int, rng: np.random.Generator) -> str:
+    """Construct an instruction targeting a DIFFERENT button than target_id.
+
+    Used for the wrong-instruction probe — strongest grounding test: the model
+    must follow the instruction even when the visually-salient or scene-prior
+    target is the "wrong" answer.
+
+    For 1-button scenes returns "" (no alternative target available).
+    """
+    other_buttons = [i for i in range(len(scene.buttons)) if i != target_id]
+    if not other_buttons:
+        return ""
+    fake_target_id = int(rng.choice(other_buttons))
+    fake_target = scene.buttons[fake_target_id]
+    # Generate a simple single-attribute instruction targeting the fake button.
+    # We pick an attribute that uniquely identifies the fake from the (real)
+    # target. If multiple attrs work, prefer color (most frequent in templates).
+    return f"click the {fake_target.color} {fake_target.shape}"
+
+
 if __name__ == "__main__":
     main()

@@ -133,3 +133,75 @@ def test_wrong_direction_first_3_frames_short_rollout():
     target_xy = (200.0, 200.0)
     out = compute_wrong_direction_first_3_frames(cursor_xys, target_xy)
     assert out is False
+
+
+def test_build_zero_instruction_embedding():
+    """Zero-instruction probe creates an all-zero text embedding tensor of the requested dim."""
+    import torch
+    from experiments.action_primitives.evaluate import build_zero_instruction_embedding
+    out = build_zero_instruction_embedding(emb_dim=768)
+    assert out.shape == (1, 768)
+    assert torch.allclose(out, torch.zeros_like(out))
+
+
+def test_build_shuffled_instruction():
+    """Shuffled probe picks a different instruction from val set."""
+    import numpy as np
+    from experiments.action_primitives.evaluate import build_shuffled_instruction
+    rng = np.random.default_rng(42)
+    val_instructions = [
+        "click the red button",
+        "tap the blue square",
+        "press the small green circle",
+    ]
+    out = build_shuffled_instruction(rng, val_instructions)
+    assert out in val_instructions
+
+
+def test_build_shuffled_instruction_with_exclude():
+    """Shuffled probe should avoid the original instruction when exclude is provided."""
+    import numpy as np
+    from experiments.action_primitives.evaluate import build_shuffled_instruction
+    rng = np.random.default_rng(0)
+    val_instructions = ["click the red button", "tap the blue square"]
+    # Run several times to make sure the excluded one never appears
+    for _ in range(20):
+        out = build_shuffled_instruction(rng, val_instructions, exclude="click the red button")
+        assert out == "tap the blue square"
+
+
+def test_build_wrong_instruction_targets_different_button():
+    """Wrong-instruction probe constructs an instruction for a DIFFERENT button."""
+    import numpy as np
+    from experiments.action_primitives.evaluate import build_wrong_instruction
+    from experiments.action_primitives.scene import Scene, Button
+    scene = Scene(
+        buttons=(
+            Button(0, "red", "circle", "small", (0, 0), 10, 10, 40, 40),
+            Button(1, "blue", "square", "large", (1, 0), 100, 10, 100, 100),
+        ),
+        decorative_shapes=(),
+        bg_color=(245, 245, 248),
+    )
+    rng = np.random.default_rng(0)
+    out = build_wrong_instruction(scene, target_id=0, rng=rng)
+    # The instruction should describe button 1 (the wrong target), not button 0
+    assert "blue" in out or "square" in out or "large" in out
+    assert "red" not in out  # the correct target's color shouldn't be mentioned
+
+
+def test_build_wrong_instruction_single_button_returns_empty():
+    """For 1-button scenes there's no other button to target — returns empty string."""
+    import numpy as np
+    from experiments.action_primitives.evaluate import build_wrong_instruction
+    from experiments.action_primitives.scene import Scene, Button
+    scene = Scene(
+        buttons=(
+            Button(0, "red", "circle", "small", (0, 0), 10, 10, 40, 40),
+        ),
+        decorative_shapes=(),
+        bg_color=(245, 245, 248),
+    )
+    rng = np.random.default_rng(0)
+    out = build_wrong_instruction(scene, target_id=0, rng=rng)
+    assert out == ""
