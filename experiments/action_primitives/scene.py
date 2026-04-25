@@ -3,6 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
+from experiments.action_primitives.config import (
+    B0_BG_COLORS, B0_COLORS, B0_POSITION_GRID, B0_SHAPES, B0_SIZES, ENV,
+)
+
 
 @dataclass(frozen=True)
 class Button:
@@ -17,6 +23,31 @@ class Button:
     w: int
     h: int
     is_clickable: bool = True
+
+    def __post_init__(self) -> None:
+        if self.color not in B0_COLORS:
+            raise ValueError(
+                f"Button color {self.color!r} not in B0_COLORS "
+                f"(allowed: {sorted(B0_COLORS)})"
+            )
+        if self.shape not in B0_SHAPES:
+            raise ValueError(
+                f"Button shape {self.shape!r} not in B0_SHAPES "
+                f"(allowed: {list(B0_SHAPES)})"
+            )
+        if self.size not in B0_SIZES:
+            raise ValueError(
+                f"Button size {self.size!r} not in B0_SIZES "
+                f"(allowed: {sorted(B0_SIZES)})"
+            )
+        cols, rows = B0_POSITION_GRID
+        col, row = self.pos_zone
+        if not (0 <= col < cols and 0 <= row < rows):
+            raise ValueError(
+                f"Button pos_zone {self.pos_zone!r} out of bounds for "
+                f"B0_POSITION_GRID {B0_POSITION_GRID} "
+                f"(must satisfy 0 <= col < {cols} and 0 <= row < {rows})"
+            )
 
     def center(self) -> tuple[float, float]:
         return (self.x + self.w / 2, self.y + self.h / 2)
@@ -35,3 +66,86 @@ class DecorativeShape:
     w: int
     h: int
     is_clickable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.color not in B0_COLORS:
+            raise ValueError(
+                f"DecorativeShape color {self.color!r} not in B0_COLORS "
+                f"(allowed: {sorted(B0_COLORS)})"
+            )
+        if self.shape not in B0_SHAPES:
+            raise ValueError(
+                f"DecorativeShape shape {self.shape!r} not in B0_SHAPES "
+                f"(allowed: {list(B0_SHAPES)})"
+            )
+
+
+@dataclass(frozen=True)
+class Scene:
+    """A rendered scene: bg color + buttons + decorative shapes."""
+    buttons: tuple[Button, ...]
+    decorative_shapes: tuple[DecorativeShape, ...]
+    bg_color: tuple[int, int, int]
+
+
+def _zone_to_xy(col: int, row: int, w: int, h: int, rng: np.random.Generator) -> tuple[int, int]:
+    """Sample a (x, y) inside the (col, row) zone of B0_POSITION_GRID."""
+    cols, rows = B0_POSITION_GRID
+    zone_w = ENV.canvas_w // cols
+    zone_h = ENV.canvas_h // rows
+    margin = 10
+    x_low = col * zone_w + margin
+    x_high = max(x_low + 1, (col + 1) * zone_w - w - margin)
+    y_low = row * zone_h + margin
+    y_high = max(y_low + 1, (row + 1) * zone_h - h - margin)
+    return int(rng.integers(x_low, x_high)), int(rng.integers(y_low, y_high))
+
+
+def generate_scene(
+    rng: np.random.Generator,
+    n_buttons: int | None = None,
+    n_decorative: int | None = None,
+) -> Scene:
+    """Generate a scene with 1-6 buttons + 0-3 decorative shapes + random bg."""
+    if n_buttons is None:
+        n_buttons = int(rng.integers(1, 7))  # 1..6 inclusive
+    if n_decorative is None:
+        n_decorative = int(rng.integers(0, 4))  # 0..3 inclusive
+
+    bg_color = tuple(B0_BG_COLORS[rng.integers(0, len(B0_BG_COLORS))])
+
+    # Sample distinct (col, row) zones (or random if not enough zones)
+    cols, rows = B0_POSITION_GRID
+    all_zones = [(c, r) for c in range(cols) for r in range(rows)]
+    rng.shuffle(all_zones)
+    chosen_zones = all_zones[:n_buttons]
+
+    buttons: list[Button] = []
+    for i, (col, row) in enumerate(chosen_zones):
+        color = list(B0_COLORS.keys())[rng.integers(0, len(B0_COLORS))]
+        shape = B0_SHAPES[rng.integers(0, len(B0_SHAPES))]
+        size = list(B0_SIZES.keys())[rng.integers(0, len(B0_SIZES))]
+        w_low, w_high = B0_SIZES[size]
+        w = int(rng.integers(w_low, w_high))
+        h = int(rng.integers(w_low, w_high))
+        x, y = _zone_to_xy(col, row, w, h, rng)
+        buttons.append(Button(
+            button_id=i, color=color, shape=shape, size=size,
+            pos_zone=(col, row), x=x, y=y, w=w, h=h,
+        ))
+
+    decorative_shapes: list[DecorativeShape] = []
+    for _ in range(n_decorative):
+        shape = B0_SHAPES[rng.integers(0, len(B0_SHAPES))]
+        color = list(B0_COLORS.keys())[rng.integers(0, len(B0_COLORS))]
+        w = int(rng.integers(20, 50))
+        h = int(rng.integers(20, 50))
+        x = int(rng.integers(10, ENV.canvas_w - w - 10))
+        y = int(rng.integers(10, ENV.canvas_h - h - 10))
+        decorative_shapes.append(DecorativeShape(shape=shape, color=color, x=x, y=y, w=w, h=h))
+
+    return Scene(
+        buttons=tuple(buttons),
+        decorative_shapes=tuple(decorative_shapes),
+        bg_color=bg_color,
+    )
