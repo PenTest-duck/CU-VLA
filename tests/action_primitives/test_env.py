@@ -1,6 +1,9 @@
 """Unit tests for LClickEnv."""
 
+import numpy as np
+
 from experiments.action_primitives.env import Action, LClickEnv
+from experiments.action_primitives.scene import generate_scene
 
 
 def test_env_reset_returns_valid_obs_and_info():
@@ -62,3 +65,32 @@ def test_env_clamps_cursor_to_canvas():
     cx, cy = info["cursor_xy"]
     assert 0 <= cx <= 720 - 1
     assert 0 <= cy <= 450 - 1
+
+
+def test_env_accepts_scene_and_target():
+    rng = np.random.default_rng(0)
+    scene = generate_scene(rng=rng, n_buttons=3)
+    env = LClickEnv(scene=scene, target_button_id=1, seed=0)
+    obs, info = env.reset(seed=0)
+    assert info["target_button_id"] == 1
+    target_button = scene.buttons[1]
+    tx, ty, tw, th = info["target_bbox"]
+    assert (tx, ty, tw, th) == (target_button.x, target_button.y, target_button.w, target_button.h)
+    # Image should render all buttons + decorative shapes
+    img = obs["image"]
+    assert img.size == (720, 450)
+
+
+def test_env_step_with_target_collidepoint():
+    """Cursor on target + L_press → L_release should set done."""
+    rng = np.random.default_rng(0)
+    scene = generate_scene(rng=rng, n_buttons=2)
+    env = LClickEnv(scene=scene, target_button_id=0, seed=0)
+    target = scene.buttons[0]
+    cx, cy = target.center()
+    # Move cursor to target
+    env.cursor_x, env.cursor_y = cx, cy
+    obs, done, info = env.step(Action(click=1))  # L_press on target
+    assert not done
+    obs, done, info = env.step(Action(click=2))  # L_release on target
+    assert done is True
