@@ -41,3 +41,14 @@ def test_scroll_bin_centers_shape():
 def test_total_logits_matches_design():
     assert TOTAL_LOGITS == 300  # 21+21+5+21+231+1 per design Q1
     assert HEAD_LOGITS["keys"] == 231
+
+
+def test_b0_attribute_palettes_defined():
+    from experiments.action_primitives.config import (
+        B0_COLORS, B0_SHAPES, B0_SIZES, B0_POSITION_GRID,
+    )
+    assert len(B0_COLORS) >= 8 and len(B0_COLORS) <= 10
+    assert all(isinstance(c, tuple) and len(c) == 3 for c in B0_COLORS.values())
+    assert set(B0_SHAPES) >= {"rect", "circle", "triangle", "square", "hexagon"}
+    assert set(B0_SIZES) == {"small", "medium", "large"}
+    assert B0_POSITION_GRID == (3, 3)

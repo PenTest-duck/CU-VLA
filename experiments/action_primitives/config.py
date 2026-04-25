@@ -138,3 +138,37 @@ class PhaseADataConfig:
 
 
 PHASE_A_DATA = PhaseADataConfig()
+
+
+# ---------- Phase B0 attribute palettes ----------
+B0_COLORS: dict[str, tuple[int, int, int]] = {
+    "red":    (220, 60,  60),
+    "blue":   (60,  120, 230),
+    "green":  (70,  180, 90),
+    "yellow": (240, 220, 70),
+    "orange": (240, 140, 50),
+    "purple": (160, 80,  200),
+    "pink":   (240, 130, 180),
+    "cyan":   (80,  200, 220),
+    "white":  (245, 245, 245),
+    "black":  (30,  30,  30),
+}
+
+B0_SHAPES: tuple[str, ...] = ("rect", "circle", "triangle", "square", "hexagon")
+
+B0_SIZES: dict[str, tuple[int, int]] = {
+    "small":  (30, 50),
+    "medium": (60, 90),
+    "large":  (100, 140),
+}
+
+B0_POSITION_GRID: tuple[int, int] = (3, 3)  # 3 cols × 3 rows of zones
+
+B0_BG_COLORS: tuple[tuple[int, int, int], ...] = (
+    (245, 245, 248),
+    (240, 246, 240),
+    (245, 240, 240),
+    (240, 245, 250),
+    (250, 248, 235),
+    (235, 240, 248),
+)
