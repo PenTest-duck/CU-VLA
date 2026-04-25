@@ -21,9 +21,17 @@ from torch.utils.data import DataLoader
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from experiments.action_primitives.config import MODEL, TRAIN
-from experiments.action_primitives.dataset import PhaseAEpisodeDataset
-from experiments.action_primitives.losses import total_loss
+from experiments.action_primitives.config import MODEL, MOUSE_BIN_CENTERS, TRAIN
+from experiments.action_primitives.dataset import (
+    PhaseAEpisodeDataset,
+    PhaseB0EpisodeDataset,
+)
+from experiments.action_primitives.losses import total_loss, total_loss_b0
+from experiments.action_primitives.metrics import (
+    bin_10_frequency,
+    per_class_click_recall,
+    soft_ce_diagnostics,
+)
 from experiments.action_primitives.model import ActionPrimitivesACT
 
 
@@ -36,7 +44,7 @@ def cosine_lr(step: int, max_steps: int, warmup_steps: int, base_lr: float, min_
     return base_lr * (min_frac + (1 - min_frac) * cos)
 
 
-def infinite_loader(ds: PhaseAEpisodeDataset, seed: int = 0) -> Iterator[dict]:
+def infinite_loader(ds: PhaseAEpisodeDataset | PhaseB0EpisodeDataset, seed: int = 0) -> Iterator[dict]:
     """Simple single-process infinite generator. No prefetching."""
     rng = np.random.default_rng(seed)
     while True:
@@ -51,7 +59,7 @@ def _unwrap_single(batch: list) -> dict:
 
 
 def prefetching_loader(
-    ds: PhaseAEpisodeDataset,
+    ds: PhaseAEpisodeDataset | PhaseB0EpisodeDataset,
     num_workers: int,
     pin_memory: bool = False,
 ) -> Iterator[dict]:
@@ -111,7 +119,7 @@ def _assemble_micro_batch(
     micro_eps: list[dict],
     device: torch.device,
 ) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Concatenate episodes into one big (sum_T, ...) micro-batch.
+    """Concatenate episodes into one big (sum_T, ...) micro-batch (Phase A).
 
     Returns (vision_preprocessed, text_rep, text_mask_rep, proprio, history, targets).
     Used by both train_one_step (under grad) and run_validation (under no_grad).
@@ -155,6 +163,86 @@ def _assemble_micro_batch(
     return vision_preprocessed, text_rep, text_mask_rep, proprio, history, targets
 
 
+def _assemble_micro_batch_b0(
+    model: ActionPrimitivesACT,
+    micro_eps: list[dict],
+    device: torch.device,
+) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+    """B0 micro-batch assembler.
+
+    Mirrors `_assemble_micro_batch` but reads from the B0 episode schema:
+    - ``ep["action_history"]`` instead of ``ep["history"]``
+    - training targets nested under ``ep["action_label"]`` (with both quantized
+      bin labels for click_left/click_right/keys/done AND continuous floats for
+      dx/dy/scroll soft-CE)
+    - per-frame ``ep["loss_mask"]`` returned as a separate tensor
+
+    Returns (vision_preprocessed, text_rep, text_mask_rep, proprio, history,
+    targets, loss_mask).
+    """
+    flat_pv: list = []
+    flat_pm: list = []
+    flat_ss: list = []
+    flat_proprio: list = []
+    flat_history: list = []
+    flat_loss_mask: list = []
+    target_keys = (
+        "dx", "dy", "dx_continuous", "dy_continuous",
+        "click_left", "click_right",
+        "scroll", "scroll_continuous",
+        "keys", "done",
+    )
+    flat_targets: dict[str, list] = {k: [] for k in target_keys}
+    text_rep_parts: list = []
+    text_mask_parts: list = []
+    instructions = [e["instruction"] for e in micro_eps]
+    with torch.no_grad():
+        text_tokens = model.backbone.encode_text(instructions)    # (M, T_text, d)
+    for ep_idx, ep in enumerate(micro_eps):
+        T = ep["proprio"].shape[0]
+        # Vision (preprocessed in worker)
+        flat_pv.append(ep["pixel_values"])
+        flat_pm.append(ep["pixel_attention_mask"])
+        flat_ss.append(ep["spatial_shapes"])
+        flat_proprio.append(ep["proprio"].float())
+        flat_history.append(ep["action_history"].float())
+        flat_loss_mask.append(ep["loss_mask"].float())
+        label = ep["action_label"]
+        flat_targets["dx"].append(label["dx_bins"])
+        flat_targets["dy"].append(label["dy_bins"])
+        flat_targets["dx_continuous"].append(label["dx_continuous"])
+        flat_targets["dy_continuous"].append(label["dy_continuous"])
+        flat_targets["click_left"].append(label["click_left"])
+        flat_targets["click_right"].append(label["click_right"])
+        flat_targets["scroll"].append(label["scroll_bins"])
+        flat_targets["scroll_continuous"].append(label["scroll_continuous"])
+        flat_targets["keys"].append(label["key_events"])
+        flat_targets["done"].append(label["dones"])
+        text_rep_parts.append(text_tokens[ep_idx:ep_idx + 1].expand(T, -1, -1))
+        text_mask_parts.append(torch.ones(T, text_tokens.size(1), device=device))
+
+    vision_preprocessed = {
+        "pixel_values": torch.cat(flat_pv, dim=0),
+        "pixel_attention_mask": torch.cat(flat_pm, dim=0),
+        "spatial_shapes": torch.cat(flat_ss, dim=0),
+    }
+    text_rep = torch.cat(text_rep_parts, dim=0)
+    text_mask_rep = torch.cat(text_mask_parts, dim=0)
+    proprio = torch.cat(flat_proprio, dim=0).to(device, non_blocking=True)
+    history = torch.cat(flat_history, dim=0).to(device, non_blocking=True)
+    loss_mask = torch.cat(flat_loss_mask, dim=0).to(device, non_blocking=True)
+    targets = {
+        k: torch.cat(flat_targets[k], dim=0).to(device, non_blocking=True)
+        for k in flat_targets
+    }
+    targets["done"] = targets["done"].float()
+    return vision_preprocessed, text_rep, text_mask_rep, proprio, history, targets, loss_mask
+
+
+_PHASE_A_HEAD_NAMES = ("dx", "dy", "click", "scroll", "keys", "done")
+_PHASE_B0_HEAD_NAMES = ("dx", "dy", "click_left", "click_right", "scroll", "keys", "done")
+
+
 def train_one_step(
     model: ActionPrimitivesACT,
     opt: torch.optim.Optimizer,
@@ -165,6 +253,7 @@ def train_one_step(
     lrs: list[float] | None = None,
     macro_batch_episodes: int = TRAIN.macro_batch_episodes,
     micro_batch_episodes: int = TRAIN.micro_batch_episodes,
+    phase: str = "a",
 ) -> dict[str, float]:
     """Execute one macro-batch step: gradient accumulation over N micro-batches,
     optimizer step, and return per-head losses. Caller manages LR schedule,
@@ -180,6 +269,10 @@ def train_one_step(
     memory pressure). The macro:micro ratio determines how many gradient
     accumulation passes happen per optimizer step.
 
+    ``phase`` selects between Phase A (legacy `total_loss`) and Phase B0
+    (`total_loss_b0` with loss_mask + soft-CE on dx/dy/scroll + dual click
+    heads).
+
     Returns a dict of per-head float losses plus ``total`` and ``grad_norm``.
     """
     if lrs is not None:
@@ -187,14 +280,20 @@ def train_one_step(
             pg["lr"] = lr
 
     opt.zero_grad(set_to_none=True)
-    step_per_head_loss = {k: 0.0 for k in ("dx", "dy", "click", "scroll", "keys", "done")}
+    head_names = _PHASE_B0_HEAD_NAMES if phase == "b0" else _PHASE_A_HEAD_NAMES
+    step_per_head_loss = {k: 0.0 for k in head_names}
     n_micros = macro_batch_episodes // micro_batch_episodes
     for _micro in range(n_micros):
         micro_eps = [next(iterator) for _ in range(micro_batch_episodes)]
         with autocast_ctx:
-            vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
-            out = model(vp, tr, tm, pr, hs)
-            loss, per_head = total_loss(out.head_logits, tgts, head_weights)
+            if phase == "b0":
+                vp, tr, tm, pr, hs, tgts, lm = _assemble_micro_batch_b0(model, micro_eps, device)
+                out = model(vp, tr, tm, pr, hs)
+                loss, per_head = total_loss_b0(out.head_logits, tgts, head_weights, lm)
+            else:
+                vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
+                out = model(vp, tr, tm, pr, hs)
+                loss, per_head = total_loss(out.head_logits, tgts, head_weights)
 
         (loss / macro_batch_episodes * micro_batch_episodes).backward()
         for k, v in per_head.items():
@@ -203,55 +302,135 @@ def train_one_step(
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), TRAIN.grad_clip_norm)
     opt.step()
 
-    step_per_head_loss["total"] = sum(
-        step_per_head_loss[k] for k in ("dx", "dy", "click", "scroll", "keys", "done")
-    )
+    step_per_head_loss["total"] = sum(step_per_head_loss[k] for k in head_names)
     step_per_head_loss["grad_norm"] = float(grad_norm)
     return step_per_head_loss
 
 
 def run_validation(
     model: ActionPrimitivesACT,
-    val_ds: PhaseAEpisodeDataset,
+    val_ds: PhaseAEpisodeDataset | PhaseB0EpisodeDataset,
     device: torch.device,
     autocast_ctx: torch.autocast,
     head_weights: dict[str, float],
     micro_batch_episodes: int,
     max_episodes: int | None = None,
+    phase: str = "a",
 ) -> dict[str, float]:
     """Mean per-head + total loss on the validation split.
 
     Iterates val_ds sequentially (no shuffle) in chunks of ``micro_batch_episodes``
     under torch.no_grad + autocast. If ``max_episodes`` is set, stops early after
     that many episodes (useful when the full val set is large).
+
+    When ``phase == "b0"``, additional B0 diagnostics are accumulated (per-class
+    click recall, soft-CE failure-mode summaries, bin-10 frequency on dx/dy)
+    and returned alongside the loss values. The caller decides how to log them.
     """
     was_training = model.training
     model.train(False)
-    total_losses = {k: 0.0 for k in ("dx", "dy", "click", "scroll", "keys", "done")}
+    head_names = _PHASE_B0_HEAD_NAMES if phase == "b0" else _PHASE_A_HEAD_NAMES
+    total_losses = {k: 0.0 for k in head_names}
     total_sum = 0.0
     n = len(val_ds) if max_episodes is None else min(max_episodes, len(val_ds))
     idx = 0
+    # B0 diagnostic accumulators: collect tensors across micro-batches (CPU)
+    # and compute once at the end so per-class denominators are correct
+    # (e.g. press-class recall must average over real press samples, not
+    # batches that may contain zero of them).
+    b0_buffers: dict[str, list[torch.Tensor]] = {
+        "click_left_preds": [], "click_left_targets": [],
+        "click_right_preds": [], "click_right_targets": [],
+        "dx_logits": [], "dx_continuous": [],
+        "dy_logits": [], "dy_continuous": [],
+    }
     with torch.no_grad():
         while idx < n:
             batch_size = min(micro_batch_episodes, n - idx)
             micro_eps = [val_ds[i] for i in range(idx, idx + batch_size)]
             idx += batch_size
             with autocast_ctx:
-                vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
-                out = model(vp, tr, tm, pr, hs)
-                loss, per_head = total_loss(out.head_logits, tgts, head_weights)
+                if phase == "b0":
+                    vp, tr, tm, pr, hs, tgts, lm = _assemble_micro_batch_b0(
+                        model, micro_eps, device,
+                    )
+                    out = model(vp, tr, tm, pr, hs)
+                    loss, per_head = total_loss_b0(out.head_logits, tgts, head_weights, lm)
+                else:
+                    vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
+                    out = model(vp, tr, tm, pr, hs)
+                    loss, per_head = total_loss(out.head_logits, tgts, head_weights)
             for k, v in per_head.items():
                 total_losses[k] += float(v.detach()) * batch_size
             total_sum += float(loss.detach()) * batch_size
+
+            if phase == "b0":
+                # Stash logits + targets on CPU for end-of-pass diagnostics.
+                # Cast to float32 so soft_ce_diagnostics is numerically stable
+                # under bf16 autocast.
+                hl = out.head_logits
+                b0_buffers["click_left_preds"].append(hl["click_left"].argmax(dim=-1).detach().cpu())
+                b0_buffers["click_left_targets"].append(tgts["click_left"].detach().cpu())
+                b0_buffers["click_right_preds"].append(hl["click_right"].argmax(dim=-1).detach().cpu())
+                b0_buffers["click_right_targets"].append(tgts["click_right"].detach().cpu())
+                b0_buffers["dx_logits"].append(hl["dx"].detach().float().cpu())
+                b0_buffers["dx_continuous"].append(tgts["dx_continuous"].detach().float().cpu())
+                b0_buffers["dy_logits"].append(hl["dy"].detach().float().cpu())
+                b0_buffers["dy_continuous"].append(tgts["dy_continuous"].detach().float().cpu())
     if was_training:
         model.train(True)
     result = {k: v / max(1, n) for k, v in total_losses.items()}
     result["total"] = total_sum / max(1, n)
+
+    if phase == "b0" and b0_buffers["click_left_preds"]:
+        cl_p = torch.cat(b0_buffers["click_left_preds"]).flatten()
+        cl_t = torch.cat(b0_buffers["click_left_targets"]).flatten()
+        cr_p = torch.cat(b0_buffers["click_right_preds"]).flatten()
+        cr_t = torch.cat(b0_buffers["click_right_targets"]).flatten()
+        dx_logits = torch.cat(b0_buffers["dx_logits"], dim=0)         # (N, num_bins)
+        dx_target = torch.cat(b0_buffers["dx_continuous"]).flatten()  # (N,)
+        dy_logits = torch.cat(b0_buffers["dy_logits"], dim=0)
+        dy_target = torch.cat(b0_buffers["dy_continuous"]).flatten()
+
+        mouse_centers = torch.tensor(MOUSE_BIN_CENTERS, dtype=torch.float32)
+        left_recall = per_class_click_recall(cl_p, cl_t)
+        right_recall = per_class_click_recall(cr_p, cr_t)
+        soft_dx = soft_ce_diagnostics(dx_logits, dx_target, mouse_centers)
+        soft_dy = soft_ce_diagnostics(dy_logits, dy_target, mouse_centers)
+        bin10_dx = bin_10_frequency(dx_logits.argmax(dim=-1), dx_target, mouse_centers)
+        bin10_dy = bin_10_frequency(dy_logits.argmax(dim=-1), dy_target, mouse_centers)
+
+        # Scoped under "diag/" to keep the loss namespace clean for the
+        # caller's existing `f"val/{k}"` log shaping.
+        result.update({
+            "diag/click_left/recall_idle":     left_recall["recall_idle"],
+            "diag/click_left/recall_press":    left_recall["recall_press"],
+            "diag/click_left/recall_release":  left_recall["recall_release"],
+            "diag/click_right/recall_idle":    right_recall["recall_idle"],
+            "diag/click_right/recall_press":   right_recall["recall_press"],
+            "diag/click_right/recall_release": right_recall["recall_release"],
+            "diag/dx/sign_acc":          soft_dx["sign_acc"],
+            "diag/dx/entropy":           soft_dx["entropy_mean"],
+            "diag/dx/wrong_sign_mass":   soft_dx["wrong_sign_mass_mean"],
+            "diag/dx/ev_l1":             soft_dx["ev_l1_mean"],
+            "diag/dy/sign_acc":          soft_dy["sign_acc"],
+            "diag/dy/entropy":           soft_dy["entropy_mean"],
+            "diag/dy/wrong_sign_mass":   soft_dy["wrong_sign_mass_mean"],
+            "diag/dy/ev_l1":             soft_dy["ev_l1_mean"],
+            "diag/dx/bin_10_freq":       bin10_dx,
+            "diag/dy/bin_10_freq":       bin10_dy,
+        })
+        # TODO(B0): instruction-zeroing probe — see Task 23.
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--phase", type=str, default="a", choices=["a", "b0"],
+                        help="Training phase. 'a' (default) uses PhaseAEpisodeDataset + "
+                             "total_loss; 'b0' uses PhaseB0EpisodeDataset + total_loss_b0 "
+                             "(loss_mask + soft-CE + dual click heads) and emits B0 val "
+                             "diagnostics.")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="Local parquet dataset directory. Mutually exclusive with --hf-data-repo.")
     parser.add_argument("--epochs", type=int, default=TRAIN.phase_a_epochs)
@@ -311,9 +490,13 @@ def main() -> None:
         data_dir = download_hf_dataset(args.hf_data_repo)
     else:
         data_dir = Path(args.data_dir)
-    train_ds = PhaseAEpisodeDataset(data_dir, split="train")
-    val_ds = PhaseAEpisodeDataset(data_dir, split="val")
-    print(f"train episodes: {len(train_ds)}   val: {len(val_ds)}")
+    if args.phase == "b0":
+        train_ds = PhaseB0EpisodeDataset(data_dir, split="train")
+        val_ds = PhaseB0EpisodeDataset(data_dir, split="val")
+    else:
+        train_ds = PhaseAEpisodeDataset(data_dir, split="train")
+        val_ds = PhaseAEpisodeDataset(data_dir, split="val")
+    print(f"[phase={args.phase}] train episodes: {len(train_ds)}   val: {len(val_ds)}")
 
     # Model
     model = ActionPrimitivesACT().to(device)
@@ -337,13 +520,22 @@ def main() -> None:
     print(f"steps/epoch: {steps_per_epoch}  total: {max_steps}  "
           f"macro={args.macro_batch_episodes}  micro={args.micro_batch_episodes}")
 
-    # Uniform per-head weights for Phase A; Q2's loss rebalancing is Phase B.
-    head_weights = {"dx": 1.0, "dy": 1.0, "click": 1.0, "scroll": 1.0, "keys": 1.0, "done": 1.0}
+    # Uniform per-head weights. Phase A uses the legacy 5-way "click" head;
+    # Phase B0 splits it into "click_left" / "click_right" 3-way heads.
+    if args.phase == "b0":
+        head_weights = {
+            "dx": 1.0, "dy": 1.0,
+            "click_left": 1.0, "click_right": 1.0,
+            "scroll": 1.0, "keys": 1.0, "done": 1.0,
+        }
+    else:
+        head_weights = {"dx": 1.0, "dy": 1.0, "click": 1.0, "scroll": 1.0, "keys": 1.0, "done": 1.0}
 
     # bf16 amp
     autocast = torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
 
     wandb.init(project=args.wandb_project, name=args.wandb_run_name, mode=args.wandb_mode, config={
+        "phase": args.phase,
         "epochs": args.epochs,
         "macro_batch": args.macro_batch_episodes,
         "micro_batch": args.micro_batch_episodes,
@@ -387,6 +579,9 @@ def main() -> None:
     best_val_loss = float("inf")
     patience_counter = 0
     early_stopped = False
+    head_loss_keys = (
+        _PHASE_B0_HEAD_NAMES if args.phase == "b0" else _PHASE_A_HEAD_NAMES
+    )
     while step < max_steps and not early_stopped:
         lrs = [cosine_lr(step, max_steps, TRAIN.warmup_steps, base, TRAIN.cosine_min_lr_frac)
                for base in (TRAIN.lr_trunk, TRAIN.lr_lora)]
@@ -395,6 +590,7 @@ def main() -> None:
             lrs=lrs,
             macro_batch_episodes=args.macro_batch_episodes,
             micro_batch_episodes=args.micro_batch_episodes,
+            phase=args.phase,
         )
         total_loss_avg = metrics["total"]
         grad_norm = metrics["grad_norm"]
@@ -402,7 +598,7 @@ def main() -> None:
         # Log
         log = {"step": step, "loss/total": total_loss_avg, "grad_norm": grad_norm,
                "lr/trunk": opt.param_groups[0]["lr"], "lr/lora": opt.param_groups[1]["lr"]}
-        for k in ("dx", "dy", "click", "scroll", "keys", "done"):
+        for k in head_loss_keys:
             log[f"loss/{k}"] = metrics[k]
         wandb.log(log)
         if step % 20 == 0:
@@ -420,12 +616,18 @@ def main() -> None:
                 model, val_ds, device, autocast, head_weights,
                 micro_batch_episodes=args.micro_batch_episodes,
                 max_episodes=args.val_episodes,
+                phase=args.phase,
             )
-            val_log = {f"val/{k}": v for k, v in val_metrics.items()}
+            # Loss metrics get logged as val/...; B0 diagnostics carry a
+            # "diag/" prefix from run_validation, so we surface them under
+            # val/diag/... to keep the wandb panel clean.
+            val_log: dict[str, float] = {}
+            for k, v in val_metrics.items():
+                val_log[f"val/{k}"] = v
             val_log["step"] = step
             wandb.log(val_log)
             print(f"[val step {step}] total={val_metrics['total']:.4f}  "
-                  + "  ".join(f"{k}={val_metrics[k]:.4f}" for k in ("dx", "dy", "click", "scroll", "keys", "done")))
+                  + "  ".join(f"{k}={val_metrics[k]:.4f}" for k in head_loss_keys))
 
             if val_metrics["total"] < best_val_loss - 1e-6:
                 best_val_loss = val_metrics["total"]

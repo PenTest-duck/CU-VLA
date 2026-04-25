@@ -307,14 +307,20 @@ class PhaseB0EpisodeDataset(PhaseAEpisodeDataset):
             history_per_frame.append(build_action_history_vector(prev))
 
         # ---- Clean expert labels (training targets) ---------------------
+        # Continuous values are kept around alongside the quantized bins
+        # because B0 soft-CE losses (`total_loss_b0`) need the raw float
+        # so they can place mass on the two bins bracketing the target.
+        label_dx_continuous = [float(f["action_label_dx"]) for f in frames]
+        label_dy_continuous = [float(f["action_label_dy"]) for f in frames]
+        label_scroll_continuous = [float(f["action_label_scroll"]) for f in frames]
         label_dx_bins = [
-            quantize_to_bin(f["action_label_dx"], MOUSE_BIN_CENTERS) for f in frames
+            quantize_to_bin(v, MOUSE_BIN_CENTERS) for v in label_dx_continuous
         ]
         label_dy_bins = [
-            quantize_to_bin(f["action_label_dy"], MOUSE_BIN_CENTERS) for f in frames
+            quantize_to_bin(v, MOUSE_BIN_CENTERS) for v in label_dy_continuous
         ]
         label_scroll_bins = [
-            quantize_to_bin(f["action_label_scroll"], SCROLL_BIN_CENTERS) for f in frames
+            quantize_to_bin(v, SCROLL_BIN_CENTERS) for v in label_scroll_continuous
         ]
         label_clicks_5way = [int(f["action_label_click"]) for f in frames]
         click_left, click_right = [], []
@@ -352,6 +358,9 @@ class PhaseB0EpisodeDataset(PhaseAEpisodeDataset):
             "action_label": {
                 "dx_bins": torch.tensor(label_dx_bins, dtype=torch.long),            # (T,)
                 "dy_bins": torch.tensor(label_dy_bins, dtype=torch.long),            # (T,)
+                "dx_continuous": torch.tensor(label_dx_continuous, dtype=torch.float32),     # (T,)
+                "dy_continuous": torch.tensor(label_dy_continuous, dtype=torch.float32),     # (T,)
+                "scroll_continuous": torch.tensor(label_scroll_continuous, dtype=torch.float32),  # (T,)
                 "click_left": torch.tensor(click_left, dtype=torch.long),            # (T,)
                 "click_right": torch.tensor(click_right, dtype=torch.long),          # (T,)
                 "scroll_bins": torch.tensor(label_scroll_bins, dtype=torch.long),    # (T,)
