@@ -131,8 +131,10 @@ def soft_label_ce(
     span = torch.where(span > 1e-6, span, torch.ones_like(span))
     upper_w = (expert_continuous - lower_centers) / span
     lower_w = 1.0 - upper_w
-    upper_w = torch.clamp(upper_w, 0.0, 1.0)
-    lower_w = torch.clamp(lower_w, 0.0, 1.0)
+    # Cast weights to logits.dtype so scatter_ works under bf16 autocast
+    # (logits are bf16; weights computed from fp32 expert_continuous + bin_centers).
+    upper_w = torch.clamp(upper_w, 0.0, 1.0).to(logits.dtype)
+    lower_w = torch.clamp(lower_w, 0.0, 1.0).to(logits.dtype)
 
     # Construct soft target (B, num_bins)
     soft_target = torch.zeros_like(logits)
@@ -211,8 +213,10 @@ def _soft_label_ce_masked(
     upper_centers = bin_centers[upper_idx]
     span = upper_centers - lower_centers
     span = torch.where(span > 1e-6, span, torch.ones_like(span))
-    upper_w = torch.clamp((expert_continuous - lower_centers) / span, 0.0, 1.0)
-    lower_w = 1.0 - upper_w
+    # Cast weights to logits.dtype so scatter_ works under bf16 autocast
+    # (logits are bf16; weights computed from fp32 expert_continuous + bin_centers).
+    upper_w = torch.clamp((expert_continuous - lower_centers) / span, 0.0, 1.0).to(logits.dtype)
+    lower_w = (1.0 - upper_w).to(logits.dtype)
     soft_target = torch.zeros_like(logits)
     soft_target.scatter_(-1, lower_idx.unsqueeze(-1), lower_w.unsqueeze(-1))
     soft_target.scatter_add_(-1, upper_idx.unsqueeze(-1), upper_w.unsqueeze(-1))

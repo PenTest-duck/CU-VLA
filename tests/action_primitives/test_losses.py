@@ -201,3 +201,46 @@ def test_total_loss_b0_zero_mask_zeros_loss():
     head_weights = {n: 1.0 for n in head_logits}
     total, per_head = total_loss_b0(head_logits, targets, head_weights, loss_mask)
     assert total.item() == 0.0
+
+
+def test_soft_label_ce_works_with_bf16_logits():
+    """Regression test: soft_label_ce must handle bf16 logits (used under autocast).
+
+    Phase B0 first training run on HF Jobs failed because lower_w/upper_w were fp32
+    while logits were bf16, causing scatter_ dtype mismatch. Fix casts weights
+    to logits.dtype before scatter.
+    """
+    centers = torch.tensor(MOUSE_BIN_CENTERS, dtype=torch.float32)
+    logits_bf16 = torch.zeros(4, 21, dtype=torch.bfloat16)
+    expert = torch.randn(4, dtype=torch.float32)
+    loss = soft_label_ce(logits_bf16, expert, centers)
+    assert torch.isfinite(loss)
+    assert loss.dtype == torch.bfloat16
+
+
+def test_total_loss_b0_works_with_bf16_logits():
+    """Regression test: total_loss_b0 must handle bf16 logits (used under autocast)."""
+    from experiments.action_primitives.losses import total_loss_b0
+    B = 4
+    head_logits = {
+        "dx":          torch.randn(B, 21, dtype=torch.bfloat16),
+        "dy":          torch.randn(B, 21, dtype=torch.bfloat16),
+        "click_left":  torch.randn(B, 3,  dtype=torch.bfloat16),
+        "click_right": torch.randn(B, 3,  dtype=torch.bfloat16),
+        "scroll":      torch.randn(B, 21, dtype=torch.bfloat16),
+        "keys":        torch.randn(B, 231, dtype=torch.bfloat16),
+        "done":        torch.randn(B, 1,  dtype=torch.bfloat16),
+    }
+    targets = {
+        "dx_continuous":      torch.randn(B),
+        "dy_continuous":      torch.randn(B),
+        "scroll_continuous":  torch.randn(B),
+        "click_left":         torch.randint(0, 3, (B,)),
+        "click_right":        torch.randint(0, 3, (B,)),
+        "keys":               torch.randint(0, 3, (B, 77)),
+        "done":               torch.randint(0, 2, (B,)).float(),
+    }
+    loss_mask = torch.ones(B)
+    head_weights = {n: 1.0 for n in head_logits}
+    total, per_head = total_loss_b0(head_logits, targets, head_weights, loss_mask)
+    assert torch.isfinite(total)
