@@ -41,8 +41,15 @@ Serves as a high-level table of contents.
 | `experiments/miniwob_pygame/`                                                      | Experiment 3 code (see below)                                                                                          |
 | `docs/plans/2026-04-14-mini-editor-design.md`                                      | Experiment 5 full design doc — mini text editor task for V+L+A                                                         |
 | `experiments/mini_editor/`                                                         | Experiment 5 code (see below)                                                                                          |
-| `scripts/launch_hf_job.py`                                                         | Launcher for HF Jobs training (calls `run_uv_job()`)                                                                   |
-| `scripts/hf_job_train.py`                                                          | UV script that runs inside HF Jobs (clones repo, runs train.py)                                                        |
+| `docs/experiments/6-action-primitives.md`                                          | Experiment 6 full design doc — event-level action primitives + Amendments section from Phase A                         |
+| `docs/plans/2026-04-23-action-primitives-phase-a-implementation.md`                | Experiment 6 Phase A implementation plan — 25-task breakdown                                                           |
+| `docs/experiments/6-action-primitives-phase-a-results/`                            | Experiment 6 Phase A spike results + PHASE-A-SUMMARY.md                                                                |
+| `experiments/action_primitives/`                                                   | Experiment 6 code (see below)                                                                                          |
+| `docs/research/hf-jobs-gotchas.md`                                                 | HF Jobs debugging reference — 5-iteration journey to first successful Phase A training run                             |
+| `scripts/launch_hf_job.py`                                                         | Launcher for HF Jobs training (calls `run_uv_job()`) — exp2/3/5                                                        |
+| `scripts/hf_job_train.py`                                                          | UV script that runs inside HF Jobs (clones repo, runs train.py) — exp2/3/5                                             |
+| `scripts/launch_hf_job_exp6.py`                                                    | Launcher for exp6 HF Jobs training (forwards WANDB_API_KEY + HF_TOKEN)                                                 |
+| `scripts/hf_job_train_exp6.py`                                                     | UV script for exp6 HF Jobs (clones `feat/exp6-phase-a` branch, runs training unbuffered)                               |
 | `scripts/migrate_hdf5_to_parquet.py`                                               | One-shot migration from HDF5 episodes to parquet                                                                       |
 
 ## Experiment 1: Reactive Clicks
@@ -237,6 +244,69 @@ observation = {
 
 **Design doc:** `docs/plans/2026-04-14-mini-editor-design.md`
 
+## Experiment 6: Action Primitives
+
+Event-level primitives (mouse_down/up, key_down/up, scroll) instead of high-level actions. Phase A is a minimum-viable end-to-end slice (L-click only) to de-risk the full design via four feasibility spikes: A (typing legibility), B (L-click end-to-end), C (M1 eval timing), E (pygame gen throughput).
+
+**Architecture (Phase A):**
+
+SigLIP2-B-naflex @ `max_num_patches=256` vision (LoRA rank-8, trainable ~0.6M) + frozen text tower (instructions only) + 2-layer proprio MLP (83 → 768) + history encoder (223 → 768, 8-frame lookback) + 3-block cross+self attention trunk (16 learnable queries, d=768) + 6 unpooled factored heads (dx 21 + dy 21 + click 5 + scroll 21 + keys 231 + done 1). Total 408.8M params, 33.6M trainable.
+
+**Run sequence (Phase A L-click):**
+
+```bash
+uv run python -m experiments.action_primitives.generate_data -n 3000 -o data/phase-a-lclick --shard-size 500
+uv run python -m experiments.action_primitives.measurements.gen_throughput -n 1000  # Spike E
+uv run python -m experiments.action_primitives.probes.typing_legibility_per_patch  # Spike A
+uv run python -c "from huggingface_hub import create_repo; create_repo('PenTest-duck/cu-vla-exp6-phasea-lclick', repo_type='dataset', exist_ok=True); create_repo('PenTest-duck/cu-vla-exp6-phasea-ckpt', repo_type='model', exist_ok=True)"
+uv run python -c "from experiments.action_primitives.hf_sync import upload_parquet_dir; from pathlib import Path; upload_parquet_dir(Path('data/phase-a-lclick'), 'PenTest-duck/cu-vla-exp6-phasea-lclick', 'dataset')"
+export WANDB_API_KEY=<key>
+uv run python scripts/launch_hf_job_exp6.py --flavor l4x1 --timeout 4h -- --hf-data-repo PenTest-duck/cu-vla-exp6-phasea-lclick --epochs 5 --hf-upload-repo PenTest-duck/cu-vla-exp6-phasea-ckpt --wandb-run-name phase-a-spike-b --micro-batch-episodes 4 --num-workers 4 --ckpt-every-steps 20 --eval-every-steps 20 --early-stop-patience 3
+uv run python -m experiments.action_primitives.evaluate --checkpoint <ckpt> --data-dir data/phase-a-lclick --n-rollouts 200 --device mps                    # Spike B closed-loop
+uv run python -m experiments.action_primitives.evaluate --checkpoint <ckpt> --data-dir data/phase-a-lclick --n-rollouts 20 --device mps --visual --skip-offline  # live pygame eval window
+uv run python -m experiments.action_primitives.measurements.m1_eval_timing --checkpoint <ckpt> --n-rollouts 100  # Spike C
+```
+
+**Code layout:**
+| File | Purpose |
+|------|---------|
+| `config.py` | All hyperparameters (ENV, MODEL, LOSS, TRAIN, PHASE_A_DATA); bin-center math; 83-dim proprio + 223-dim history schema |
+| `env.py` | `LClickEnv` — 720×450 pygame canvas with one colored button; headless or `visual=True` for live eval |
+| `expert.py` | `LClickExpert` — Fitts-law trajectory + 4 tempo profiles + overshoot with press-on-target verification |
+| `generator.py` | `generate_one_episode` — runs env + expert in lockstep, emits per-frame rows with env_done_frame drift detection |
+| `generate_data.py` | Batched parquet writer with `--workers` + idempotency guard |
+| `backbones.py` | `SigLIP2Naflex` with `preprocess` / `encode_preprocessed` / `encode_image` split; LoRA attached via `apply_lora` |
+| `proprio.py` / `history.py` | 2-layer MLP encoders (83→768 and 223→768 respectively) |
+| `trunk.py` | 3-block cross+self attention with 16 learnable queries |
+| `heads.py` | Unpooled 6-head flatten(16 × 768)→logits |
+| `model.py` | `ActionPrimitivesACT` — wires everything; `forward` is polymorphic over PIL list or preprocessed dict |
+| `dataset.py` | `PhaseAEpisodeDataset` — parquet loader + on-the-fly quantization + history-vector construction + optional SigLIP2 preprocessing in worker |
+| `losses.py` | Focal CE + idle-biased smoothing on keys + focal BCE for done + `total_loss` aggregator |
+| `train.py` | AdamW two-param-group + cosine warmup + grad accum + DataLoader prefetch + val eval + best.pt tracking + early stopping |
+| `evaluate.py` | Offline per-head accuracy + closed-loop rollouts with tolerance curves; `--visual` live mode, tqdm progress |
+| `hf_sync.py` | HF Hub upload/download helpers |
+| `probes/typing_legibility.py` | Spike A string-presence probe (mean + attention pool) |
+| `probes/typing_legibility_per_patch.py` | Spike A per-patch char-identity probe (62-way, no space) |
+| `measurements/gen_throughput.py` | Spike E |
+| `measurements/m1_eval_timing.py` | Spike C |
+
+**Action space (Phase A):**
+
+```python
+action = {
+    "dx": float,            # 21-bin exponential, ±100 px/frame
+    "dy": float,            # 21-bin exponential, ±100 px/frame
+    "click": int,           # 5-way {idle, L_press, L_release, R_press, R_release}
+    "scroll": float,        # 21-bin exponential, ±20 ticks/frame (always idle in L-click)
+    "key_events": [77],     # 3-way per key {press=0, release=1, idle=2}
+    "done": int,            # binary (training-only)
+}
+```
+
+**Design doc:** `docs/experiments/6-action-primitives.md` (see Amendments section for Phase A findings)
+**Phase A plan:** `docs/plans/2026-04-23-action-primitives-phase-a-implementation.md`
+**Phase A results:** `docs/experiments/6-action-primitives-phase-a-results/`
+
 ## Experiment Results
 
 Experiment 1: simple CNN got pretty perfect results
@@ -244,6 +314,7 @@ Experiment 2: ACT, 10 chunks, ResNet18 got 94% eval. No ablations tested.
 Experiment 3: skipped
 Experiment 4: skipped
 Experiment 5: in progress
+Experiment 6 Phase A: Spike A ✓ (typing legibility per-patch 74% @ 14pt), Spike E ✓ (3.6 eps/s single-proc; 200 eps/s target revised), Spike B in progress, Spike C pending
 
 ## Key Technical Decisions (from research)
 

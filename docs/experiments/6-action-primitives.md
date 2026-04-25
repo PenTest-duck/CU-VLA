@@ -6,7 +6,22 @@ In anticipation of potential dual-system operation where reasoning happens in a 
 
 **Performance targets:** logical framerate 30Hz (aspirational). Real-time wall-clock on current M1 PyTorch/MPS stack measured at ~7–15Hz; INT8+MLX optimization could potentially reach 15–22Hz. For v1, training and within-env eval use pygame slowdown so logical 30Hz is achievable regardless of wall-clock. Real-time 30Hz deployment deferred to Q29 (inference optimization).
 
-**Status:** design complete. All 39 design questions closed. Ready for dataset generation + implementation.
+**Status:** design v2 (2026-04-23). All 43 design questions closed; pre-implementation brainstorm pass added Phase A feasibility spikes and several amendments (see `6-action-primitives-changelog.md`). Ready for Phase A; Phase B (full v1) runs after per-spike review.
+
+---
+
+## Phase A — feasibility spikes (run before Phase B)
+
+Four spikes to de-risk load-bearing assumptions before committing to the full generator + training stack. Each spike produces a write-up; user reviews and approves proceeding on a per-spike basis. No pre-committed quantitative thresholds — judgment call per spike based on results.
+
+| Spike | What it validates | Effort |
+|---|---|---|
+| **A — Typing legibility probe** | Can SigLIP2 naflex @ `max_num_patches=256` actually resolve 14pt+ rendered text? Linear-probe patch features on rendered character content, or cross-attention visualization. Highest architectural risk — informs Q5/Q6 decision on typing feedback mechanism. | 2–3 days |
+| **B — L-click end-to-end** | Whole pipeline works: generator → data format → model → training loop → eval. ~3K episodes of L-click primitive, 3–5 epochs, closed-loop val pass. Subsumes dataloader throughput (Q21) and architecture assembly testing. | 5–7 days |
+| **C — M1 closed-loop eval timing** | Real wall-clock for 100-episode rollouts on M1 fp16 MPS. Validates Tier-B eval budget (Q25). Run as a 1-hour follow-up to B. | 1 day |
+| **E — Pygame generation throughput** | Generate 1K episodes each of click, drag, type; measure eps/sec, storage per episode, parquet shard size. Validates Q7's "≥200 eps/sec" claim. Runs in parallel with A. | 0.5 day |
+
+**Dependencies on spike outcomes:** see "Open items" in `6-action-primitives-changelog.md` for which Q-decisions each spike may reopen.
 
 ---
 
@@ -119,7 +134,7 @@ State-as-input, integrated as an additional K/V token in the trunk (see Q15 for 
 
 | Actuator | Head | Loss | Notes |
 |---|---|---|---|
-| Mouse `delta_x` | 21-bin exponential CE | Focal CE (γ≈2) + label smoothing (σ≈1 bin) | 10+1+10 layout, α≈2–3, ±50px. Expected-value readout at inference (softmax × bin_centers → continuous delta). |
+| Mouse `delta_x` | 21-bin exponential CE | Focal CE (γ≈2) + label smoothing (σ≈1 bin) | 10+1+10 layout, α≈2.5, **±100px** (widened from ±50px to cover human flicks, 2026-04-23). Finest bin ≈0.75px; coarsest ≈100px. Expected-value readout at inference. |
 | Mouse `delta_y` | 21-bin exponential CE | Same as above | Same layout. |
 | Click (delta) | 5-way softmax CE | Focal CE | `{idle, L_press, L_release, R_press, R_release}`. Trackpad exclusivity built-in. |
 | Scroll | 21-bin signed exponential CE | Focal CE + label smoothing | Signed scroll delta per frame. Mirrors mouse philosophy — captures velocity, matches human action space. |
@@ -136,9 +151,11 @@ State-as-input, integrated as an additional K/V token in the trunk (see Q15 for 
 **Why 21 bins per axis (not 49, not 11):**
 - **Literature range:** VPT (2022) used 11 per axis for angular camera control in Minecraft; JARVIS-VLA (2025) used 21 per μ-law-encoded axis; FDM-1 (2026) used 49 (ambiguous; likely 49 per axis given text, though figure is suggestive of ~7 per axis).
 - **Data-efficiency argument:** with ~400K transitions, 49 per axis leaves each tail bin with hundreds of examples — marginal training signal. 21 per axis doubles per-bin examples.
-- **Precision argument:** the finest non-zero bin at 21×α≈3 is ~0.5–1px, which already matches real label-noise floor on screen recordings. Sub-pixel bins are spurious precision.
+- **Precision argument:** at ±100px with α≈2.5, the finest non-zero bin is ≈0.75px; naflex's 2.25× internal downscale already floors useful precision at ~1–2 source px. Sub-pixel bins are spurious precision.
 - **Multimodality argument:** practical mouse distributions have ≤3 modes; 15+ bins is more than sufficient. FDM-1 at 49 was matched to 11M hours — different regime.
 - Alignment with scroll head at 21 bins keeps the architecture uniform.
+
+**Why ±100px (widened from ±50px, 2026-04-23):** at 30Hz, deliberate cross-screen motion is ~50px/frame but fast human flicks reach 100–167px/frame. Q9 training data deliberately includes "superhuman burst" tempos; ±50px would clip that signal at the top bin. ±100px covers typical flicks with minor loss at the finest bins (still below naflex's useful precision floor).
 
 Lost ordinal structure is mitigated by **label smoothing across adjacent bins** and **expected-value readout at inference** (softmax × bin_centers → continuous delta).
 
@@ -166,7 +183,7 @@ Lost ordinal structure is mitigated by **label smoothing across adjacent bins** 
 
 **Decision — Tier 1 stack (cheap, principled, no adaptive methods):**
 
-1. **Balanced primitive sampler.** Stratify batches by primitive group (A/B/C) and sub-type. Strongest lever; fixes sparsity at the data source rather than the loss downstream. Synthetic env gives us this for free.
+1. **Balanced primitive sampler via micro-batch grad accumulation.** Macro-batch = 8 micro-batches × 8 episodes, each micro-batch homogeneous by primitive sub-type; the 14 primitive sub-types cycle across consecutive macro-batches so each sub-type gets roughly equal exposure. Accumulate gradients across the 8 micro-batches; optimizer steps once per macro-batch. Clean tensor shapes per forward pass; blended multi-task gradient per step. Strongest lever; fixes sparsity at the data source rather than the loss downstream (see Q8 for the reconciliation with per-primitive fixed windows).
 
 2. **Focal CE on all heads (mouse `dx`, `dy`, click, scroll, keyboard).** γ ≈ 2, α balancing the majority "idle/zero" class. Uniform focal treatment across all heads — the delta keyboard decision (Q3) makes this clean: all heads are softmax CE with focal weighting.
 
@@ -311,7 +328,14 @@ Chunking was initially motivated by latency amortization: "30 Hz on M1 with SigL
 
 Single-frame's benefits: simpler, closer to minimal-inductive-bias, closed-loop responsive every frame, no train/inference mismatch, trivial to debug.
 
-**Coupling with Q6 (encoder choice):** 30 Hz achievability on M1 is entirely an encoder-latency question now. SigLIP2 at 720p in single-frame mode is likely 15–20 Hz. FastViT-like or distilled-SigLIP variants can reach 30 Hz. Q6 decides the actual control rate ceiling.
+**Coupling with Q6 / Q16 reality (updated 2026-04-23):** earlier drafts of Q5 framed chunking as rejected because "Q6 encoder choice resolves latency." Q16's empirical measurement shows that's not true: current PyTorch MPS stack delivers ~7.6Hz wall-clock for the full pipeline on M1, not 30Hz. Single-frame output is nonetheless the right call on its independent merits:
+
+- Closed-loop responsiveness every frame (chunking commits to a stale plan for K frames)
+- Simpler debug and no train/inference distribution mismatch
+- Action history (8 past frames) + proprio carry enough temporal context for Double-click, Drag, Click-and-hold without chunking's modeling wins
+- Logical 30Hz is achievable for training and within-env eval via pygame slowdown (env paused during inference), decoupling wall-clock from logical clock
+
+Real-time 30Hz deployment is a separate concern, tracked in Q29 (MLX/INT8 port, post-v1).
 
 **Idle-frame handling during typing rhythm:**
 Human typing at 120 WPM produces ~3 idle frames between keystrokes at 30 Hz. Handled by:
@@ -527,7 +551,9 @@ Broader design questions not yet resolved, grouped by area. Roughly prioritized:
 | Press-and-hold | ~1,000 | 60 | Variant of chord |
 | **Total** | **~24,500 episodes** | | **~1.3–1.5M transitions** |
 
-**Window strategy: per-primitive-type fixed windows** (option B). Each primitive type has its own fixed window sized to natural length distribution. Within a type, episodes padded to that window with no-op continuations. Batches stratified by primitive type (from Q2 balanced sampler) → same-window-length within a batch, clean tensor shapes.
+**Window strategy: per-primitive-type fixed windows** (option B). Each primitive type has its own fixed window sized to natural length distribution. Within a type, episodes padded to that window with no-op continuations.
+
+**Batching with micro-batch grad accumulation** (reconciles Q2's balanced sampler with per-primitive windows): each optimizer step consumes a macro-batch of 64 episodes split into 8 micro-batches × 8 episodes, where each micro-batch is homogeneous by primitive sub-type (same window length → clean tensor shapes). Gradients accumulate across the 8 micro-batches; optimizer steps once per macro-batch. Across consecutive macro-batches the 14 primitive sub-types cycle so each gets roughly equal exposure. This gives clean shapes per forward pass AND blended multi-task gradient per step — closer to π0 / OpenVLA-OFT patterns than either single-primitive-per-batch (literal earlier reading) or true variable-length masked batches (~200–500 LOC cost rejected below).
 
 Window lengths per primitive are specified in Q9's recipe tables. Summary: Group A primitives (hover/click family): 30–45 frames. Group B primitives (drag, scroll, click-and-hold): 60–90 frames. Group C typing sub-categorized by string length: 45/120/240 frames. Chord: 30. Press-and-hold: 60.
 
@@ -611,7 +637,7 @@ Each primitive type has a dedicated Python generator class that produces episode
 |---|---|---|---|
 | Click-and-hold | Approach, settle, L_press, hold (10–40f), L_release | 60 | Hold duration varied |
 | Drag A → B | Approach A, L_press, drag path to B, L_release | 90 | Two-target grounding, continuous closed-loop |
-| Scroll-to-target | Scroll events until target enters viewport, then stop | 90 | **Newly added** — closed-loop visual grounding; target initially off-screen in a scrollable list |
+| Scroll-to-target | Scroll events until target enters viewport, then stop | 90 | **Spec (2026-04-23):** content type randomized per episode between (a) text-row list of 15–30 colored rows (reused/adapted from `miniwob_pygame/widgets.py` `ScrollableList`) and (b) scrollable page/document with a button below the fold. Input: scroll-wheel only (maps to 21-bin scroll head); no scrollbar-drag (would collide with Drag primitive grounding); no arrow-keys in v1. Target initially off-screen; closed-loop visual grounding as target enters viewport. |
 
 **Group C — Blind keyboard**
 
@@ -1341,14 +1367,16 @@ LR values assume typical batch sizes (64–512). Q21 (batch size) may require LR
 
 **Confidence: medium.**
 
-Episode-level batches (not frame-level): each batch contains 64 full episodes, each contributing its full window of frames to the loss (batch size ~3,500 frames on average across primitives). Matches the stratified-by-primitive-type sampling from Q2 and the per-primitive fixed windows from Q8.
+Episode-level batches (not frame-level): each macro-batch contains 64 full episodes, each contributing its full window of frames to the loss (macro-batch size ~3,500 frames on average across primitives). Realized as **8 micro-batches × 8 episodes per macro-batch** with gradient accumulation (see Q2/Q8): each micro-batch is homogeneous by primitive sub-type for clean tensor shapes; grads accumulate across 8 micro-batches; optimizer steps once per macro-batch. Across consecutive macro-batches the 14 primitive sub-types cycle so each gets roughly equal exposure.
 
 Rejected:
 - Frame-level sampling — breaks stratification, harder to reason about per-primitive coverage
 - Batch size 32 — too little per-primitive signal (14 sub-types means only 2–3 samples per primitive)
 - Batch size 128 — memory pressure on L40S; diminishing returns on gradient noise
+- Single-primitive homogeneous batches without accumulation — gradient magnitude swings step-to-step as trunk alternates between primitive types
+- True mixed batches with padding + attention/loss masks — ~200–500 LOC cost rejected in Q8
 
-Gradient accumulation to effective 128 or 256 available as a fallback if per-primitive gradient variance is problematic.
+Effective macro-batch size can be further increased (to 128 or 256 episodes) by adding more micro-batch steps per optimizer step if per-primitive gradient variance is problematic.
 
 ### Training duration: 20 epochs (~7,600 steps)
 
@@ -1413,7 +1441,7 @@ Prior exp2 had DataLoader bottleneck. For 1M frames:
 | Best-checkpoint metric | Mean primitive success rate | High |
 | Warmup | 500 steps linear (from Q20) | High |
 | LR schedule | Cosine to 10% of max over 7,600 steps (from Q20) | High |
-| Gradient accumulation | None default | High |
+| Gradient accumulation | 8 micro-batches × 8 episodes per macro-batch (for per-primitive micro-batch homogeneity per Q2/Q8; blended multi-task grad per optimizer step) | High |
 
 ### Q27 ablations queued
 
@@ -1584,7 +1612,7 @@ Distinct from Q10–Q12's generation-time diversity, Q23's per-step augmentation
 | Double-click | Two L-clicks within 15-frame window at same target | 0 px, ≤15 frames | 7/10 |
 | Click-and-hold | L-press at target, held ≥N frames without release | 0 px, N=primitive-spec | 8/10 |
 | Drag A→B | L-press at A, L-release at B, cursor inside B bbox at release | 0 px endpoints; trajectory not required | 8/10 |
-| Scroll-to-target | Target visible in viewport + no more scroll needed | Visibility check per scene | 6/10 |
+| Scroll-to-target | Target bbox entirely inside viewport at episode end AND no scroll events for last ≥5 frames (tests "recognize I'm done") | Bbox visibility + 5-frame quiescence | 6/10 |
 | Type-short/med/long | Final visible text matches target exactly | Exact string match | 8/10 (6/10 on exact-match choice) |
 | Chord | All keys in chord held simultaneously within 3-frame window | N=3 frames | 6/10 |
 | Press-and-hold | Key held for ≥target duration without intermediate release | Within ±3 frames of target | 6/10 |
@@ -1592,6 +1620,17 @@ Distinct from Q10–Q12's generation-time diversity, Q23's per-step augmentation
 **Rationale for 0px tolerance:** our pygame env generates bbox ground-truth directly — no annotation noise unlike human-labeled ScreenSpot (which uses ~3-5px tolerance). Model clicks either inside or outside the designed target.
 
 **Literature anchor:** ScreenSpot click accuracy (proportion of predicted clicks falling inside GT bbox) is the dominant grounding metric in 2025 GUI-agent literature. Our Tier-1 for click/hover primitives matches this convention.
+
+### Tier 1.5 — tolerance / edit-distance curves (added 2026-04-23)
+
+Binary Tier-1 doesn't distinguish "1px outside" from "100px off" or "1 typo in 16 chars" from "every char wrong." Tier-1.5 reports the underlying curves at negligible extra cost (data already captured in Tier-2):
+
+| Primitive family | Tier-1 (unchanged) | Tier-1.5 curve |
+|---|---|---|
+| Click / hover / drag endpoints | Inside bbox (0px) | Success @ {0, 3, 5, 10}px cumulative tolerance |
+| Type-short / med / long | Exact string match | Success at edit-distance {≤0, ≤1, ≤2} and normalized Levenshtein ratio |
+
+**Role:** diagnostic granularity only. Best-checkpoint selection still uses Tier-1 (0px / exact-match) so physical-keyboard and bbox-strict semantics remain the primary metric. Tier-1.5 answers "is the model clicking near?" and "is the model mistyping by one key?" without changing what we optimize for.
 
 ### Tier 2 — diagnostic sub-metrics (always logged)
 
@@ -1927,13 +1966,15 @@ Both limited by action-space mismatch; comparison would need to restrict to prim
 
 ### Inference-time diagnostic probes (cheap substitutes, included in v1 eval)
 
-Two free probes run at final eval time — no separate training required:
+Three free probes run at final eval time — no separate training required:
 
 **Probe 1: Zero-out action history at inference.** During closed-loop eval on test set, run half the episodes with real action history tokens and half with all-zeros history tokens. Compare per-primitive success rates. Tests whether model *relies on* action history.
 
 **Probe 2: Zero-out proprio at inference.** Same idea on proprio token. Tests whether model *relies on* state input.
 
-Both tell us about reliance, not about counterfactual performance if trained without these inputs. Enough diagnostic value for v1.
+**Probe 3: Zero-out instruction at inference (added 2026-04-23).** Same pattern on the cached instruction tokens. Measures how much the model actually conditions on the instruction vs exploits scene-level correlations (e.g., "there's only one red thing, click it regardless of what was asked"). Particularly informative for scenes with natural attribute-target alignments; failure to use instruction means Q10's adversarial-scene coverage may be insufficient.
+
+All three tell us about reliance, not about counterfactual performance if trained without these inputs. Enough diagnostic value for v1.
 
 **Confidence: 8/10** these probes are worth including.
 
@@ -2002,6 +2043,7 @@ Beyond the inference-time probes above, two low-cost additions to v1 eval protoc
 | Dedicated ablation runs in v1 | None | 8/10 |
 | Inference-time probe: zero action history | Include | 8/10 |
 | Inference-time probe: zero proprio | Include | 8/10 |
+| Inference-time probe: zero instruction (2026-04-23) | Include | 8/10 |
 | Cursor-sprite OOD as 7th slice | Include | 9/10 |
 | EMA vs non-EMA checkpoint comparison | Include (zero cost) | 9/10 |
 | Full ablation backlog | Documented, prioritized, driven by v1 results | 8/10 |
@@ -2095,6 +2137,11 @@ Cheap substitutes for dedicated ablation training runs:
 - Particularly informative for Chord / Press-hold (theoretically impossible without held-key state)
 - Answers: "does the model actually use proprio state?"
 - Note: cursor remains rendered on the visual frame (it's part of the screen); only the explicit proprio `(x, y)` and held-key bits are zeroed. So this probe tests reliance on explicit state input, not cursor-concept learning. For the latter, use the Q11 cursor-sprite OOD test.
+
+**Instruction ablation probe (added 2026-04-23):**
+- Same pattern but zero-out cached instruction tokens
+- Tests whether the model actually conditions on the instruction or exploits scene-level correlations
+- Particularly informative for scenes where target attributes are naturally unique (and instruction is therefore theoretically redundant). A model that succeeds here without the instruction is pattern-matching on the scene, not following instructions.
 
 **Run cadence:** once per major eval milestone (end of training), not every 500 steps.
 
@@ -2353,8 +2400,8 @@ Bayesian optimization adaptive sampling: cuts 30–50% but still 70–100 L40S-h
 |---|---|
 | Dataset hosting | HuggingFace Datasets |
 | Model checkpoint hosting | HuggingFace Model Hub |
-| Training compute (primary) | HuggingFace Jobs |
-| Training compute (fallback) | AWS SageMaker |
+| Training compute | HuggingFace Jobs (v1 sole platform) |
+| Training compute — future fallback | AWS SageMaker — deferred post-v1 per 2026-04-23 simplification; added only if/when HF credits exhaust |
 | Training diagnostics | Weights & Biases |
 | Code repository | GitHub |
 
@@ -2375,7 +2422,6 @@ Bayesian optimization adaptive sampling: cuts 30–50% but still 70–100 L40S-h
 - Pin: torch, transformers, datasets, peft (LoRA), wandb, pygame, numpy
 - Pin Python version (3.11 or 3.12)
 - Pin CUDA version for L40S
-- **Critical for mid-training platform switch:** environment must be reproducible across HF Jobs and SageMaker
 
 ### Config versioning
 
@@ -2384,7 +2430,7 @@ Bayesian optimization adaptive sampling: cuts 30–50% but still 70–100 L40S-h
 - W&B run captures full config as metadata
 - Git commit hash logged alongside W&B run
 
-### Resume-ready checkpoint protocol (critical for HF Jobs → SageMaker switch)
+### Resume-ready checkpoint protocol (crash recovery on HF Jobs)
 
 **Checkpoint contents (everything needed to resume without loss):**
 - Model weights (trunk + LoRA + heads + EMA)
@@ -2401,16 +2447,13 @@ Bayesian optimization adaptive sampling: cuts 30–50% but still 70–100 L40S-h
 - Upload to HF Hub automatically per checkpoint (async background to avoid blocking training)
 - Retry queue for network failures
 
-**Resume protocol:**
+**Resume protocol (same-platform crash recovery):**
 1. Download latest checkpoint from HF Hub
 2. Restore all state
 3. Continue training from last step
 4. W&B reattaches to same run ID for continuous logging
 
-**Mid-training platform switch validation (pre-v1):**
-- 1000-step training run → save checkpoint → kill process → resume on fresh process
-- Verify loss curves continue smoothly without visible discontinuity
-- Confidence: 9/10 this small validation is worth doing before v1 full run
+**Smoke test (pre-v1):** 1000-step training run → save checkpoint → kill process → resume on fresh process; verify loss curves continue smoothly without visible discontinuity. Validates the resume protocol for HF-Jobs crash recovery. Cross-platform (HF Jobs → SageMaker) switch validation deferred post-v1 per Q35 simplification.
 
 ### Checkpoint format
 
@@ -2418,15 +2461,9 @@ Bayesian optimization adaptive sampling: cuts 30–50% but still 70–100 L40S-h
 - Separately loadable: trunk weights, LoRA adapters, head weights (enables partial loading)
 - Both "best" (by val primitive success rate) and "final" (end of training)
 
-### HF Jobs → SageMaker switch readiness
+### HF Jobs → SageMaker switch readiness (post-v1 only)
 
-**Risks when switching mid-training:**
-1. **Dependency parity** — SageMaker deep learning AMIs may not match HF Jobs environment exactly. Mitigation: pin exact versions, document setup for both platforms.
-2. **Data access** — HF Datasets streaming works from both. Low risk.
-3. **W&B reconnection** — same run ID continues. Low risk.
-4. **Checkpoint compatibility** — PyTorch state_dict is portable. Low risk.
-
-**Confidence: 7/10** mid-training switch works on first attempt assuming resume protocol tested in advance.
+Cross-platform switching is out of scope for v1 per the 2026-04-23 simplification. When/if we need it (HF credits exhaust), the main risks are dependency parity (SageMaker deep-learning AMIs vs HF Jobs env) and data access (HF Datasets streaming should work from both). Checkpoints on HF Hub are already platform-portable (PyTorch state_dict), so the artifact side is fine. Address as its own small project when triggered.
 
 ### W&B logging cadence (from Q21)
 
@@ -2449,7 +2486,7 @@ Bayesian optimization adaptive sampling: cuts 30–50% but still 70–100 L40S-h
 3. Fix all seeds
 4. Upload dataset + final model to HF Hub
 5. W&B run link in README
-6. **Test checkpoint resume protocol before v1 full run**
+6. **Test same-platform checkpoint-resume protocol before v1 full run** (crash recovery on HF Jobs; cross-platform switch deferred post-v1)
 
 **Confidence: 9/10** that this is sufficient for v1.
 
@@ -2584,7 +2621,7 @@ Bayesian optimization adaptive sampling: cuts 30–50% but still 70–100 L40S-h
 - RNG state exactness: resumed run's batch order differs from hypothetical no-crash run. Minor effect on training dynamics; not meaningful.
 - Sub-500-step progress: worst-case lose ~500 steps of training (<10% of epoch).
 
-**If HF Jobs compute budget exhausts mid-run:** switch to AWS SageMaker per Q35. `latest` checkpoint on HF Hub transfers cleanly between compute platforms.
+**If HF Jobs compute budget exhausts mid-run:** out of scope for v1 per Q35 (2026-04-23). If it happens, treat it as its own small project — HF-Hub checkpoints are platform-portable, so the artifact side is already fine; the work is SageMaker environment setup + dependency parity.
 
 **Confidence: 9/10** — simple, pragmatic, matches available infrastructure.
 
@@ -2632,3 +2669,62 @@ Stratified batching from Q2 ensures balanced exposure per primitive. All heads t
 **What this trades:** early-cancel compute savings for simplicity. If a run is going to fail, Q40 diagnostics catch it in epoch 1 (~30 min of wall-clock). If it passes epoch 1 but fails later, we've spent a few hours of L40S — acceptable cost for workflow simplicity.
 
 **Confidence: 8/10** — matches your manual-review-after-full-run workflow preference.
+
+---
+
+## Amendments (Phase A findings, 2026-04-24)
+
+Revisions to the questions above based on Spike A, B, C, E results. Phase B planning should treat these as authoritative overrides. Full derivations in [docs/experiments/6-action-primitives-phase-a-results/](6-action-primitives-phase-a-results/).
+
+### Q7 — Pygame generator throughput (revised)
+
+- **Was:** "pygame env generates at ≥200 eps/sec on consumer CPU."
+- **Now:** **≥20 eps/s single-process on M1** (measured 3.61 eps/s at N=1000 in Spike E). Naive `multiprocessing.Pool.imap` at default `chunksize=1` is *slower* than serial (1.79 eps/s at workers=4 on M1) because of spawn+pygame init cost per worker and IPC payload size. The 200 eps/s target is only achievable with a **worker-writes-shards redesign** where workers own episode ranges and write their own parquet shards, eliminating the IPC round-trip.
+- **Phase B implication:** schedule the multiproc redesign before Phase B data gen (24,500 eps × 2.5 eps/s serial = 2.7 h). With redesign, target 6-8× speedup on 8-core M1.
+
+### Q8 — Per-primitive window length (revised)
+
+- **Was:** `max_frames_lclick = 30`.
+- **Now:** `max_frames_lclick = 45`. At 30, slow-tempo + long-distance episodes overflowed the window (~5% label-noise rate: expert never reached press, `done_gt=0` on all rows — model would learn "never predict done" from these). At 45, rate drops to ~0.25%.
+- **Phase B implication:** size other primitives' windows by the same "slow-tempo + long-distance + settle + press/release" worst case, with ~15% headroom. Document per-primitive window lengths in Q9.
+
+### Q15 — Trainable parameter budget (revised)
+
+- **Was:** "~118M total params, ~30M trainable."
+- **Now:** **408.8M total** (vision 93M frozen + text 282M frozen + trunk 28M + heads 4M + encoders 1M + LoRA 0.6M), **33.6M trainable**.
+- **L4 fits** `micro_batch_episodes=4` with bf16 autocast (14.5 GB peak). `micro=8` OOMs (43 GB activations).
+- **Phase B note:** the **text tower is 282M of frozen dead weight** for Phase A (no language variation in L-click). Phase B consideration: cache instruction embeddings offline and drop the text tower from the runtime model. Saves 1.1 GB GPU memory. Zero quality cost if the instruction set is enumerable at training time, which it is.
+
+### Q2/Q8 — Micro batch sizing (new constraint)
+
+- **New default:** `micro_batch_episodes=4` on L4 24 GB, `num_workers=4` for DataLoader prefetch, `macro_batch_episodes=64` (unchanged → 16 micros/step).
+- Larger GPUs (L40S 48 GB, A100 80 GB) can run `micro=8` or `16`; adjust `num_workers` accordingly.
+- The default in config.py (`micro_batch_episodes=8`) is now documented as "development-time default, override on L4 via `--micro-batch-episodes 4`".
+
+### Q5/Q6 — Typing legibility at `max_num_patches=256` (confirmed)
+
+- **Design stands.** Per-patch char identity probe gives 74% top-1 at 14pt on 62-way identity (46× chance, 46× better than random). SigLIP2 preserves per-patch char identity — the original string-presence probe was pooling-limited, not feature-limited.
+- **Caveats for Phase B:**
+  - Use the per-patch probe, not mean-pool or attention-pool presence, if re-measuring legibility for a new font/size regime.
+  - Residual ~12-15% error even at 32pt is consistent with patch-boundary aliasing. If typing primitives underperform, first hypothesis is glyphs straddling patch edges; test by snapping rendered text to patch centers.
+
+### Q40 — Epoch-1 diagnostics (add new signal)
+
+- Existing list (loss descending, no NaN, grad norms stable, no head dominating) stands.
+- **Add:** log `frac(dx_bin == 10)` and `frac(dy_bin == 10)` per step. Bin 10 is zero-motion. If the model outputs bin 10 on frames where the expert was moving >5 px/frame, it's collapsing to a "safe" zero-motion attractor. Spike B visual n=20 suggests this is the dominant "stuck far away" failure mode — confirm/refute with n=200 data.
+
+### Q25 — Eval cadence on M1 (revised)
+
+- Design assumed Spike C M1 timing ≈ 7.6 Hz per-frame effective rate.
+- **Measured (extracted from Spike B closed-loop wall-clock):** ~180 ms/frame with `--decode expected`, ~370 ms/frame with `--decode argmax` on M1 MPS. That's **2.7-5.5 Hz** depending on decode mode — meaningfully below the 7.6 Hz target.
+- **Phase B implication:** Tier-B eval cadence (400 rollouts every 2000 steps as originally scoped) is too expensive at the measured rate. Adjust to one of:
+  - Drop cadence to every 4000 training steps (halves cost).
+  - Trim rollout count to 200 (halves cost again).
+  - Use probabilistic decode in Phase B eval (~2× faster than argmax — fewer max-frame timeouts).
+- A dedicated Spike C measurement (`m1_eval_timing.py`) was implemented but not run separately; Spike B's wall-clock data is sufficient to revise this.
+
+### Convention notes (not parameter changes, but tooling)
+
+- **pygame → pygame-ce.** Project dep swapped because pygame 2.6.1 + Python 3.14 has a circular-import bug on `pygame.font`. pygame-ce 2.5.7 is a drop-in replacement.
+- **`--num-workers` DataLoader prefetch + dataset-side SigLIP2 preprocessing.** Training loop hides JPEG decode + naflex processor + history-vector construction in DataLoader workers. Without this, GPU util oscillates 0-30 ↔ 100% on L4 because data prep is synchronous with the forward. Default on L4: `--num-workers 4`.
+- **HF Jobs entry script workflow.** `scripts/hf_job_train_exp6.py` skips `pip install -e .` (UV env has no pip), clones an explicit branch via `CU_VLA_BRANCH` env var, and sets `HF_HUB_DISABLE_PROGRESS_BARS` + `HF_DATASETS_DISABLE_PROGRESS_BARS` to keep HF Jobs logs readable. See `docs/research/hf-jobs-gotchas.md` for the full debugging journey.
