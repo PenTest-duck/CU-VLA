@@ -108,3 +108,28 @@ def test_adversarial_tier_three_attr_needed():
     )
     tier = classify_adversarial_tier(scene, 0, ("color", "shape", "size"))
     assert tier == "3-attr-needed"
+
+
+def test_wrong_direction_first_3_frames_heading_away():
+    from experiments.action_primitives.evaluate import compute_wrong_direction_first_3_frames
+    cursor_xys = [(100.0, 100.0), (90.0, 90.0), (80.0, 80.0)]  # heading away from (200, 200)
+    target_xy = (200.0, 200.0)
+    out = compute_wrong_direction_first_3_frames(cursor_xys, target_xy)
+    assert out is True
+
+
+def test_wrong_direction_first_3_frames_heading_toward():
+    from experiments.action_primitives.evaluate import compute_wrong_direction_first_3_frames
+    cursor_xys = [(100.0, 100.0), (130.0, 130.0), (160.0, 160.0)]  # heading toward (200, 200)
+    target_xy = (200.0, 200.0)
+    out = compute_wrong_direction_first_3_frames(cursor_xys, target_xy)
+    assert out is False
+
+
+def test_wrong_direction_first_3_frames_short_rollout():
+    """Rollouts shorter than 3 frames should not flag as wrong-direction (insufficient data)."""
+    from experiments.action_primitives.evaluate import compute_wrong_direction_first_3_frames
+    cursor_xys = [(100.0, 100.0), (90.0, 90.0)]  # only 2 frames
+    target_xy = (200.0, 200.0)
+    out = compute_wrong_direction_first_3_frames(cursor_xys, target_xy)
+    assert out is False

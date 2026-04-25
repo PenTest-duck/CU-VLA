@@ -357,5 +357,25 @@ def _attr_value_for_classify(b, attr):
     raise ValueError(f"Unknown attribute: {attr}")
 
 
+def compute_wrong_direction_first_3_frames(
+    cursor_xys: list[tuple[float, float]],
+    target_xy: tuple[float, float],
+) -> bool:
+    """Returns True if cursor net displacement over the first 3 frames is AWAY from target.
+
+    Compares distance(start → target) vs distance(end_of_3rd_frame → target).
+    If the cursor got farther from target, the rollout went wrong-direction.
+
+    Returns False if fewer than 3 frames are available (insufficient data).
+    """
+    if len(cursor_xys) < 3:
+        return False
+    start = cursor_xys[0]
+    end = cursor_xys[2]
+    start_dist = ((target_xy[0] - start[0])**2 + (target_xy[1] - start[1])**2)**0.5
+    end_dist = ((target_xy[0] - end[0])**2 + (target_xy[1] - end[1])**2)**0.5
+    return end_dist > start_dist  # got farther from target
+
+
 if __name__ == "__main__":
     main()
