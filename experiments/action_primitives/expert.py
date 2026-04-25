@@ -59,9 +59,16 @@ class LClickExpert:
                 f"Tempo '{cfg.tempo}' has settle_frames={self.profile['settle_frames']}; "
                 "high must be strictly greater than low (rng.integers is half-open)."
             )
-        # State machine: move -> settle -> press -> release -> done
+        # State machine: move -> settle -> press -> release -> done.
+        # `_move_step()` already returns one zero-motion frame on the
+        # transition from "move" → "settle" (the arrival frame), so
+        # settle_remaining counts ONLY the additional idle frames after that.
+        # Earlier code added an extra `+ 1` here, which made every episode
+        # pause 1 frame longer than the tempo profile specifies. Phase A's
+        # uploaded checkpoint was trained with the +1 behaviour; this fix
+        # only affects future Phase B data regenerations.
         self.state = "move"
-        self.settle_remaining = int(self.rng.integers(low, high) + 1)
+        self.settle_remaining = int(self.rng.integers(low, high))
         self._overshoot_done = False
 
     def _move_step(self) -> Action:

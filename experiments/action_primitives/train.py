@@ -183,7 +183,7 @@ def train_one_step(
     Returns a dict of per-head float losses plus ``total`` and ``grad_norm``.
     """
     if lrs is not None:
-        for pg, lr in zip(opt.param_groups, lrs):
+        for pg, lr in zip(opt.param_groups, lrs, strict=True):
             pg["lr"] = lr
 
     opt.zero_grad(set_to_none=True)

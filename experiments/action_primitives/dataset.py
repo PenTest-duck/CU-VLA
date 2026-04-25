@@ -144,8 +144,11 @@ class PhaseAEpisodeDataset(Dataset):
                         "done_gt": dones[j],
                     })
             history_per_frame.append(build_action_history_vector(prev))
-        # Instruction: for L-click only, use a single fixed string in Phase A
-        instruction = f"click the {frames[0].get('theme', 'flat-modern')} button"
+        # Instruction: Phase A uses a single fixed string. Theme metadata is
+        # already available in the visual stream — putting it in language too
+        # would leak scene supervision into the text channel and confound the
+        # vision-vs-language attribution Phase A is supposed to hold constant.
+        instruction = "click the button"
         out = {
             "proprio": torch.from_numpy(np.stack(proprio_per_frame)),             # (T, 83)
             "history": torch.from_numpy(np.stack(history_per_frame)).float(),     # (T, K, 223)

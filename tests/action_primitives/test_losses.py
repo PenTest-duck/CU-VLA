@@ -44,6 +44,20 @@ def test_done_loss_shape_handling():
     assert torch.isfinite(loss)
 
 
+def test_keys_focal_loss_with_class_weights():
+    """Regression test: class_weights path used to crash with rank-mismatch."""
+    B = 4
+    logits = torch.randn(B, NUM_KEYS * 3)
+    target = torch.full((B, NUM_KEYS), 2, dtype=torch.long)  # all idle
+    class_weights = torch.ones(NUM_KEYS, 3) * 0.5             # any nonzero shape
+    loss = keys_focal_loss(
+        logits, target, gamma=2.0,
+        class_weights=class_weights, idle_smoothing=0.05,
+    )
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+
+
 def test_total_loss_all_heads_contribute():
     B = 4
     head_logits = {

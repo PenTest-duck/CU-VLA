@@ -104,7 +104,7 @@ The stricter per-patch probe was specified in the rubric as the disambiguator fo
 
 ## Recommendation
 
-**Q5/Q6 design stands: proceed to Phase A as-designed, and Phase B typing primitives use `max_num_patches=256` with visual feedback.**
+**Q5/Q6 design stands: proceed to Phase B as-designed, with typing primitives using `max_num_patches=256` and visual feedback.**
 
 No Phase B design revision is needed. The per-patch probe at 14pt shows SigLIP2 features preserve char identity at 74% top-1 out of 62 classes, which gives the trunk more than enough signal to learn typing progress from visual feedback.
 

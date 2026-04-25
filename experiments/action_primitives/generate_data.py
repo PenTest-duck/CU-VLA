@@ -12,7 +12,7 @@ from pathlib import Path
 
 from datasets import Dataset, Features, Sequence, Value
 
-from experiments.action_primitives.config import ENV, PHASE_A_DATA
+from experiments.action_primitives.config import PHASE_A_DATA
 from experiments.action_primitives.generator import generate_one_episode
 
 
@@ -60,6 +60,8 @@ def generate_all(n_episodes: int, out_dir: Path, shard_size: int = 500, workers:
     t0 = time.time()
     shard_rows: list[dict] = []
     shard_idx = 0
+    shard_first_ep = 0  # explicit tracking — episodes can finish early so
+                         # `len(shard_rows) // max_frames_lclick` would be wrong
     pool: mp.pool.Pool | None = None
 
     if workers == 1:
@@ -75,9 +77,10 @@ def generate_all(n_episodes: int, out_dir: Path, shard_size: int = 500, workers:
             ds = Dataset.from_list(shard_rows, features=FEATURES)
             shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
             ds.to_parquet(shard_path)
-            print(f"[shard {shard_idx}] episodes {i + 1 - len(shard_rows) // ENV.max_frames_lclick + 1}..{i + 1}  frames={len(shard_rows)}  → {shard_path}")
+            print(f"[shard {shard_idx}] episodes {shard_first_ep}..{i}  frames={len(shard_rows)}  → {shard_path}")
             shard_rows = []
             shard_idx += 1
+            shard_first_ep = i + 1
 
     if pool is not None:
         pool.close()

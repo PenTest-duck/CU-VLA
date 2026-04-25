@@ -2713,10 +2713,15 @@ Revisions to the questions above based on Spike A, B, C, E results. Phase B plan
 - Existing list (loss descending, no NaN, grad norms stable, no head dominating) stands.
 - **Add:** log `frac(dx_bin == 10)` and `frac(dy_bin == 10)` per step. Bin 10 is zero-motion. If the model outputs bin 10 on frames where the expert was moving >5 px/frame, it's collapsing to a "safe" zero-motion attractor. Spike B visual n=20 suggests this is the dominant "stuck far away" failure mode — confirm/refute with n=200 data.
 
-### Q25 — Eval cadence on M1 (pending)
+### Q25 — Eval cadence on M1 (revised)
 
-- Design assumes Spike C M1 timing ≈ 7.6 Hz per-frame effective rate.
-- **Pending** Spike C measurement (T24). If measured Hz is substantially lower (e.g., <3 Hz), Phase B Tier-B eval cadence (400 rollouts every 2000 steps) needs adjustment — either drop to every 4000 steps or trim rollout count.
+- Design assumed Spike C M1 timing ≈ 7.6 Hz per-frame effective rate.
+- **Measured (extracted from Spike B closed-loop wall-clock):** ~180 ms/frame with `--decode expected`, ~370 ms/frame with `--decode argmax` on M1 MPS. That's **2.7-5.5 Hz** depending on decode mode — meaningfully below the 7.6 Hz target.
+- **Phase B implication:** Tier-B eval cadence (400 rollouts every 2000 steps as originally scoped) is too expensive at the measured rate. Adjust to one of:
+  - Drop cadence to every 4000 training steps (halves cost).
+  - Trim rollout count to 200 (halves cost again).
+  - Use probabilistic decode in Phase B eval (~2× faster than argmax — fewer max-frame timeouts).
+- A dedicated Spike C measurement (`m1_eval_timing.py`) was implemented but not run separately; Spike B's wall-clock data is sufficient to revise this.
 
 ### Convention notes (not parameter changes, but tooling)
 

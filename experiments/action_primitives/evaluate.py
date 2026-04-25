@@ -150,7 +150,8 @@ def rollout_one_episode(
     """
     obs, info = env.reset()
     with torch.no_grad():
-        text_tokens = model.backbone.encode_text([f"click the {env.theme} button" if False else "click the button"])
+        # Must match dataset.py's Phase A fixed instruction (no theme leakage).
+        text_tokens = model.backbone.encode_text(["click the button"])
     K = MODEL.action_history_len
     history = np.zeros((K, HISTORY_INPUT_DIM), dtype=np.float32)
     for t in range(max_frames):
@@ -190,7 +191,7 @@ def closed_loop_eval(
     model: ActionPrimitivesACT,
     device: str,
     n_episodes: int = 200,
-    tolerances_px: list[int] = [0, 3, 5, 10],
+    tolerances_px: list[int] | None = None,
     visual: bool = False,
     fps: int = 30,
     decode_mode: str = "argmax",
@@ -203,6 +204,8 @@ def closed_loop_eval(
 
     ``decode_mode`` is forwarded to ``rollout_one_episode``; see `_decode_mouse`.
     """
+    if tolerances_px is None:
+        tolerances_px = [0, 3, 5, 10]
     results = []
     # Visual mode prints per-episode lines; non-visual shows a tqdm bar with
     # running success rate in the postfix so you can track progress.

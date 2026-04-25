@@ -31,6 +31,15 @@ class SigLIP2Naflex(nn.Module):
         self.max_num_patches = max_num_patches
         self.processor = AutoProcessor.from_pretrained(MODEL.vision_model)
         self.model = AutoModel.from_pretrained(MODEL.vision_model)
+        # Freeze BOTH towers by default. The vision tower is selectively
+        # re-enabled via LoRA in apply_lora() (peft.get_peft_model handles
+        # the requires_grad bookkeeping for the wrapped layers). If a caller
+        # forgets to call apply_lora, this guarantees they don't silently
+        # full-finetune the 93 M-param vision base when they build the
+        # optimizer. Probes (typing_legibility*) deliberately skip apply_lora
+        # and run inference-only — also consistent with this default.
+        for p in self.model.vision_model.parameters():
+            p.requires_grad = False
         # Freeze text tower per Q15
         for p in self.model.text_model.parameters():
             p.requires_grad = False

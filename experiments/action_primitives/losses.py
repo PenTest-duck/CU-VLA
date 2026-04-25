@@ -84,8 +84,11 @@ def keys_focal_loss(
 
     # Per-class weighting (rare keys)
     if class_weights is not None:
-        # class_weights: (NUM_KEYS, 3); pick based on target
-        w = class_weights.gather(-1, target_keys.unsqueeze(-1)).squeeze(-1)  # (B, NUM_KEYS)
+        # class_weights: (NUM_KEYS, 3) — broadcast to (B, NUM_KEYS, 3) so
+        # gather() ranks match. Pick the weight for the target class per (b, k).
+        B = target_keys.size(0)
+        w = (class_weights.unsqueeze(0).expand(B, -1, -1)
+             .gather(-1, target_keys.unsqueeze(-1)).squeeze(-1))  # (B, NUM_KEYS)
         focal_weight = focal_weight * w
 
     return (focal_weight * ce).mean()
