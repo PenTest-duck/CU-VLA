@@ -205,3 +205,88 @@ def test_build_wrong_instruction_single_button_returns_empty():
     rng = np.random.default_rng(0)
     out = build_wrong_instruction(scene, target_id=0, rng=rng)
     assert out == ""
+
+
+def test_eval_b0_mode_constructs_scene_from_parquet(tmp_path):
+    """Smoke test: B0 eval mode should reconstruct Scene from parquet metadata.
+
+    Generates a tiny B0 dataset, loads it via load_episode_metadata, verifies
+    the per-episode metadata has the fields B0 eval needs, and verifies
+    scene reconstruction via the generator's deterministic seed.
+    """
+    from pathlib import Path
+    from experiments.action_primitives.generate_data import generate_dataset_multiproc
+    from experiments.action_primitives.evaluate import (
+        load_episode_metadata, reconstruct_scene_for_episode,
+    )
+
+    out_dir = tmp_path / "tiny"
+    out_dir.mkdir()
+    base_seed = 0
+    generate_dataset_multiproc(
+        n_episodes=2, output_dir=out_dir, n_workers=1, seed=base_seed,
+        episodes_per_shard=10,
+    )
+
+    # Verify metadata fields exist for B0 reconstruction (read raw shards).
+    import pandas as pd
+    df = pd.concat([pd.read_parquet(p) for p in Path(out_dir).glob("*.parquet")])
+    assert "instruction" in df.columns
+    assert "target_button_id" in df.columns
+    assert "n_buttons" in df.columns
+    assert "composite_tier" in df.columns
+    assert "is_adversarial" in df.columns
+    assert "is_scenario_error" in df.columns
+
+    # load_episode_metadata("all") returns one row per episode regardless of split bucket.
+    meta = load_episode_metadata(out_dir, split="all")
+    assert len(meta) == 2
+    assert set(meta.columns) >= {
+        "episode_id", "instruction", "target_button_id", "n_buttons",
+        "composite_tier", "is_adversarial", "is_scenario_error",
+    }
+
+    # Scene reconstruction must match what the generator produced.
+    for _, row in meta.iterrows():
+        eid = int(row["episode_id"])
+        scene = reconstruct_scene_for_episode(eid, base_seed=base_seed)
+        # The reconstructed scene's button count must match the parquet's n_buttons,
+        # and target_button_id must be a valid index into scene.buttons.
+        assert len(scene.buttons) == int(row["n_buttons"]), (
+            f"Scene reconstruction skew for eid={eid}: "
+            f"reconstructed {len(scene.buttons)} buttons, parquet has {row['n_buttons']}"
+        )
+        assert 0 <= int(row["target_button_id"]) < len(scene.buttons)
+
+
+def test_decode_b0_click_idle_when_both_idle():
+    """Both heads predict idle => return legacy idle (0)."""
+    import torch
+    from experiments.action_primitives.evaluate import _decode_b0_click
+    logits = {
+        "click_left": torch.tensor([[5.0, 0.0, 0.0]]),
+        "click_right": torch.tensor([[5.0, 0.0, 0.0]]),
+    }
+    assert _decode_b0_click(logits) == 0
+
+
+def test_decode_b0_click_left_press():
+    """Only left predicts press => return L_press (1)."""
+    import torch
+    from experiments.action_primitives.evaluate import _decode_b0_click
+    logits = {
+        "click_left": torch.tensor([[0.0, 5.0, 0.0]]),
+        "click_right": torch.tensor([[5.0, 0.0, 0.0]]),
+    }
+    assert _decode_b0_click(logits) == 1
+
+
+def test_decode_b0_click_right_release():
+    """Only right predicts release => return R_release (4)."""
+    import torch
+    from experiments.action_primitives.evaluate import _decode_b0_click
+    logits = {
+        "click_left": torch.tensor([[5.0, 0.0, 0.0]]),
+        "click_right": torch.tensor([[0.0, 0.0, 5.0]]),
+    }
+    assert _decode_b0_click(logits) == 4
