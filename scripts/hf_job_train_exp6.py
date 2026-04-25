@@ -14,10 +14,11 @@
 #   "numpy>=2.0",
 # ]
 # ///
-"""HF Jobs training entrypoint for Experiment 6 Phase A.
+"""HF Jobs training entrypoint for Experiment 6 (Phase A + B0).
 
 Clones the CU-VLA repo, downloads the dataset from HF Hub (if --hf-data-repo set),
-and runs experiments.action_primitives.train.
+and runs experiments.action_primitives.train. Default branch is feat/exp6-phase-b0;
+override via the CU_VLA_BRANCH env var (e.g. set to feat/exp6-phase-a for re-runs).
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ import sys
 
 def main() -> None:
     repo_url = os.environ.get("CU_VLA_REPO_URL", "https://github.com/PenTest-duck/CU-VLA.git")
-    branch = os.environ.get("CU_VLA_BRANCH", "feat/exp6-phase-a")
+    branch = os.environ.get("CU_VLA_BRANCH", "feat/exp6-phase-b0")
     workdir = "/workspace/CU-VLA"
     subprocess.run(
         ["git", "clone", "--depth", "1", "--branch", branch, repo_url, workdir],

@@ -6,6 +6,13 @@ Usage (Phase A, L4x1, 4h):
         --data-dir data/phase-a-lclick \
         --epochs 5 \
         --hf-upload-repo PenTest-duck/cu-vla-exp6-phasea-ckpt
+
+Usage (Phase B0, A100-large, ~2h):
+    uv run python scripts/launch_hf_job_exp6.py \
+        --timeout 2h -- \
+        --phase b0 \
+        --hf-data-repo PenTest-duck/cu-vla-exp6-phaseb0 \
+        --hf-upload-repo PenTest-duck/cu-vla-exp6-phaseb0-ckpt
 """
 import argparse
 import os
@@ -19,7 +26,9 @@ DEFAULT_SCRIPT = os.path.join(os.path.dirname(__file__), "hf_job_train_exp6.py")
 
 def main() -> None:
     parser = argparse.ArgumentParser(usage="%(prog)s [launcher-opts] -- [train.py opts]")
-    parser.add_argument("--flavor", default="l4x1")
+    # Phase B0 default — see design doc Sec compute (a100-large ~$2.50/hr, fits micro-batch=16).
+    # Override with --flavor l4x1 for Phase A reruns.
+    parser.add_argument("--flavor", default="a100-large")
     parser.add_argument("--timeout", default="4h")
     parser.add_argument("--namespace", default=None)
     parser.add_argument("--script", default=DEFAULT_SCRIPT)
