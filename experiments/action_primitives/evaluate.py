@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from PIL import Image
 from tqdm import tqdm
@@ -286,6 +287,30 @@ def main() -> None:
             print(f"  {k}: {v:.4f}")
         else:
             print(f"  {k}: {v}")
+
+
+def filter_eval_split(df, slice_name: str):
+    """Filter a parquet DataFrame to a B0 eval slice.
+
+    Slices (per the B0 design doc):
+    - phase_a_holdout: n_buttons == 1 and not is_scenario_error (apples-to-apples Phase A baseline)
+    - multi_btn_generic: n_buttons >= 2 and composite_tier == 1 and not is_adversarial
+    - multi_btn_composite: n_buttons >= 2 and composite_tier >= 2 and not is_adversarial
+    - scenario_recovery: is_scenario_error == 1
+    - adversarial: is_adversarial == 1
+    """
+    if slice_name == "phase_a_holdout":
+        return df[(df["n_buttons"] == 1) & (df["is_scenario_error"] == 0)]
+    elif slice_name == "multi_btn_generic":
+        return df[(df["n_buttons"] >= 2) & (df["composite_tier"] == 1) & (df["is_adversarial"] == 0)]
+    elif slice_name == "multi_btn_composite":
+        return df[(df["n_buttons"] >= 2) & (df["composite_tier"] >= 2) & (df["is_adversarial"] == 0)]
+    elif slice_name == "scenario_recovery":
+        return df[df["is_scenario_error"] == 1]
+    elif slice_name == "adversarial":
+        return df[df["is_adversarial"] == 1]
+    else:
+        raise ValueError(f"Unknown slice_name: {slice_name!r}. Valid: phase_a_holdout, multi_btn_generic, multi_btn_composite, scenario_recovery, adversarial")
 
 
 if __name__ == "__main__":
