@@ -8,6 +8,7 @@ Migrate the GPU training infrastructure for CU-VLA experiments from Hugging Face
 
 **In scope:**
 - Replacement launcher + entrypoint scripts for SageMaker (`scripts/launch_sm_job*.py`, `scripts/sm_job_train.py`, `scripts/sagemaker_estimator.py`).
+- Operator CLI helper (`scripts/sm_jobs.py`) for ls / status / logs / stop / describe / url / cost / reconcile-ckpts.
 - One-time AWS bootstrap (region pick, IAM execution role, S3 bucket, SSM Parameter Store secrets, GPU quota request, Budget alerts).
 - Spot-instance auto-resume mechanics (`checkpoint_s3_uri` + entrypoint resume detection + wandb run continuation).
 - ~3-line patch to `experiments/action_primitives/train.py` to restore `best_val_loss` from `best.pt` on `--resume`.
@@ -44,7 +45,7 @@ scripts/
 ├── sm_job_train.py             [NEW] ~60 LOC — in-container entrypoint
 ├── launch_sm_job.py            [NEW] ~80 LOC — generic launcher CLI
 ├── launch_sm_job_exp6.py       [NEW] ~30 LOC — exp6 defaults (Phase B0/B1, branch, instance)
-├── sm_recover_to_hf.py         [NEW] ~30 LOC — one-shot ckpt reconciler (S3 → HF Hub)
+├── sm_jobs.py                  [NEW] ~200 LOC — operator CLI: ls, status, logs, stop, describe, url, cost, reconcile-ckpts
 ├── launch_hf_job.py            [unchanged, deprecated] retained as fallback
 ├── launch_hf_job_exp6.py       [unchanged, deprecated] retained as fallback
 ├── hf_job_train.py             [unchanged, deprecated]
@@ -304,7 +305,7 @@ After a successful Phase 3 run, mark HF Jobs scripts deprecated in their docstri
 |---|---------|------------|------------|
 | 1 | Spot allocation timeout (`MaxWaitTimeExceeded`) | Med | Launcher prints actionable error; no silent on-demand fallback |
 | 2 | Source git-clone fails (branch typo / deleted) | Med | Launcher pre-validates: `git ls-remote --exit-code origin <branch>` before `.fit()` |
-| 3 | HF Hub upload of best.pt times out / 503s | Low–Med | `train.py` already catches and logs; best.pt persisted to S3 anyway; `sm_recover_to_hf.py` reconciles after the fact |
+| 3 | HF Hub upload of best.pt times out / 503s | Low–Med | `train.py` already catches and logs; best.pt persisted to S3 anyway; `sm_jobs.py reconcile-ckpts <job>` reconciles after the fact |
 | 4 | Disk full on `/opt/ml/checkpoints/` | Low (short runs); real (>24h runs) | `volume_size=100` GB at bootstrap; ckpt pruning patch deferred until first occurrence |
 | 5 | Token rotation (HF or wandb) | Low | `aws ssm put-parameter --overwrite` — next job picks up; no relaunch |
 | 6 | Pygame import in headless container tries to init display | Med | Entrypoint sets `SDL_VIDEODRIVER=dummy` unconditionally |
@@ -318,10 +319,88 @@ After a successful Phase 3 run, mark HF Jobs scripts deprecated in their docstri
 - Network partition retry — SageMaker handles internally.
 - Custom step-checkpoint pruning — defer until disk fill encountered.
 
+## Operator UX
+
+Goal: parity with today's HF Jobs ergonomics for both the user and Claude. **One CLI helper module (`scripts/sm_jobs.py`, ~200 LOC) wraps the SageMaker SDK so neither party needs to remember `aws sagemaker ...` subcommand syntax.**
+
+### Naming convention (job names = stable handles)
+
+All training jobs get names of the form `cu-vla-<exp>-<phase>-YYYYMMDD-HHMMSS`. Predictable, sortable, lex-comparable, parseable. Example: `cu-vla-exp6-phaseb0-20260427-093142`. Set in `launch_sm_job_<exp>.py` at launch time and passed to the estimator.
+
+### Initiate (unchanged mental model from HF Jobs)
+
+```bash
+uv run python scripts/launch_sm_job_exp6.py --phase b0 --spot \
+    -- --epochs 5 --hf-data-repo PenTest-duck/cu-vla-exp6-phaseb0
+```
+
+Default behavior: blocks, streams CloudWatch logs to terminal, prints summary on completion. `--detach` returns immediately with the job name. Args mirror today's HF Jobs launcher.
+
+### `sm_jobs.py` subcommand surface
+
+All subcommands accept either a literal job name, the literal `latest` (most recent CU-VLA job), or `--filter <substring>` matching against job names.
+
+```
+sm_jobs.py ls [--status <state>] [--limit N]            # list active + recent jobs (default last 20, sorted by start)
+sm_jobs.py status [name|latest|--filter ...]            # one-line: state, instance, runtime, billable seconds
+sm_jobs.py logs <name|latest> [--follow]                # batch or stream CloudWatch logs (mirrors HF Jobs streaming UX)
+sm_jobs.py stop <name|latest|--filter ...>              # stop running job(s); confirms before kill if running > 1 min
+sm_jobs.py describe <name|latest>                       # full describe-training-job output (failure reason, secondary status)
+sm_jobs.py url <name|latest>                            # print SageMaker console URL (clickable from terminal)
+sm_jobs.py cost <name|latest>                           # estimated cost = BillableTimeInSeconds × $/hr for that job
+sm_jobs.py reconcile-ckpts <name|latest>                # push any S3 ckpts not yet on HF Hub (failure mode #3)
+```
+
+Defaults compact + parseable; `--verbose` / `--json` for richer formats. All subcommands exit with non-zero if the operation fails or no matching job is found.
+
+### Live monitoring while a job runs
+
+| Latency / detail | Tool |
+|---|---|
+| Foreground stream | launcher's default (CloudWatch tailed inline) — same as today |
+| Out-of-band tail | `sm_jobs.py logs <name|latest> --follow` from another terminal |
+| Live training metrics | wandb web UI (unchanged) |
+
+### Cancel
+
+`Ctrl-C` on the foreground launcher does **not** stop the job — it only detaches the log stream. Same as HF Jobs. Real stop:
+
+```bash
+uv run python scripts/sm_jobs.py stop latest               # most recent running job
+uv run python scripts/sm_jobs.py stop --filter phaseb0     # the running B0 job
+uv run python scripts/sm_jobs.py stop cu-vla-exp6-phaseb0-20260427-093142
+```
+
+Calls `boto3.client("sagemaker").stop_training_job(TrainingJobName=name)`. Confirms before kill if the job has been running > 1 min (paranoia for paid runs).
+
+### Debug ladder (when something breaks)
+
+1. **Foreground terminal output** during streaming — first stop.
+2. **`sm_jobs.py logs <name>`** — pulls CloudWatch without re-launching anything; works after job exited.
+3. **`sm_jobs.py describe <name>`** — full job metadata: failure reason, secondary status (`Stopping`, `MaxRuntimeExceeded`, `InternalServerError`), output S3 paths.
+4. **wandb dashboard** — training-time metrics.
+5. **`sm_jobs.py url <name>`** — opens SageMaker console for the job (web UI shows everything).
+
+### Claude-specific ergonomics
+
+When helping debug a run via Bash, Claude needs commands that produce parseable output without flooding context:
+
+- `uv run python scripts/sm_jobs.py status latest` → one-line summary
+- `uv run python scripts/sm_jobs.py logs latest | tail -200` → recent slice
+- `uv run python scripts/sm_jobs.py describe latest --json` → structured failure cause
+
+`sm_jobs.py` is designed to fit cleanly inside tool-result blocks. The `latest` shortcut + predictable job names mean Claude doesn't need to bash up arrow or remember UUIDs.
+
+### What we're NOT building
+
+- No GUI / TUI dashboard. CloudWatch + SageMaker console + wandb cover all needs.
+- No auto-retry on transient failure. Explicit re-run.
+- No completion notification. Foreground launcher blocks; wandb's desktop notification covers detached runs.
+
 ## Open Questions
 
 None. Region, secrets store, container strategy, persistence layer, spot policy, file split, and edge case mitigations all decided in §1–§7 of the brainstorming.
 
 ## Implementation Plan
 
-To be authored next via the writing-plans skill. Expected breakdown: ~10 tasks covering bootstrap (3) + script authoring (4) + smoke + rehearsal + first real run (3).
+To be authored next via the writing-plans skill. Expected breakdown: ~12 tasks covering bootstrap (3) + script authoring (5: factory, generic launcher, entrypoint, exp6 override, sm_jobs CLI) + train.py patch (1) + smoke + spot rehearsal + first real run (3).
