@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from experiments.action_primitives.expert import LClickExpert, LClickExpertConfig, TEMPO_PROFILES
+from experiments.action_primitives.scene import generate_scene
+from experiments.action_primitives.expert import InstructionAwareLClickExpert
 
 
 def test_expert_reaches_target_and_clicks():
@@ -82,3 +84,35 @@ def test_expert_presses_while_cursor_on_target(tempo):
         f"{tempo}: cursor was {err:.2f}px from target at press "
         f"(cursor={press_cursor}, target={target_center})"
     )
+
+
+def test_instruction_aware_expert_targets_specified_button():
+    rng = np.random.default_rng(0)
+    scene = generate_scene(rng=rng, n_buttons=3)
+    target_id = 1
+    target = scene.buttons[target_id]
+    cx, cy = 10.0, 10.0
+    cfg = LClickExpertConfig(tempo="normal", seed=0)
+    expert = InstructionAwareLClickExpert(
+        cfg=cfg, scene=scene, target_button_id=target_id, cursor_xy=(cx, cy),
+    )
+    # First action's dx, dy should head toward target
+    a0 = next(iter(expert))
+    target_dx = target.center()[0] - cx
+    target_dy = target.center()[1] - cy
+    assert np.sign(a0.dx) == np.sign(target_dx)
+    assert np.sign(a0.dy) == np.sign(target_dy)
+
+
+def test_expert_re_query_from_arbitrary_state():
+    """Re-querying the expert from a new cursor position should produce a fresh trajectory."""
+    rng = np.random.default_rng(0)
+    scene = generate_scene(rng=rng, n_buttons=2)
+    target_id = 0
+    cfg = LClickExpertConfig(tempo="normal", seed=0)
+    expert1 = InstructionAwareLClickExpert(cfg, scene, target_id, cursor_xy=(10.0, 10.0))
+    expert2 = InstructionAwareLClickExpert(cfg, scene, target_id, cursor_xy=(700.0, 400.0))
+    a1 = next(iter(expert1))
+    a2 = next(iter(expert2))
+    # Two starting positions on opposite sides → different signs in at least one of dx, dy
+    assert (np.sign(a1.dx) != np.sign(a2.dx)) or (np.sign(a1.dy) != np.sign(a2.dy))

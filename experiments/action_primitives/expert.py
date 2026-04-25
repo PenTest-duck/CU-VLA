@@ -112,3 +112,32 @@ class LClickExpert:
             return Action(dx=0.0, dy=0.0, click=2, key_events=_idle_keys())  # L_release
         # After release, stop iterating
         raise StopIteration
+
+
+class InstructionAwareLClickExpert:
+    """Wrapper that grounds expert to a specific button id within a scene.
+
+    Re-queryable: construct fresh from (cursor_xy, scene, target_button_id) at
+    any time to get a fresh recovery trajectory from a new cursor state.
+    """
+    def __init__(
+        self,
+        cfg: LClickExpertConfig,
+        scene,                     # Scene
+        target_button_id: int,
+        cursor_xy: tuple[float, float],
+    ) -> None:
+        target = scene.buttons[target_button_id]
+        self._inner = LClickExpert(
+            cfg=cfg,
+            cursor_xy=cursor_xy,
+            target_center=target.center(),
+        )
+        self._scene = scene
+        self._target_button_id = target_button_id
+
+    def __iter__(self):
+        return iter(self._inner)
+
+    def __next__(self):
+        return next(self._inner)
