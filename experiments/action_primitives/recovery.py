@@ -173,3 +173,32 @@ def generate_wrong_segment(
         actions=tuple(actions), k_frames=k_frames,
         segment_type=segment_type, final_cursor_xy=final,
     )
+
+
+DART_PROB_DEFAULT: float = 0.08
+DART_SIGMA_DEFAULT: float = 20.0
+
+
+def apply_dart_noise(
+    action: Action,
+    rng: np.random.Generator,
+    p: float = DART_PROB_DEFAULT,
+    sigma: float = DART_SIGMA_DEFAULT,
+) -> tuple[Action, bool]:
+    """With prob p, add Gaussian(0, sigma²) to dx/dy. Skip click event frames.
+
+    Returns (possibly_perturbed_action, was_perturbed).
+    """
+    # Skip click event frames (preserve click semantics)
+    if action.click != 0:
+        return action, False
+    if rng.random() >= p:
+        return action, False
+    noise_dx = float(rng.normal(0.0, sigma))
+    noise_dy = float(rng.normal(0.0, sigma))
+    new_dx = float(np.clip(action.dx + noise_dx, -MOUSE_CAP_PX, MOUSE_CAP_PX))
+    new_dy = float(np.clip(action.dy + noise_dy, -MOUSE_CAP_PX, MOUSE_CAP_PX))
+    return Action(
+        dx=new_dx, dy=new_dy,
+        click=action.click, scroll=action.scroll, key_events=action.key_events,
+    ), True
