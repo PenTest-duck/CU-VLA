@@ -161,3 +161,135 @@ def total_loss(
     }
     total = sum(head_weights[n] * per_head[n] for n in per_head)
     return total, per_head
+
+
+# ============================================================================
+# Phase B0: masked variants + total_loss_b0
+# ============================================================================
+from experiments.action_primitives.config import (  # noqa: E402
+    MOUSE_BIN_CENTERS,
+    SCROLL_BIN_CENTERS,
+)
+
+
+def _focal_ce_masked(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gamma: float,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Per-sample focal CE multiplied by loss_mask; mean over masked samples."""
+    logp = F.log_softmax(logits, dim=-1)
+    if label_smoothing > 0.0:
+        C = logits.size(-1)
+        smooth = torch.full_like(logp, label_smoothing / (C - 1))
+        smooth.scatter_(-1, target.unsqueeze(-1), 1.0 - label_smoothing)
+        ce = -(smooth * logp).sum(dim=-1)
+    else:
+        ce = F.nll_loss(logp, target, reduction="none")
+    p_true = logp.gather(-1, target.unsqueeze(-1)).squeeze(-1).exp()
+    focal_weight = (1.0 - p_true) ** gamma
+    per_sample = focal_weight * ce  # (B,)
+    masked = per_sample * loss_mask
+    n_active = loss_mask.sum().clamp(min=1)
+    return masked.sum() / n_active
+
+
+def _soft_label_ce_masked(
+    logits: torch.Tensor,
+    expert_continuous: torch.Tensor,
+    bin_centers: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> torch.Tensor:
+    B = logits.size(0)
+    num_bins = bin_centers.size(0)
+    upper_idx = torch.searchsorted(bin_centers, expert_continuous, right=True)
+    upper_idx = torch.clamp(upper_idx, 1, num_bins - 1)
+    lower_idx = upper_idx - 1
+    lower_centers = bin_centers[lower_idx]
+    upper_centers = bin_centers[upper_idx]
+    span = upper_centers - lower_centers
+    span = torch.where(span > 1e-6, span, torch.ones_like(span))
+    upper_w = torch.clamp((expert_continuous - lower_centers) / span, 0.0, 1.0)
+    lower_w = 1.0 - upper_w
+    soft_target = torch.zeros_like(logits)
+    soft_target.scatter_(-1, lower_idx.unsqueeze(-1), lower_w.unsqueeze(-1))
+    soft_target.scatter_add_(-1, upper_idx.unsqueeze(-1), upper_w.unsqueeze(-1))
+    log_probs = F.log_softmax(logits, dim=-1)
+    per_sample = -(soft_target * log_probs).sum(dim=-1)
+    masked = per_sample * loss_mask
+    n_active = loss_mask.sum().clamp(min=1)
+    return masked.sum() / n_active
+
+
+def _done_loss_masked(
+    logits_done: torch.Tensor,
+    target_done: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> torch.Tensor:
+    logits = logits_done.squeeze(-1)
+    bce = F.binary_cross_entropy_with_logits(logits, target_done.float(), reduction="none")
+    p_true = torch.sigmoid(logits)
+    p_t = torch.where(target_done.bool(), p_true, 1 - p_true)
+    focal_weight = (1.0 - p_t) ** LOSS.focal_gamma
+    per_sample = focal_weight * bce
+    masked = per_sample * loss_mask
+    n_active = loss_mask.sum().clamp(min=1)
+    return masked.sum() / n_active
+
+
+def _keys_focal_loss_masked(
+    logits_keys: torch.Tensor,
+    target_keys: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gamma: float = 2.0,
+    idle_smoothing: float = 0.05,
+) -> torch.Tensor:
+    B = logits_keys.size(0)
+    logits = logits_keys.view(B, NUM_KEYS, 3)
+    logp = F.log_softmax(logits, dim=-1)
+    smooth = torch.full_like(logp, 0.0)
+    smooth.scatter_(-1, target_keys.unsqueeze(-1), 1.0 - idle_smoothing)
+    idle_slot = smooth[..., KEY_STATE_IDLE]
+    mask_target_not_idle = (target_keys != KEY_STATE_IDLE).float()
+    smooth[..., KEY_STATE_IDLE] = idle_slot + idle_smoothing * mask_target_not_idle
+    target_is_idle = (target_keys == KEY_STATE_IDLE)
+    smooth[..., KEY_STATE_IDLE] = torch.where(
+        target_is_idle,
+        torch.ones_like(smooth[..., KEY_STATE_IDLE]),
+        smooth[..., KEY_STATE_IDLE],
+    )
+    ce = -(smooth * logp).sum(dim=-1)  # (B, NUM_KEYS)
+    p_true = logp.gather(-1, target_keys.unsqueeze(-1)).squeeze(-1).exp()
+    focal_weight = (1.0 - p_true) ** gamma
+    per_sample = (focal_weight * ce).mean(dim=-1)  # (B,)
+    masked = per_sample * loss_mask
+    n_active = loss_mask.sum().clamp(min=1)
+    return masked.sum() / n_active
+
+
+def total_loss_b0(
+    head_logits: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    head_weights: dict[str, float],
+    loss_mask: torch.Tensor,            # (B,) float — 0 means skip, 1 means train
+    bin_centers_mouse: torch.Tensor | None = None,
+    bin_centers_scroll: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """B0 total loss: soft-CE on dx/dy/scroll, focal CE on click_left/click_right/keys, focal BCE on done."""
+    if bin_centers_mouse is None:
+        bin_centers_mouse = torch.tensor(MOUSE_BIN_CENTERS, device=head_logits["dx"].device)
+    if bin_centers_scroll is None:
+        bin_centers_scroll = torch.tensor(SCROLL_BIN_CENTERS, device=head_logits["scroll"].device)
+    per_head = {
+        "dx":          _soft_label_ce_masked(head_logits["dx"], targets["dx_continuous"], bin_centers_mouse, loss_mask),
+        "dy":          _soft_label_ce_masked(head_logits["dy"], targets["dy_continuous"], bin_centers_mouse, loss_mask),
+        "click_left":  _focal_ce_masked(head_logits["click_left"], targets["click_left"], loss_mask, LOSS.focal_gamma),
+        "click_right": _focal_ce_masked(head_logits["click_right"], targets["click_right"], loss_mask, LOSS.focal_gamma),
+        "scroll":      _soft_label_ce_masked(head_logits["scroll"], targets["scroll_continuous"], bin_centers_scroll, loss_mask),
+        "keys":        _keys_focal_loss_masked(head_logits["keys"], targets["keys"], loss_mask, LOSS.focal_gamma, LOSS.idle_smoothing_keys),
+        "done":        _done_loss_masked(head_logits["done"], targets["done"], loss_mask),
+    }
+    total = sum(head_weights[n] * per_head[n] for n in per_head)
+    return total, per_head

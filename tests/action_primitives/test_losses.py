@@ -143,3 +143,61 @@ def test_soft_label_ce_interpolates_between_bins():
     logits2[0, 11] = 3.0
     loss_matched = soft_label_ce(logits2, expert_continuous, centers)
     assert loss_matched < loss_uniform  # matching distribution gets lower loss
+
+
+def test_total_loss_b0_architecture():
+    """total_loss_b0 should compute losses for click_left + click_right (no 'click')."""
+    from experiments.action_primitives.losses import total_loss_b0
+    B = 4
+    head_logits = {
+        "dx":          torch.randn(B, 21),
+        "dy":          torch.randn(B, 21),
+        "click_left":  torch.randn(B, 3),
+        "click_right": torch.randn(B, 3),
+        "scroll":      torch.randn(B, 21),
+        "keys":        torch.randn(B, 231),
+        "done":        torch.randn(B, 1),
+    }
+    targets = {
+        "dx_continuous":      torch.randn(B),     # for soft-label CE
+        "dy_continuous":      torch.randn(B),
+        "scroll_continuous":  torch.randn(B),
+        "click_left":         torch.randint(0, 3, (B,)),
+        "click_right":        torch.randint(0, 3, (B,)),
+        "keys":               torch.randint(0, 3, (B, 77)),
+        "done":               torch.randint(0, 2, (B,)).float(),
+    }
+    loss_mask = torch.ones(B)
+    head_weights = {n: 1.0 for n in head_logits}
+    total, per_head = total_loss_b0(head_logits, targets, head_weights, loss_mask)
+    assert torch.isfinite(total)
+    assert "click_left" in per_head
+    assert "click_right" in per_head
+
+
+def test_total_loss_b0_zero_mask_zeros_loss():
+    """All-zero loss_mask should produce zero total loss."""
+    from experiments.action_primitives.losses import total_loss_b0
+    B = 4
+    head_logits = {
+        "dx":          torch.randn(B, 21),
+        "dy":          torch.randn(B, 21),
+        "click_left":  torch.randn(B, 3),
+        "click_right": torch.randn(B, 3),
+        "scroll":      torch.randn(B, 21),
+        "keys":        torch.randn(B, 231),
+        "done":        torch.randn(B, 1),
+    }
+    targets = {
+        "dx_continuous":      torch.randn(B),
+        "dy_continuous":      torch.randn(B),
+        "scroll_continuous":  torch.randn(B),
+        "click_left":         torch.randint(0, 3, (B,)),
+        "click_right":        torch.randint(0, 3, (B,)),
+        "keys":               torch.randint(0, 3, (B, 77)),
+        "done":               torch.randint(0, 2, (B,)).float(),
+    }
+    loss_mask = torch.zeros(B)
+    head_weights = {n: 1.0 for n in head_logits}
+    total, per_head = total_loss_b0(head_logits, targets, head_weights, loss_mask)
+    assert total.item() == 0.0
