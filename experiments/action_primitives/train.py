@@ -577,6 +577,14 @@ def main() -> None:
     model.train(True)
     step = start_step
     best_val_loss = float("inf")
+    # Restore best_val_loss after spot-reclaim resume so the first post-resume
+    # val eval does not overwrite a real best with a worse one. best.pt lives
+    # next to the step_*.pt being resumed (both in --out-dir).
+    if args.resume:
+        best_path = Path(args.resume).parent / "best.pt"
+        if best_path.exists():
+            best_val_loss = torch.load(best_path, map_location="cpu")["val_loss"]
+            print(f"[resume] restored best_val_loss={best_val_loss:.4f} from {best_path}")
     patience_counter = 0
     early_stopped = False
     head_loss_keys = (
