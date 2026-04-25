@@ -106,6 +106,44 @@ def done_loss(logits_done: torch.Tensor, target_done: torch.Tensor) -> torch.Ten
     return (focal_weight * bce).mean()
 
 
+def soft_label_ce(
+    logits: torch.Tensor,         # (B, num_bins)
+    expert_continuous: torch.Tensor,  # (B,) float — expert action in continuous units
+    bin_centers: torch.Tensor,    # (num_bins,) float — sorted ascending
+) -> torch.Tensor:
+    """2-bin triangular soft-label cross-entropy.
+
+    For each sample, find the two bins bracketing expert_continuous and assign
+    weights linearly interpolated between them. Example: bins [0, 1, 4, 10],
+    expert=2.5 → bracketing bins {1, 2}, weight on bin 1 = (4-2.5)/(4-1) = 0.5,
+    weight on bin 2 = (2.5-1)/(4-1) = 0.5.
+    """
+    B = logits.size(0)
+    num_bins = bin_centers.size(0)
+    # For each sample, find the rightmost bin <= expert (lower bracket)
+    # `searchsorted` with side="right" gives the index of the first bin > expert.
+    upper_idx = torch.searchsorted(bin_centers, expert_continuous, right=True)
+    upper_idx = torch.clamp(upper_idx, 1, num_bins - 1)
+    lower_idx = upper_idx - 1
+    lower_centers = bin_centers[lower_idx]
+    upper_centers = bin_centers[upper_idx]
+    span = upper_centers - lower_centers
+    span = torch.where(span > 1e-6, span, torch.ones_like(span))
+    upper_w = (expert_continuous - lower_centers) / span
+    lower_w = 1.0 - upper_w
+    upper_w = torch.clamp(upper_w, 0.0, 1.0)
+    lower_w = torch.clamp(lower_w, 0.0, 1.0)
+
+    # Construct soft target (B, num_bins)
+    soft_target = torch.zeros_like(logits)
+    soft_target.scatter_(-1, lower_idx.unsqueeze(-1), lower_w.unsqueeze(-1))
+    soft_target.scatter_add_(-1, upper_idx.unsqueeze(-1), upper_w.unsqueeze(-1))
+
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = -(soft_target * log_probs).sum(dim=-1).mean()
+    return loss
+
+
 def total_loss(
     head_logits: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],

@@ -1,12 +1,14 @@
 """Unit tests for loss functions."""
 
+import numpy as np
 import torch
 
-from experiments.action_primitives.config import HEAD_LOGITS, NUM_BINS_MOUSE, NUM_CLICK_EVENTS, NUM_KEYS
+from experiments.action_primitives.config import HEAD_LOGITS, MOUSE_BIN_CENTERS, NUM_BINS_MOUSE, NUM_CLICK_EVENTS, NUM_KEYS
 from experiments.action_primitives.losses import (
     focal_ce_loss,
     keys_focal_loss,
     done_loss,
+    soft_label_ce,
     total_loss,
 )
 
@@ -112,3 +114,32 @@ def test_keys_smoothing_is_probability_distribution():
     sums = smooth.sum(dim=-1)
     assert torch.allclose(sums, torch.ones_like(sums), atol=1e-6), \
         f"smoothing sum invariant broken: min={sums.min()}, max={sums.max()}"
+
+
+def test_soft_label_ce_concentrates_at_target_bin():
+    """When expert is exactly on a bin center, soft label = hard label."""
+    centers = torch.tensor(MOUSE_BIN_CENTERS, dtype=torch.float32)
+    bin_idx = 10  # center bin (zero)
+    expert_continuous = torch.tensor([centers[bin_idx].item()])
+    # Use logits that heavily favor target bin
+    logits = torch.zeros(1, 21)
+    logits[0, bin_idx] = 5.0
+    loss = soft_label_ce(logits, expert_continuous, centers)
+    # Loss should be very small (logits favor the correct bin)
+    assert loss.item() < 0.5
+
+
+def test_soft_label_ce_interpolates_between_bins():
+    """When expert is between two bins, matched logits give lower loss than uniform."""
+    centers = torch.tensor(MOUSE_BIN_CENTERS, dtype=torch.float32)
+    # Pick a value between bin 10 (0.0) and bin 11 (~0.026)
+    expert_continuous = torch.tensor([centers[10].item() * 0.5 + centers[11].item() * 0.5])
+    # Logits: zero everywhere → uniform softmax → high loss
+    logits1 = torch.zeros(1, 21)
+    loss_uniform = soft_label_ce(logits1, expert_continuous, centers)
+    # Logits matching the soft target (bins 10 + 11)
+    logits2 = torch.zeros(1, 21)
+    logits2[0, 10] = 3.0
+    logits2[0, 11] = 3.0
+    loss_matched = soft_label_ce(logits2, expert_continuous, centers)
+    assert loss_matched < loss_uniform  # matching distribution gets lower loss
