@@ -162,13 +162,20 @@ def main(argv: list[str] | None = None) -> int:
     # streams CloudWatch to the local terminal (same UX as V2's wait=True).
     trainer.train(wait=not args.detach, logs=not args.detach)
 
+    # Surface the actual SageMaker job name (the SDK appends a -YYYYMMDDHHMMSS
+    # suffix to the launcher's job_name; this is what the user / sm_jobs.py
+    # needs to inspect the run).
+    actual_name = None
+    if hasattr(trainer, "_latest_training_job") and trainer._latest_training_job is not None:
+        actual_name = getattr(trainer._latest_training_job, "training_job_name", None)
+    name_display = actual_name or f"{job_name}* (SDK-suffixed; use 'sm_jobs.py latest' to resolve)"
+
     if args.detach:
-        print(f"[launch_sm_job] detached. Watch with: uv run python scripts/sm_jobs.py logs latest --follow")
+        print(f"[launch_sm_job] detached. Job: {name_display}")
+        print(f"[launch_sm_job] Watch logs: uv run python scripts/sm_jobs.py logs latest --follow")
     else:
-        # V3 logs=True already streamed the actual job name + status during training.
-        # Use sm_jobs.py for post-hoc inspection.
-        print(f"[launch_sm_job] training run finished. "
-              f"Inspect with: uv run python scripts/sm_jobs.py status latest")
+        print(f"[launch_sm_job] training run finished. Job: {name_display}")
+        print(f"[launch_sm_job] Inspect: uv run python scripts/sm_jobs.py status latest")
     return 0
 
 

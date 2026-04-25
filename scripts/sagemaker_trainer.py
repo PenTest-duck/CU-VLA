@@ -14,6 +14,7 @@ Used by scripts/launch_sm_job.py and scripts/launch_sm_job_<exp>.py.
 """
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -118,7 +119,7 @@ def make_trainer(
     environment: dict[str, str] = {
         "CU_VLA_BRANCH": branch,
         "TRAIN_MODULE": train_module,
-        "TRAIN_ARGS": " ".join(train_args) if train_args else "",
+        "TRAIN_ARGS": shlex.join(train_args) if train_args else "",
         # Headless pygame insurance — if any train-time code path imports
         # pygame.display, this prevents an SDL init crash.
         "SDL_VIDEODRIVER": "dummy",

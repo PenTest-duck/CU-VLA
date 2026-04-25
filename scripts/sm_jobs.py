@@ -222,22 +222,34 @@ def cmd_cost(args: argparse.Namespace) -> int:
 def cmd_reconcile_ckpts(args: argparse.Namespace) -> int:
     """Push any best.pt / final.pt sitting in S3 but not yet on HF Hub.
 
-    Reads the s3://.../checkpoints/<job-name>/{best,final}.pt and uploads
-    them via experiments.action_primitives.hf_sync if the user provides
-    --hf-repo.
+    Reads the s3://.../checkpoints/<job-name>/{best,final}.pt — the actual
+    S3 prefix is taken from the job's CheckpointConfig.S3Uri (the SDK
+    appends a timestamp suffix to the base_job_name we passed in, so
+    constructing the prefix from the resolved job name would be wrong).
+    Then uploads to HF Hub if the user provides --hf-repo.
     """
+    # NOTE: args.s3_bucket is intentionally unused after the fix; the bucket
+    # is parsed from CheckpointConfig.S3Uri below. The CLI flag is kept for
+    # backward-compatibility.
     name = resolve_job(args.name, tuple(args.filter or ()), args.region)
     if not args.hf_repo:
         sys.exit("ERROR: --hf-repo required for reconcile-ckpts")
-    if not args.s3_bucket:
-        s3_bucket = os.environ.get("CU_VLA_SM_BUCKET")
-        if not s3_bucket:
-            sys.exit("ERROR: pass --s3-bucket or set CU_VLA_SM_BUCKET")
-    else:
-        s3_bucket = args.s3_bucket
+
+    sm = _sm_client(args.region)
+    desc = sm.describe_training_job(TrainingJobName=name)
+    ckpt_uri = desc.get("CheckpointConfig", {}).get("S3Uri")
+    if not ckpt_uri:
+        sys.exit(f"ERROR: job {name} has no CheckpointConfig.S3Uri (was it spot?)")
+
+    # Parse s3://bucket/prefix/path/ → (bucket, key_prefix).
+    if not ckpt_uri.startswith("s3://"):
+        sys.exit(f"ERROR: unexpected CheckpointConfig.S3Uri format: {ckpt_uri}")
+    bucket_and_key = ckpt_uri[len("s3://"):]
+    parts = bucket_and_key.split("/", 1)
+    s3_bucket = parts[0]
+    prefix = (parts[1] if len(parts) > 1 else "").rstrip("/") + "/"
 
     s3 = boto3.client("s3", region_name=args.region)
-    prefix = f"checkpoints/{name}/"
     resp = s3.list_objects_v2(Bucket=s3_bucket, Prefix=prefix)
     if "Contents" not in resp:
         print(f"(no S3 objects under s3://{s3_bucket}/{prefix})")
