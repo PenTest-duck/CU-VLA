@@ -125,3 +125,63 @@ def test_generate_all_parallel_respects_idempotency_guard(tmp_path):
     generate_all(n_episodes=2, out_dir=tmp_path, shard_size=1, workers=2)
     with pytest.raises(RuntimeError, match="already contains"):
         generate_all(n_episodes=2, out_dir=tmp_path, shard_size=1, workers=2)
+
+
+# ---------------------------------------------------------------------------
+# Phase B0 generator tests
+# ---------------------------------------------------------------------------
+import numpy as np
+from experiments.action_primitives.generator import generate_one_b0_episode
+
+
+def test_generate_b0_episode_no_recovery():
+    rows = generate_one_b0_episode(episode_id=0, seed=42, force_scenario_error=False)
+    assert len(rows) > 0
+    # First row has all expected B0 fields
+    r = rows[0]
+    for field in ("episode_id", "frame_idx", "image_bytes",
+                  "instruction", "target_button_id", "n_buttons",
+                  "composite_tier", "is_adversarial",
+                  "is_scenario_error", "scenario_type", "k_wrong_frames",
+                  "is_dart_noisy_frame", "loss_mask"):
+        assert field in r, f"missing field: {field}"
+    # Episode-level metadata is consistent across rows
+    assert all(r["instruction"] == rows[0]["instruction"] for r in rows)
+    assert all(r["target_button_id"] == rows[0]["target_button_id"] for r in rows)
+    assert all(r["is_scenario_error"] == 0 for r in rows)
+
+
+def test_generate_b0_scenario_error_episode():
+    rows = generate_one_b0_episode(
+        episode_id=1, seed=0, force_scenario_error=True, force_k_frames=10,
+    )
+    assert rows[0]["is_scenario_error"] == 1
+    assert rows[0]["k_wrong_frames"] == 10
+    # First k frames have loss_mask=0
+    assert all(rows[i]["loss_mask"] == 0 for i in range(10))
+    # Frames after k have loss_mask=1
+    assert any(rows[i]["loss_mask"] == 1 for i in range(10, len(rows)))
+
+
+def test_generate_b0_dart_noise_in_clean_episode():
+    rows = generate_one_b0_episode(
+        episode_id=2, seed=0, force_scenario_error=False, dart_p=0.5,
+    )
+    # With p=0.5, expect ~50% of nav frames to be DART-noisy
+    nav_frames = [r for r in rows if r["loss_mask"] == 1]
+    noisy_frames = [r for r in nav_frames if r["is_dart_noisy_frame"] == 1]
+    assert len(noisy_frames) > 0, "expected at least some DART-noisy frames"
+
+
+def test_generate_b0_action_label_is_clean_expert():
+    """Verify action_label_* columns are clean expert actions (not perturbed/wrong)."""
+    rows = generate_one_b0_episode(episode_id=3, seed=0, force_scenario_error=False, dart_p=1.0)
+    # On DART-noisy frames, action_dx (applied) may differ from action_label_dx (clean)
+    nav_noisy = [r for r in rows if r["loss_mask"] == 1 and r["is_dart_noisy_frame"] == 1]
+    if nav_noisy:
+        # At least one frame should show applied != label
+        any_differ = any(
+            r["action_dx"] != r["action_label_dx"] or r["action_dy"] != r["action_label_dy"]
+            for r in nav_noisy
+        )
+        assert any_differ, "DART noise should make applied != label on at least some frames"
