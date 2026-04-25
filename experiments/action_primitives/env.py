@@ -275,5 +275,7 @@ class LClickEnv:
         }
         if self._scene is not None:
             info["target_button_id"] = self._target_button_id
-            info["scene"] = self._scene
+            # Note: scene reference is NOT echoed into info — caller already
+            # holds the Scene it passed in, and per-step duplication adds
+            # serialization pressure for downstream parquet writers.
         return info
