@@ -117,6 +117,7 @@ def _worker_run_episodes(
     output_dir: Path,
     base_seed: int,
     episodes_per_shard: int,
+    progress_every: int = 25,
 ) -> tuple[int, int]:
     """Run a worker that generates n episodes and writes them as parquet shards.
 
@@ -124,8 +125,16 @@ def _worker_run_episodes(
     ``generate_one_b0_episode`` (which constructs ``LClickEnv``, which
     initializes pygame). Subsequent episodes reuse the same pygame state.
 
+    Prints periodic progress (every ``progress_every`` episodes) with
+    ``flush=True`` so output is visible in real-time across multiproc workers.
+
     Returns ``(worker_id, n_episodes_written)``.
     """
+    import time
+    t_start = time.time()
+    print(f"[w{worker_id}] starting: {n_episodes_for_worker} eps "
+          f"(ids {episode_id_start}..{episode_id_start + n_episodes_for_worker - 1})",
+          flush=True)
     buffer: list[dict] = []
     shard_idx = 0
     episodes_in_shard = 0
@@ -137,6 +146,12 @@ def _worker_run_episodes(
         buffer.extend(rows)
         episodes_in_shard += 1
         n_done += 1
+        if n_done % progress_every == 0:
+            elapsed = time.time() - t_start
+            eps_per_s = n_done / elapsed if elapsed > 0 else 0.0
+            eta = (n_episodes_for_worker - n_done) / eps_per_s if eps_per_s > 0 else float("inf")
+            print(f"[w{worker_id}] {n_done}/{n_episodes_for_worker} eps "
+                  f"({eps_per_s:.1f} eps/s, ETA {eta:.0f}s)", flush=True)
         if episodes_in_shard >= episodes_per_shard:
             _flush_shard(buffer, output_dir, worker_id, shard_idx)
             buffer = []
@@ -144,6 +159,9 @@ def _worker_run_episodes(
             shard_idx += 1
     if buffer:
         _flush_shard(buffer, output_dir, worker_id, shard_idx)
+    elapsed = time.time() - t_start
+    print(f"[w{worker_id}] done: {n_done} eps in {elapsed:.1f}s "
+          f"({n_done/elapsed:.1f} eps/s)", flush=True)
     return worker_id, n_done
 
 
