@@ -1,7 +1,8 @@
-"""Output heads: unpooled flatten(16 queries × 768) → 6 action heads.
+"""Output heads: unpooled flatten(16 queries × 768) → 7 action heads.
 
-Per Q16: 21+21+5+21+231+1 = 300 logits/frame; unpooled trades ~3.7M params
-for no information loss vs pooling.
+B0: 21+21+3+3+21+231+1 = 301 logits/frame (click split into click_left + click_right,
+each 3-way {idle, press, release}); unpooled trades ~3.7M params for no information
+loss vs pooling.
 """
 from __future__ import annotations
 

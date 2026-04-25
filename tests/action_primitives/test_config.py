@@ -39,8 +39,13 @@ def test_scroll_bin_centers_shape():
 
 
 def test_total_logits_matches_design():
-    assert TOTAL_LOGITS == 300  # 21+21+5+21+231+1 per design Q1
+    # B0: click split into click_left + click_right (3-way each)
+    # 21+21+3+3+21+231+1 = 301 per design Q1 (B0 amendment)
+    assert TOTAL_LOGITS == 301
     assert HEAD_LOGITS["keys"] == 231
+    assert HEAD_LOGITS["click_left"] == 3
+    assert HEAD_LOGITS["click_right"] == 3
+    assert "click" not in HEAD_LOGITS
 
 
 def test_b0_attribute_palettes_defined():

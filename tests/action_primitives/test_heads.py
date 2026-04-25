@@ -14,8 +14,20 @@ def test_action_heads_output_shapes():
         assert out[name].shape == (3, n), f"{name} got {out[name].shape}"
 
 
-def test_action_heads_produce_all_six_outputs():
+def test_action_heads_outputs_two_click_heads():
     heads = ActionHeads()
-    q = torch.randn(1, MODEL.n_queries, MODEL.d_model)
-    out = heads(q)
-    assert set(out.keys()) == {"dx", "dy", "click", "scroll", "keys", "done"}
+    queries = torch.randn(2, MODEL.n_queries, MODEL.d_model)
+    out = heads(queries)
+    # New B0 architecture: dx, dy, click_left, click_right, scroll, keys, done
+    assert "click_left" in out
+    assert "click_right" in out
+    assert out["click_left"].shape == (2, 3)
+    assert out["click_right"].shape == (2, 3)
+    assert "click" not in out, "5-way click head should be removed"
+
+
+def test_head_logits_total_matches_new_arch():
+    # 21+21+3+3+21+231+1 = 301
+    expected = 21 + 21 + 3 + 3 + 21 + 231 + 1
+    actual = sum(HEAD_LOGITS.values())
+    assert actual == expected

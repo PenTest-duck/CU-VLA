@@ -41,8 +41,15 @@ def _build_exp_bin_centers(num_bins: int, cap: float, alpha: float) -> np.ndarra
 MOUSE_BIN_CENTERS: np.ndarray = _build_exp_bin_centers(NUM_BINS_MOUSE, MOUSE_CAP_PX, MOUSE_ALPHA)
 
 # Click event: 5-way {idle, L_press, L_release, R_press, R_release}
+# Phase A's combined 5-way constants kept for backward-compat in legacy code paths
+# (e.g., env.step still emits 0-4 click event ids; generator.py emits these to parquet);
+# training-side code uses CLICK_BTN_* with separate click_left/click_right logits.
 NUM_CLICK_EVENTS: int = 5
 CLICK_IDLE, CLICK_L_PRESS, CLICK_L_RELEASE, CLICK_R_PRESS, CLICK_R_RELEASE = range(5)
+
+# Click event split into two parallel 3-way heads (B0): {idle, press, release} per button
+NUM_CLICK_EVENTS_PER_BUTTON: int = 3
+CLICK_BTN_IDLE, CLICK_BTN_PRESS, CLICK_BTN_RELEASE = range(3)
 
 # Scroll: 21-bin signed, ±20 wheel ticks/frame (symmetric; Q1 notes unchanged in Phase A)
 NUM_BINS_SCROLL: int = 21
@@ -55,14 +62,15 @@ KEY_STATE_PRESS, KEY_STATE_RELEASE, KEY_STATE_IDLE = range(3)
 
 # Head sizes
 HEAD_LOGITS = {
-    "dx": NUM_BINS_MOUSE,        # 21
-    "dy": NUM_BINS_MOUSE,        # 21
-    "click": NUM_CLICK_EVENTS,   # 5
-    "scroll": NUM_BINS_SCROLL,   # 21
-    "keys": NUM_KEYS * 3,        # 231
-    "done": 1,                   # binary
+    "dx":          NUM_BINS_MOUSE,                # 21
+    "dy":          NUM_BINS_MOUSE,                # 21
+    "click_left":  NUM_CLICK_EVENTS_PER_BUTTON,   # 3
+    "click_right": NUM_CLICK_EVENTS_PER_BUTTON,   # 3
+    "scroll":      NUM_BINS_SCROLL,               # 21
+    "keys":        NUM_KEYS * 3,                  # 231
+    "done":        1,                             # binary
 }
-TOTAL_LOGITS: int = sum(HEAD_LOGITS.values())  # 300
+TOTAL_LOGITS: int = sum(HEAD_LOGITS.values())  # 301
 
 
 # ---------- Proprio (Q15) ----------
@@ -92,12 +100,14 @@ MODEL = ModelConfig()
 # ---------- Loss (Q2, Q3) ----------
 @dataclass(frozen=True)
 class LossConfig:
-    focal_gamma: float = 2.0
+    focal_gamma: float = 3.0           # B0 default (Phase A used 2.0)
     label_smoothing_mouse: float = 0.05
     idle_smoothing_keys: float = 0.05
     # Initial per-head weights will be re-computed from L_i^init at train start (Q2)
     placeholder_weights: dict = field(default_factory=lambda: {
-        "dx": 1.0, "dy": 1.0, "click": 1.0, "scroll": 1.0, "keys": 1.0, "done": 1.0,
+        "dx": 1.0, "dy": 1.0,
+        "click_left": 1.0, "click_right": 1.0,
+        "scroll": 1.0, "keys": 1.0, "done": 1.0,
     })
 
 
