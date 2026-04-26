@@ -75,6 +75,17 @@ def main() -> int:
     if args.detach:
         forwarded.append("--detach")
     forwarded.append("--")
+    # Auto-forward --phase to the train module unless the user already passed
+    # one. train.py uses --phase to select the right loss function (Phase A
+    # legacy `total_loss` vs B0 `total_loss_b0` with click_left/click_right
+    # heads). Without this, B0 model output silently fails with
+    # KeyError: 'click' inside losses.total_loss().
+    # train.py only knows phases {"a", "b0"} today — skip auto-forward for
+    # any phase outside that set (e.g. b1 once added) so the user can be
+    # explicit about the train-time phase value.
+    _TRAIN_KNOWN_PHASES = {"a", "b0"}
+    if "--phase" not in train_args and args.phase in _TRAIN_KNOWN_PHASES:
+        forwarded.extend(["--phase", args.phase])
     forwarded.extend(train_args)
 
     return launch_main(forwarded)
