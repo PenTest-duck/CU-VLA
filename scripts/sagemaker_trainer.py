@@ -125,7 +125,11 @@ def make_trainer(
         "TRAIN_ARGS": shlex.join(train_args) if train_args else "",
         # Headless pygame insurance — if any train-time code path imports
         # pygame.display, this prevents an SDL init crash.
+        # Headless pygame: dummy video driver prevents SDL display init crash;
+        # dummy audio driver silences ~10 lines of ALSA errors per pygame.init()
+        # call (no sound card in the container). Both are no-ops for compute.
         "SDL_VIDEODRIVER": "dummy",
+        "SDL_AUDIODRIVER": "dummy",
         "AWS_REGION": region,
         # Silence HF Hub progress bars in CloudWatch.
         "HF_HUB_DISABLE_PROGRESS_BARS": "1",

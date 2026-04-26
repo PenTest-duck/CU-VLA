@@ -86,6 +86,7 @@ def test_factory_sets_environment_with_branch_and_train_module(mock_mt, mock_ima
     assert env["CU_VLA_BRANCH"] == "feat/exp6-phase-b1"
     assert env["TRAIN_MODULE"] == "experiments.action_primitives.train"
     assert env["SDL_VIDEODRIVER"] == "dummy"
+    assert env["SDL_AUDIODRIVER"] == "dummy"
 
 
 @patch("scripts.sagemaker_trainer.image_uris")
