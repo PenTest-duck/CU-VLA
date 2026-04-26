@@ -242,6 +242,11 @@ def _assemble_micro_batch_b0(
 _PHASE_A_HEAD_NAMES = ("dx", "dy", "click", "scroll", "keys", "done")
 _PHASE_B0_HEAD_NAMES = ("dx", "dy", "click_left", "click_right", "scroll", "keys", "done")
 
+# How many recent step_*.pt files to keep on disk (and thus in the S3-synced
+# checkpoint volume on SageMaker). Spot resume only needs the latest; extras
+# are debug headroom. best.pt and final.pt are never pruned.
+KEEP_LAST_N_STEP_CKPTS = 3
+
 
 def train_one_step(
     model: ActionPrimitivesACT,
@@ -617,6 +622,16 @@ def main() -> None:
             ckpt_path = out_dir / f"step_{step:05d}.pt"
             torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(), "step": step}, ckpt_path)
             print(f"[ckpt] {ckpt_path}")
+            # Prune older step_*.pt to bound S3 storage cost on long SageMaker
+            # spot runs (each ckpt is ~1.9GB; without pruning a 4h run leaves
+            # ~38GB on S3 for 30 days = ~$0.87/run). Spot resume only needs
+            # the latest; the extra 2 are debug headroom. best.pt + final.pt
+            # are NOT touched — they're the canonical artifacts uploaded to
+            # HF Hub.
+            existing_step_ckpts = sorted(out_dir.glob("step_*.pt"))
+            for old in existing_step_ckpts[:-KEEP_LAST_N_STEP_CKPTS]:
+                old.unlink()
+                print(f"[ckpt] pruned {old.name}")
 
         # Validation + best.pt tracking + early stopping.
         if args.eval_every_steps > 0 and step > 0 and step % args.eval_every_steps == 0:
