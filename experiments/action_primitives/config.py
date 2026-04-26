@@ -139,6 +139,10 @@ class TrainConfig:
     macro_batch_episodes: int = 64
     micro_batch_episodes: int = 8        # 8 micro × 8 = 64 macro (Q2/Q8 clarification)
     phase_a_epochs: int = 5              # smaller than Phase B's 20
+    # Phase B0 attempt 2: 16 epochs × 125 steps/epoch (10000 train eps / 64 macro
+    # = 125 steps/epoch since train_frac=0.8 gives 8000 train eps) = 2000 steps.
+    # Attempt 1 crashed at step 512/1250; this gives ~60% more compute.
+    phase_b0_epochs: int = 16
     lr_trunk: float = 3e-4
     lr_lora: float = 2e-4
     weight_decay: float = 0.01
