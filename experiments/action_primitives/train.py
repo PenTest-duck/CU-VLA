@@ -133,8 +133,14 @@ def _assemble_micro_batch(
     text_rep_parts: list = []
     text_mask_parts: list = []
     instructions = [e["instruction"] for e in micro_eps]
-    with torch.no_grad():
-        text_tokens = model.backbone.encode_text(instructions)    # (M, T_text, d)
+    # B0 attempt 2 fix: encode_text now returns (tokens, mask). The torch.no_grad
+    # barrier is removed so text-tower LoRA gradients can flow when enabled.
+    # Phase A doesn't use text LoRA (text_lora_rank=0 -> text fully frozen anyway),
+    # so the no_grad removal is a no-op for Phase A. The real attention mask
+    # replaces the prior fake torch.ones(...) — a long-standing bug that
+    # masked padding from the trunk's cross-attention identically to real text.
+    text_tokens, text_attn_mask = model.backbone.encode_text(instructions)  # (M, T, d), (M, T)
+    text_attn_mask = text_attn_mask.to(device)
     for ep_idx, ep in enumerate(micro_eps):
         flat = flatten_episode_to_frames(ep)
         vp = flat["vision_preprocessed"]
@@ -147,7 +153,8 @@ def _assemble_micro_batch(
         for k in flat_targets:
             flat_targets[k].append(flat[k])
         text_rep_parts.append(text_tokens[ep_idx:ep_idx + 1].expand(T, -1, -1))
-        text_mask_parts.append(torch.ones(T, text_tokens.size(1), device=device))
+        # Real text attention mask, broadcast to T frames per episode
+        text_mask_parts.append(text_attn_mask[ep_idx:ep_idx + 1].expand(T, -1))
 
     vision_preprocessed = {
         "pixel_values": torch.cat(flat_pv, dim=0),
@@ -196,8 +203,11 @@ def _assemble_micro_batch_b0(
     text_rep_parts: list = []
     text_mask_parts: list = []
     instructions = [e["instruction"] for e in micro_eps]
-    with torch.no_grad():
-        text_tokens = model.backbone.encode_text(instructions)    # (M, T_text, d)
+    # B0 attempt 2 fix (F2): drop torch.no_grad so text-tower LoRA gradients
+    # can flow; capture the real attention mask from encode_text and broadcast
+    # it per-frame instead of the prior bug where text_mask was torch.ones.
+    text_tokens, text_attn_mask = model.backbone.encode_text(instructions)  # (M, T, d), (M, T)
+    text_attn_mask = text_attn_mask.to(device)
     for ep_idx, ep in enumerate(micro_eps):
         T = ep["proprio"].shape[0]
         # Vision (preprocessed in worker)
@@ -219,7 +229,7 @@ def _assemble_micro_batch_b0(
         flat_targets["keys"].append(label["key_events"])
         flat_targets["done"].append(label["dones"])
         text_rep_parts.append(text_tokens[ep_idx:ep_idx + 1].expand(T, -1, -1))
-        text_mask_parts.append(torch.ones(T, text_tokens.size(1), device=device))
+        text_mask_parts.append(text_attn_mask[ep_idx:ep_idx + 1].expand(T, -1))
 
     vision_preprocessed = {
         "pixel_values": torch.cat(flat_pv, dim=0),

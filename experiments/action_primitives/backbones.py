@@ -59,8 +59,15 @@ class SigLIP2Naflex(nn.Module):
                 f"`attention_mask` in its signature; got params: {list(params)}"
             )
 
-    def apply_lora(self, rank: int = 8) -> None:
+    def apply_lora(self, rank: int = 8, text_rank: int = 0, text_target_layers: int = 2) -> None:
         """Apply LoRA adapters to vision tower attention projections (Q15).
+
+        If ``text_rank > 0``, also apply LoRA to the top ``text_target_layers``
+        text encoder layers' self-attention projections. This unfreezes a small
+        number of text params (~30K-200K, rank-dependent) so the text encoder
+        can specialize for our short imperative instructions (B0 attempt 2 fix
+        F2). Default ``text_rank=0`` reproduces attempt 1's text-frozen
+        behavior.
 
         Idempotency-guarded: calling a second time raises RuntimeError rather
         than silently stacking adapters (PEFT emits warnings but continues,
@@ -82,8 +89,26 @@ class SigLIP2Naflex(nn.Module):
             bias="none",
             lora_dropout=0.0,
         )
-        # Apply only to vision_model (text stays frozen)
         self.model.vision_model = get_peft_model(self.model.vision_model, lora_cfg)
+
+        # Optional text-tower LoRA on top N layers (B0 attempt 2).
+        if text_rank > 0:
+            n_text_layers = len(self.model.text_model.encoder.layers)
+            target_layer_idxs = list(range(n_text_layers - text_target_layers, n_text_layers))
+            text_target_modules = [
+                f"encoder.layers.{i}.self_attn.{proj}"
+                for i in target_layer_idxs
+                for proj in ("q_proj", "k_proj", "v_proj", "out_proj")
+            ]
+            text_cfg = LoraConfig(
+                r=text_rank,
+                lora_alpha=text_rank * 2,
+                target_modules=text_target_modules,
+                modules_to_save=[],
+                bias="none",
+                lora_dropout=0.0,
+            )
+            self.model.text_model = get_peft_model(self.model.text_model, text_cfg)
 
     def preprocess(self, images: list) -> dict:
         """Run the naflex processor on PIL images; returns CPU tensors.
@@ -135,11 +160,32 @@ class SigLIP2Naflex(nn.Module):
         """
         return self.encode_preprocessed(self.preprocess(images))
 
-    @torch.no_grad()
-    def encode_text(self, texts: list[str]) -> torch.Tensor:
-        """Cache-friendly instruction encoder. Returns (B, T, d) text tokens."""
+    def encode_text(self, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode instructions to (tokens, attention_mask).
+
+        Returns:
+            tokens: (B, T, d) hidden states.
+            attention_mask: (B, T) int — 1 for real tokens, 0 for padding.
+
+        IMPORTANT: NOT decorated with @torch.no_grad anymore. When text LoRA
+        is applied (B0 attempt 2), gradients must flow through the text
+        adapters, so the no_grad barrier is removed. Callers that want a
+        no-grad inference path should wrap this call themselves.
+
+        Returning the attention_mask fixes a B0 attempt 1 bug where
+        train.py used `torch.ones(...)` as a fake mask, hiding which text
+        tokens were real vs padding from the trunk's cross-attention.
+        """
         inputs = self.processor(text=texts, return_tensors="pt", padding=True)
         device = next(self.model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        # SigLIP2's tokenizer doesn't emit attention_mask by default. Compute
+        # it from input_ids using the pad-token id (0 in this tokenizer):
+        #   1 = real token, 0 = padding.
+        if "attention_mask" not in inputs:
+            pad_id = getattr(self.processor.tokenizer, "pad_token_id", 0)
+            attention_mask = (inputs["input_ids"] != pad_id).to(torch.long)
+        else:
+            attention_mask = inputs["attention_mask"]
         out = self.model.text_model(**inputs)
-        return out.last_hidden_state  # (B, T, d)
+        return out.last_hidden_state, attention_mask  # (B, T, d), (B, T)

@@ -27,7 +27,11 @@ class ActionPrimitivesACT(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.backbone = SigLIP2Naflex()
-        self.backbone.apply_lora(rank=MODEL.lora_rank)
+        self.backbone.apply_lora(
+            rank=MODEL.lora_rank,
+            text_rank=getattr(MODEL, "text_lora_rank", 0),
+            text_target_layers=getattr(MODEL, "text_lora_target_layers", 2),
+        )
         self.proprio_enc = ProprioEncoder()
         self.history_enc = HistoryEncoder()
         self.trunk = Trunk()

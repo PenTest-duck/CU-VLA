@@ -91,7 +91,24 @@ class ModelConfig:
     action_history_len: int = 8    # Q5, Q19
     action_vec_dim: int = 300      # Q19: per-frame composite action vector size
     lora_rank: int = 8             # Q15
-    freeze_text_tower: bool = True # Q15
+    freeze_text_tower: bool = True # Q15 — kept for backward-compat; B0 attempt 2
+                                   # uses text_lora_rank>0 instead, which adds
+                                   # LoRA to the top text_lora_target_layers
+                                   # text encoder layers without "unfreezing" the
+                                   # base text params.
+    # B0 attempt 2: text-tower LoRA on top N layers. Coupled with train.py
+    # text-path bug fixes (removing torch.no_grad in encode_text usage and
+    # passing real attention mask). 0 disables (backward-compat with attempt 1).
+    text_lora_rank: int = 4
+    text_lora_target_layers: int = 2
+    # B0 attempt 2: aux target-button head (A3, redesigned).
+    # Predicts target's grid cell index (in B0_POSITION_GRID = 3x2 = 6 cells)
+    # from target_bbox center. Loss applied only on episode_frame_idx==0
+    # (history is naturally zero there) — prevents the trunk from learning to
+    # read cursor-trajectory history instead of the instruction.
+    aux_target_enabled: bool = True
+    aux_target_n_cells: int = 6      # B0_POSITION_GRID = (3,2) → 6 cells
+    aux_target_hidden_dim: int = 256
 
 
 MODEL = ModelConfig()

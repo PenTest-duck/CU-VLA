@@ -88,9 +88,9 @@ def offline_eval(model: ActionPrimitivesACT, data_dir: Path, device: str) -> dic
         # model.forward's fast dispatch path.
         T = ep["pixel_values"].shape[0]
         with torch.no_grad():
-            text_tokens = model.backbone.encode_text([ep["instruction"]])  # (1, T_text, d)
+            text_tokens, text_attn_mask = model.backbone.encode_text([ep["instruction"]])  # (1, T_text, d), (1, T_text)
             text_rep = text_tokens.expand(T, -1, -1)
-            text_mask = torch.ones(T, text_tokens.size(1), device=device)
+            text_mask = text_attn_mask.to(device).expand(T, -1)
             vision_input = {
                 "pixel_values": ep["pixel_values"],
                 "pixel_attention_mask": ep["pixel_attention_mask"],
@@ -180,7 +180,8 @@ def rollout_one_episode(
     obs, info = env.reset()
     with torch.no_grad():
         # Must match dataset.py's Phase A fixed instruction (no theme leakage).
-        text_tokens = model.backbone.encode_text(["click the button"])
+        text_tokens, text_attn_mask = model.backbone.encode_text(["click the button"])
+        text_attn_mask = text_attn_mask.to(device)
     K = MODEL.action_history_len
     history = np.zeros((K, HISTORY_INPUT_DIM), dtype=np.float32)
     for t in range(max_frames):
@@ -193,7 +194,7 @@ def rollout_one_episode(
         proprio_t = torch.from_numpy(prop).float().unsqueeze(0).to(device)
         history_t = torch.from_numpy(history).float().unsqueeze(0).to(device)
         with torch.no_grad():
-            out = model([obs["image"]], text_tokens, torch.ones(1, text_tokens.size(1), device=device), proprio_t, history_t)
+            out = model([obs["image"]], text_tokens, text_attn_mask, proprio_t, history_t)
         # Decode mouse deltas (argmax or probabilistic). Bin index is still
         # tracked for the one-hot history vector — training never saw soft
         # history, and introducing it at inference would itself be a distribution
@@ -356,7 +357,8 @@ def rollout_one_episode_b0(
     obs, info = env.reset()
     is_b0 = _is_b0_model(model)
     with torch.no_grad():
-        text_tokens = model.backbone.encode_text([instruction])
+        text_tokens, text_attn_mask = model.backbone.encode_text([instruction])
+        text_attn_mask = text_attn_mask.to(device)
     K = MODEL.action_history_len
     history = np.zeros((K, HISTORY_INPUT_DIM), dtype=np.float32)
     cursor_xys: list[tuple[float, float]] = [(env.cursor_x, env.cursor_y)]
@@ -369,7 +371,7 @@ def rollout_one_episode_b0(
         with torch.no_grad():
             out = model(
                 [obs["image"]], text_tokens,
-                torch.ones(1, text_tokens.size(1), device=device),
+                text_attn_mask,
                 proprio_t, history_t,
             )
         dx_bin, dx = _decode_mouse(out.head_logits["dx"], MOUSE_BIN_CENTERS, decode_mode)
