@@ -29,22 +29,37 @@ def soft_ce_diagnostics(
     expert_continuous: torch.Tensor,  # (N,)
     bin_centers: torch.Tensor,   # (num_bins,)
 ) -> dict[str, float]:
-    """Diagnostics for soft-CE failure modes."""
+    """Diagnostics for soft-CE failure modes.
+
+    sign_acc and wrong_sign_mass exclude idle frames (expert_continuous == 0),
+    where torch.sign(0) == 0 would mismatch any nonzero EV/bin and bury real
+    motor-sign learning under the idle-frame floor (~80% of L-click frames).
+    """
     probs = torch.softmax(logits, dim=-1)
     expected_value = (probs * bin_centers.unsqueeze(0)).sum(dim=-1)  # (N,)
-    # Sign accuracy
-    sign_match = (torch.sign(expected_value) == torch.sign(expert_continuous))
-    sign_acc = sign_match.float().mean().item()
-    # Entropy
+    motion_mask = expert_continuous.abs() > 1e-6
+    n_motion = int(motion_mask.sum().item())
+    # Sign accuracy (motion frames only)
+    if n_motion > 0:
+        sign_match = (torch.sign(expected_value[motion_mask])
+                      == torch.sign(expert_continuous[motion_mask]))
+        sign_acc = sign_match.float().mean().item()
+    else:
+        sign_acc = float("nan")
+    # Entropy (all frames — distributional shape statistic)
     log_probs = torch.log_softmax(logits, dim=-1)
     entropy = -(probs * log_probs).sum(dim=-1).mean().item()
-    # Mass on wrong-sign bins
-    expert_sign = torch.sign(expert_continuous)
-    bin_signs = torch.sign(bin_centers).unsqueeze(0).expand_as(probs)
-    wrong_sign_mass = torch.where(
-        bin_signs != expert_sign.unsqueeze(-1), probs, torch.zeros_like(probs),
-    ).sum(dim=-1).mean().item()
-    # Expected-value endpoint error
+    # Mass on wrong-sign bins (motion frames only — idle frames have no "wrong sign")
+    if n_motion > 0:
+        expert_sign = torch.sign(expert_continuous[motion_mask])
+        bin_signs = torch.sign(bin_centers).unsqueeze(0).expand(n_motion, -1)
+        wrong_sign_mass = torch.where(
+            bin_signs != expert_sign.unsqueeze(-1),
+            probs[motion_mask], torch.zeros_like(probs[motion_mask]),
+        ).sum(dim=-1).mean().item()
+    else:
+        wrong_sign_mass = float("nan")
+    # Expected-value endpoint error (all frames — captures both motion + idle accuracy)
     ev_l1 = (expected_value - expert_continuous).abs().mean().item()
     return {
         "sign_acc": sign_acc,
