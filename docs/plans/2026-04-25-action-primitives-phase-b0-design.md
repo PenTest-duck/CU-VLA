@@ -316,12 +316,19 @@ Replaces the previous "all-or-nothing 4-criterion" gate. Failure routes to a typ
 
 | Criterion | Threshold | Failure type if missed |
 |---|---|---|
-| **Phase-A holdout closed-loop** | ≥0.92 | **Phase-A-regression** |
+| **Phase-A holdout closed-loop** | ≥0.80 | **Phase-A-regression** |
 | **Phase-A holdout l_press recall** | ≥0.90 | **Phase-A-regression** |
 | **Multi-btn generic + composite (combined) closed-loop** | ≥0.85 | **Motor or grounding fail** (sub-routed by probes) |
 | **Wrong-instruction degradation** | ≥40 pp from baseline | **Grounding-fail** |
 | **Adversarial subset closed-loop** | ≥0.75 | **Grounding-fail** if probe degradations weak; **Motor-fail** if probe degradations strong |
 | **Scenario-recovery closed-loop** | ≥0.80 | **Recovery-fail** |
+
+> **Gate change (2026-04-27):** Phase-A holdout closed-loop relaxed from
+> ≥0.92 to ≥0.80. Phase A's spike B reached 0.78 on the same 1-button
+> distribution; ≥0.92 was an aspirational stretch that exceeded Phase A's
+> own ceiling. Framed as a soft stretch target, not a principled
+> recalibration. Bundled fixes for B0 attempt 2 are tracked in
+> `docs/plans/2026-04-27-b0-bundled-fixes-implementation.md`.
 
 **Soft warnings (don't block ship, but flag in write-up):**
 - Zero-instruction degradation <30 pp: noise-robust grounding signal weak.

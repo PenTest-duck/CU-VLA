@@ -2728,3 +2728,44 @@ Revisions to the questions above based on Spike A, B, C, E results. Phase B plan
 - **pygame → pygame-ce.** Project dep swapped because pygame 2.6.1 + Python 3.14 has a circular-import bug on `pygame.font`. pygame-ce 2.5.7 is a drop-in replacement.
 - **`--num-workers` DataLoader prefetch + dataset-side SigLIP2 preprocessing.** Training loop hides JPEG decode + naflex processor + history-vector construction in DataLoader workers. Without this, GPU util oscillates 0-30 ↔ 100% on L4 because data prep is synchronous with the forward. Default on L4: `--num-workers 4`.
 - **HF Jobs entry script workflow.** `scripts/hf_job_train_exp6.py` skips `pip install -e .` (UV env has no pip), clones an explicit branch via `CU_VLA_BRANCH` env var, and sets `HF_HUB_DISABLE_PROGRESS_BARS` + `HF_DATASETS_DISABLE_PROGRESS_BARS` to keep HF Jobs logs readable. See `docs/research/hf-jobs-gotchas.md` for the full debugging journey.
+## Amendments (B0 attempt 1 findings, 2026-04-27)
+
+### B0 attempt 1 results vs. gates
+
+W&B run `phase-b0-combined` (yvapeux5) crashed at step 512/1250 (HF Jobs credits exhausted). 8-eval suite results (n=200 each):
+
+| Slice | closed_loop | wrong_dir_first_3 |
+|---|---|---|
+| phase_a_holdout | 0.39 | 0.05 |
+| multi_btn_generic | 0.26 | 0.16 |
+| multi_btn_composite | 0.30 | 0.12 |
+| adversarial | 0.37 | 0.12 |
+| scenario_recovery | 0.28 | 0.13 |
+
+Probes on multi_btn_generic:
+- none: 0.26 / zero: 0.16 / shuffled: 0.12 / wrong: 0.17
+- Wrong-instruction degradation: 9 pp (gate ≥40 pp).
+
+All gates fail. Val/total still falling at crash (0.435 at step 510, slope -0.019/100 steps).
+
+### Diagnoses
+
+1. **Click-press recall val oscillates 0.40-0.97** — focal_gamma=3.0 + 95% idle imbalance starves the press class of gradient. Train loss/click_left is rock-solid stable at ~0.003 from step 200 onward (no dynamical instability); val recall_press swings come from the model's thin logit margin on press, where small batch-composition shifts flip 30-50% of decisions.
+2. **Wrong-instruction degradation only 9 pp** — well below the ≥40 pp gate. Initially attributed to weak text conditioning; subsequent code audit (GPT-5.4 review) found two latent bugs in train.py that meant text was effectively unusable: (a) `encode_text` wrapped in `torch.no_grad()` blocking gradient flow, and (b) text mask was hard-coded `torch.ones(...)` instead of the real attention mask. Even with text LoRA enabled, attempt 1 couldn't have learned to use the instruction.
+3. **sign_acc=0.19** — was a metric artifact, not a sign-learning bug. The denominator included idle frames where `expert_continuous=0` (sign=0) which mismatched almost any nonzero EV. Theoretical ceiling under the broken metric was ~0.20 (the ratio of motion frames). Fixed in metrics.py to mask idle frames.
+
+### B0 attempt 2 fix bundle
+
+Implementation tracked in `docs/plans/2026-04-27-b0-bundled-fixes-implementation.md`. Five fixes after pruning per GPT-5.4 review:
+
+- **F1**: focal_gamma 3.0 → 2.0 + click_class_weight=(1, 5, 5)
+- **F2**: text-tower LoRA rank-4 on top 2 layers + fix the no_grad and fake-mask train.py bugs (these were no-ops in attempt 1; F2 isn't useful without them)
+- **F4**: 1250 → 2000 steps (16 epochs)
+- **A3** (redesigned): aux head predicts target's grid cell (3×3 = 9, from `target_bbox` already in parquet) instead of `target_button_id` (which was just RNG-shuffled creation order). Loss applied only on episode_frame_idx==0 (history naturally zero there) so the trunk can't cheat via cursor trajectory. Uses flattened (16×768) query state, matching action heads.
+- **A4**: head_weights — drop scroll/keys/done from 1.0 to 0.1 (their losses are ~1e-9 in attempt 1)
+
+Dropped after review: A1 (eval-time only; user drives eval), A2 (color jitter risks corrupting grounding; spatial jitter is mechanistically wrong because cursor proprio isn't co-jittered), F3 (16.7% → 15% 1-button is too marginal; would also require data regen).
+
+### Gate update
+
+Phase-A holdout closed-loop gate relaxed from ≥0.92 to ≥0.80. Phase A spike B's ceiling on this distribution was 0.78; ≥0.92 exceeded that. Framed as a soft stretch target.
