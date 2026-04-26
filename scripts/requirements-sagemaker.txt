@@ -10,5 +10,5 @@ datasets>=3.0
 huggingface_hub>=0.30
 peft>=0.10
 pygame-ce>=2.5
-transformers>=4.50
+transformers>=4.50,<5  # <5: avoids _ignore_bidirectional_mask_sdpa CPU regression in 5.x SigLIP2 path
 wandb

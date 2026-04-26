@@ -28,6 +28,7 @@ import argparse
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,6 +143,12 @@ def main() -> int:
                         help="Slice on which the probe variants run")
     parser.add_argument("--skip-upload", action="store_true",
                         help="Run the suite but don't upload to HF Hub (debug mode)")
+    parser.add_argument("--parallel", type=int, default=1,
+                        help="Run N evals concurrently (each as its own subprocess sharing the GPU). "
+                             "Useful when CPU-bound — e.g. set to 8 on ml.g6e.2xlarge (8 vCPUs). "
+                             "Each parallel worker loads its own copy of the model into VRAM "
+                             "(~4GB on a B0 SigLIP2 ckpt), so verify VRAM headroom before raising. "
+                             "Default 1 (sequential).")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -163,44 +170,84 @@ def main() -> int:
         probes=tuple(args.probes),
         probe_slice=args.probe_slice,
     )
-    print(f"[eval-suite] running {len(runs)} evals → upload to "
+    print(f"[eval-suite] running {len(runs)} evals (parallel={args.parallel}) → upload to "
           f"{args.upload_repo}/{upload_prefix}/", flush=True)
 
-    n_failures = 0
-    n_uploaded = 0
-    for i, run in enumerate(runs, 1):
+    def _execute_one(run: EvalRun) -> tuple[EvalRun, int, str, str]:
+        """Run one eval as a subprocess. Returns (run, exit_code, stdout, stderr).
+
+        Stdout/stderr captured (instead of inherited) so parallel workers'
+        output doesn't interleave illegibly. Caller prints each block atomically.
+        """
         json_out = out_dir / run.json_filename
-        print(f"\n[eval-suite] === {i}/{len(runs)} slice={run.slice_name} probe={run.probe} ===",
-              flush=True)
         cmd = _build_eval_cmd(
             run=run,
             checkpoint_path=checkpoint_path,
-            data_dir=data_dir,
+            data_dir=str(data_dir),
             json_out=json_out,
             device=args.device,
             phase=args.phase,
             n_rollouts=args.n_rollouts,
             decode=args.decode,
         )
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            n_failures += 1
-            print(f"[eval-suite] FAILED slice={run.slice_name} probe={run.probe} "
-                  f"(exit {result.returncode}); continuing", file=sys.stderr, flush=True)
-            continue
+        # Each parallel subprocess loads its own copy of the model. With
+        # parallel=8 on a 48GB L40S, ~32GB VRAM is occupied (8 × ~4GB ckpt) —
+        # comfortable headroom. Bumping above 8 needs a VRAM check.
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return run, result.returncode, result.stdout, result.stderr
 
-        # Upload per-slice immediately so a mid-suite crash preserves what
-        # we already paid GPU time to compute.
-        if not args.skip_upload and json_out.exists():
-            print(f"[eval-suite] uploading {run.json_filename} → "
-                  f"{args.upload_repo}/{upload_prefix}/", flush=True)
-            upload_file(
-                path_or_fileobj=str(json_out),
-                path_in_repo=f"{upload_prefix}/{run.json_filename}",
-                repo_id=args.upload_repo,
-                repo_type="model",
-            )
-            n_uploaded += 1
+    def _print_block(run: EvalRun, returncode: int, stdout: str, stderr: str) -> None:
+        """Atomic per-eval output dump — keeps parallel logs readable."""
+        status = "OK" if returncode == 0 else f"FAILED (exit {returncode})"
+        print(f"\n[eval-suite] ===== slice={run.slice_name} probe={run.probe} : {status} =====",
+              flush=True)
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        if stderr:
+            print(f"[eval-suite] stderr from {run.slice_name}/{run.probe}:", file=sys.stderr)
+            print(stderr, end="" if stderr.endswith("\n") else "\n", file=sys.stderr)
+
+    def _maybe_upload(run: EvalRun) -> bool:
+        json_out = out_dir / run.json_filename
+        if args.skip_upload or not json_out.exists():
+            return False
+        print(f"[eval-suite] uploading {run.json_filename} → "
+              f"{args.upload_repo}/{upload_prefix}/", flush=True)
+        upload_file(
+            path_or_fileobj=str(json_out),
+            path_in_repo=f"{upload_prefix}/{run.json_filename}",
+            repo_id=args.upload_repo,
+            repo_type="model",
+        )
+        return True
+
+    n_failures = 0
+    n_uploaded = 0
+
+    if args.parallel <= 1:
+        # Sequential — preserves original behavior, easier to debug.
+        for run in runs:
+            r, code, out, err = _execute_one(run)
+            _print_block(r, code, out, err)
+            if code != 0:
+                n_failures += 1
+                continue
+            if _maybe_upload(r):
+                n_uploaded += 1
+    else:
+        # Parallel — N subprocesses run concurrently sharing the same GPU.
+        # ThreadPoolExecutor (not ProcessPoolExecutor) because the threads
+        # only orchestrate subprocesses; no Python-level CPU contention.
+        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            futures = {pool.submit(_execute_one, r): r for r in runs}
+            for future in as_completed(futures):
+                r, code, out, err = future.result()
+                _print_block(r, code, out, err)
+                if code != 0:
+                    n_failures += 1
+                    continue
+                if _maybe_upload(r):
+                    n_uploaded += 1
 
     print(f"\n[eval-suite] done. {len(runs) - n_failures}/{len(runs)} evals succeeded; "
           f"{n_uploaded} uploaded.", flush=True)
