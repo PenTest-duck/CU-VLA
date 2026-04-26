@@ -290,3 +290,24 @@ def test_decode_b0_click_right_release():
         "click_right": torch.tensor([[0.0, 0.0, 5.0]]),
     }
     assert _decode_b0_click(logits) == 4
+
+
+def test_is_b0_model_detects_b0_heads():
+    """Regression test: _is_b0_model must check 'head_click_left' / 'head_click_right'
+    (the actual ModuleDict keys per heads.py prefix convention) — not the bare names.
+
+    First B0 visual eval crashed with KeyError: 'click' because the detector
+    returned False on a real B0 model and fell through to the Phase A path.
+    """
+    from experiments.action_primitives.evaluate import _is_b0_model
+    from experiments.action_primitives.heads import ActionHeads
+    # Build the real ActionHeads — it uses the head_<name> prefix
+    heads_module = ActionHeads()
+    # Mock model with .heads attribute pointing to ActionHeads
+    class MockModel:
+        def __init__(self, heads):
+            self.heads = heads
+    model = MockModel(heads_module)
+    assert _is_b0_model(model) is True, (
+        f"Expected B0 detection, got False. heads_module.heads keys: {list(heads_module.heads.keys())}"
+    )

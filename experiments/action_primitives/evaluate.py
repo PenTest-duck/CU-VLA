@@ -293,8 +293,13 @@ def _decode_b0_click(head_logits: dict[str, torch.Tensor]) -> int:
 
 
 def _is_b0_model(model: ActionPrimitivesACT) -> bool:
-    """Detect whether the model has the B0 dual-click heads."""
-    return "click_left" in model.heads.heads and "click_right" in model.heads.heads
+    """Detect whether the model has the B0 dual-click heads.
+
+    Note: heads.py prefixes ModuleDict keys with 'head_' to avoid colliding with
+    nn.ModuleDict's built-in .keys() method (one head is literally named "keys").
+    So we check for "head_click_left" / "head_click_right", not the bare names.
+    """
+    return "head_click_left" in model.heads.heads and "head_click_right" in model.heads.heads
 
 
 def load_episode_metadata(data_dir: Path, split: str = "test") -> pd.DataFrame:
