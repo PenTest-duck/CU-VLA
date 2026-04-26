@@ -19,3 +19,7 @@ experiments/*/results/
 .firecrawl
 .pytest_cache
 .DS_Store
+
+# Local secrets / per-project config (see .env.example for schema)
+.env
+.env.local

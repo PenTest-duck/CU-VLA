@@ -31,6 +31,27 @@ if str(_PROJECT_ROOT) not in sys.path:
 from scripts.sagemaker_trainer import make_trainer  # noqa: E402
 
 
+def _load_dotenv_if_present() -> None:
+    """Load CU_VLA_SM_* config from <repo-root>/.env if present.
+
+    Project-scoped config vs polluting ~/.zshrc. Called from main() (not at
+    import time) so unit tests don't inherit the user's local .env values.
+    Existing env vars take precedence over .env (so explicit shell exports
+    or CI overrides win).
+    """
+    env_path = _PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        # python-dotenv is in deps but if a fresh checkout hasn't run `uv sync`,
+        # silently skip rather than crash. The launcher's _resolve_*() helpers
+        # will give a clear ERROR if the vars truly aren't set.
+        return
+    load_dotenv(env_path, override=False)
+
+
 DEFAULT_REPO_URL = "https://github.com/PenTest-duck/CU-VLA.git"
 DEFAULT_INSTANCE = "ml.g6e.xlarge"
 DEFAULT_REGION = "us-west-2"
@@ -130,6 +151,7 @@ def _resolve_s3_bucket(args: argparse.Namespace) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv_if_present()
     args = parse_args(argv)
     validate_remote_branch(args.repo_url, args.branch)
 

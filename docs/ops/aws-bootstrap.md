@@ -206,26 +206,34 @@ If the log group doesn't exist yet, this fails harmlessly. Re-run after the firs
 
 ## 7. Local config
 
-Either env vars (preferred for shell-script convenience) or a TOML file. Pick one.
+**Recommended: project-scoped `.env` file** (gitignored). The launcher
+auto-loads it via `python-dotenv` at startup. Keeps CU-VLA config out of
+your global shell — useful when you have other AWS work using a different
+default region or different credentials.
 
-Env vars in `~/.zshrc` or `~/.bashrc`:
+```bash
+cp .env.example .env
+# Edit .env with your values:
+#   CU_VLA_SM_ROLE_ARN=arn:aws:iam::<acct>:role/SageMakerExecutionRole-CU-VLA
+#   CU_VLA_SM_BUCKET=cu-vla-sm-<acct>
+```
+
+The launcher (`scripts/launch_sm_job.py`) loads `<repo-root>/.env` at
+startup, but **shell env vars take precedence** (so CI overrides still
+win). `.env` is in `.gitignore` already; never commit it.
+
+**`AWS_REGION` is intentionally not in `.env`** — the launchers default to
+`us-west-2` internally. If you need to run ad-hoc `aws ...` commands for
+CU-VLA stuff, pass `--region us-west-2` explicitly (matches the rest of
+this doc).
+
+**Alternative: shell env vars** in `~/.zshrc` or `~/.bashrc` (older pattern,
+pollutes other AWS work):
 
 ```bash
 export CU_VLA_SM_ROLE_ARN="arn:aws:iam::<acct>:role/SageMakerExecutionRole-CU-VLA"
 export CU_VLA_SM_BUCKET="cu-vla-sm-<acct>"
-export AWS_REGION="us-west-2"
 ```
-
-Or `~/.cu-vla/sagemaker.toml`:
-
-```toml
-[sagemaker]
-role_arn = "arn:aws:iam::<acct>:role/SageMakerExecutionRole-CU-VLA"
-s3_bucket = "cu-vla-sm-<acct>"
-region = "us-west-2"
-```
-
-(The launchers in `scripts/launch_sm_job*.py` currently read env vars, not TOML — the TOML file is provided as a more-explicit alternative if you prefer. If you go TOML, edit the `_resolve_role_arn` / `_resolve_s3_bucket` helpers.)
 
 Verify the bootstrap works:
 
