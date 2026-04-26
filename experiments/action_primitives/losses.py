@@ -281,6 +281,31 @@ def _keys_focal_loss_masked(
     return masked.sum() / n_active
 
 
+def aux_target_loss(
+    logits: torch.Tensor,           # (B, n_cells)
+    target_cells: torch.Tensor,     # (B,) int — target's grid cell index
+    episode_frame_idx: torch.Tensor, # (B,) int — frame index within episode
+    first_n: int = 1,
+) -> torch.Tensor:
+    """Auxiliary target-grid-cell CE (B0 attempt 2 — A3 redesigned).
+
+    Loss applied only on frames where ``episode_frame_idx < first_n``. Default
+    first_n=1 means ONLY the first frame of each episode contributes — at
+    that frame the action_history vector is naturally all-zero (per
+    PhaseB0EpisodeDataset.__getitem__: when j < 0, prev.append(zero_action)),
+    so there's no cursor-trajectory information leaking into the trunk's
+    features. This forces the trunk to derive grid-cell prediction from the
+    instruction + screenshot + proprio alone.
+
+    Returns mean CE over in-scope samples; zero if no samples in scope.
+    """
+    in_scope = (episode_frame_idx < first_n).float()
+    if float(in_scope.sum()) < 1.0:
+        return torch.zeros((), device=logits.device, dtype=logits.dtype)
+    ce = F.cross_entropy(logits, target_cells, reduction="none")  # (B,)
+    return (ce * in_scope).sum() / in_scope.sum().clamp(min=1.0)
+
+
 def total_loss_b0(
     head_logits: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -288,6 +313,10 @@ def total_loss_b0(
     loss_mask: torch.Tensor,            # (B,) float — 0 means skip, 1 means train
     bin_centers_mouse: torch.Tensor | None = None,
     bin_centers_scroll: torch.Tensor | None = None,
+    aux_target_logits: torch.Tensor | None = None,
+    aux_target_cells: torch.Tensor | None = None,
+    aux_target_frame_idx: torch.Tensor | None = None,
+    aux_target_first_n: int = 1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """B0 total loss: soft-CE on dx/dy/scroll, focal CE on click_left/click_right/keys, focal BCE on done."""
     if bin_centers_mouse is None:
@@ -304,5 +333,11 @@ def total_loss_b0(
         "keys":        _keys_focal_loss_masked(head_logits["keys"], targets["keys"], loss_mask, LOSS.focal_gamma, LOSS.idle_smoothing_keys),
         "done":        _done_loss_masked(head_logits["done"], targets["done"], loss_mask),
     }
+    # B0 attempt 2: aux target-grid-cell head (A3 redesigned)
+    if aux_target_logits is not None and aux_target_cells is not None and aux_target_frame_idx is not None:
+        per_head["aux_target"] = aux_target_loss(
+            aux_target_logits, aux_target_cells, aux_target_frame_idx,
+            first_n=aux_target_first_n,
+        )
     total = sum(head_weights.get(n, 0.0) * per_head[n] for n in per_head)
     return total, per_head

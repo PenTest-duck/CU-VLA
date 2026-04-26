@@ -50,11 +50,24 @@ def test_lora_adapters_are_trainable():
     assert len(lora_params) > 0, "no trainable LoRA params found"
 
 
-def test_text_tower_still_frozen_after_lora():
+def test_text_tower_lora_state():
+    """B0 attempt 2: with MODEL.text_lora_rank > 0, text tower has LoRA-only
+    trainable params (just the lora_A / lora_B matrices on top text_lora_target_layers
+    encoder layers — base text params remain frozen). Pre-attempt-2 behavior
+    (text fully frozen) is exercised by the unit test in test_backbones.py:
+    test_apply_lora_text_rank_zero_keeps_text_frozen.
+    """
     from experiments.action_primitives.model import ActionPrimitivesACT
+    from experiments.action_primitives.config import MODEL
 
     model = ActionPrimitivesACT()
     text_trainable = [
         n for n, p in model.backbone.model.text_model.named_parameters() if p.requires_grad
     ]
-    assert len(text_trainable) == 0, f"text tower has trainable params: {text_trainable}"
+    if getattr(MODEL, "text_lora_rank", 0) > 0:
+        # All trainable params should be LoRA adapters (not base weights)
+        assert len(text_trainable) > 0, "text LoRA enabled but no trainable params found"
+        for n in text_trainable:
+            assert "lora_" in n, f"non-LoRA text param is trainable: {n}"
+    else:
+        assert len(text_trainable) == 0, f"text tower has trainable params: {text_trainable}"

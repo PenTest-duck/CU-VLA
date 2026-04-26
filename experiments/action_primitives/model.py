@@ -1,18 +1,19 @@
-"""Full ACT model for Experiment 6 Phase A.
+"""Full ACT model for Experiment 6 Phase A and B0.
 
 Wires SigLIP2 naflex vision+text, proprio encoder, action-history encoder,
-trunk, and output heads per the Q15 wiring spec.
+trunk, output heads, and (B0) the auxiliary target-grid-cell head.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 from experiments.action_primitives.backbones import SigLIP2Naflex
 from experiments.action_primitives.config import MODEL
-from experiments.action_primitives.heads import ActionHeads
+from experiments.action_primitives.heads import ActionHeads, AuxTargetHead
 from experiments.action_primitives.history import HISTORY_INPUT_DIM, HistoryEncoder
 from experiments.action_primitives.proprio import ProprioEncoder
 from experiments.action_primitives.trunk import Trunk
@@ -21,6 +22,7 @@ from experiments.action_primitives.trunk import Trunk
 @dataclass
 class ACTOutput:
     head_logits: dict[str, torch.Tensor]  # {head_name: (B, n_logits)}
+    aux_target_logits: Optional[torch.Tensor] = None  # (B, n_cells) or None
 
 
 class ActionPrimitivesACT(nn.Module):
@@ -36,6 +38,17 @@ class ActionPrimitivesACT(nn.Module):
         self.history_enc = HistoryEncoder()
         self.trunk = Trunk()
         self.heads = ActionHeads()
+        # Auxiliary target-grid-cell head (B0 attempt 2 — A3 redesigned).
+        # Gated by config flag. When disabled, ACTOutput.aux_target_logits=None.
+        if getattr(MODEL, "aux_target_enabled", False):
+            self.aux_target_head = AuxTargetHead(
+                n_queries=MODEL.n_queries,
+                d_model=MODEL.d_model,
+                n_cells=MODEL.aux_target_n_cells,
+                hidden_dim=MODEL.aux_target_hidden_dim,
+            )
+        else:
+            self.aux_target_head = None
 
     def forward(
         self,
@@ -72,7 +85,11 @@ class ActionPrimitivesACT(nn.Module):
         query_out = self.trunk(kv, kv_key_padding_mask=kv_mask)
         # 7. Heads
         head_logits = self.heads(query_out)
-        return ACTOutput(head_logits=head_logits)
+        # 8. Aux target head (B0 attempt 2; None when disabled)
+        aux_target_logits = (
+            self.aux_target_head(query_out) if self.aux_target_head is not None else None
+        )
+        return ACTOutput(head_logits=head_logits, aux_target_logits=aux_target_logits)
 
     def trainable_parameters_summary(self) -> str:
         total = sum(p.numel() for p in self.parameters())

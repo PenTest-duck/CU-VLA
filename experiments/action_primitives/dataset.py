@@ -336,6 +336,26 @@ class PhaseB0EpisodeDataset(PhaseAEpisodeDataset):
         loss_mask = [float(f["loss_mask"]) for f in frames]
         instruction = str(frames[0]["instruction"])
 
+        # ---- Auxiliary target-grid-cell label (B0 attempt 2 — A3) -------
+        # Compute grid cell from target_bbox center. The bbox can drift slightly
+        # within an episode (re-rendered each frame), but per-cell category is
+        # stable. We pick frame-0's bbox for the per-episode label.
+        from experiments.action_primitives.config import ENV
+        from experiments.action_primitives.config import B0_POSITION_GRID
+        bbox_x = float(frames[0]["target_bbox_x"])
+        bbox_y = float(frames[0]["target_bbox_y"])
+        bbox_w = float(frames[0]["target_bbox_w"])
+        bbox_h = float(frames[0]["target_bbox_h"])
+        cx = bbox_x + bbox_w / 2.0
+        cy = bbox_y + bbox_h / 2.0
+        n_cols, n_rows = B0_POSITION_GRID
+        col = min(int(cx / ENV.canvas_w * n_cols), n_cols - 1)
+        row = min(int(cy / ENV.canvas_h * n_rows), n_rows - 1)
+        target_cell = row * n_cols + col  # row-major index
+
+        # ---- Episode-frame index (for aux loss masking + diagnostics) ---
+        episode_frame_idx = [int(f["frame_idx"]) for f in frames]
+
         # ---- Episode metadata (constant across frames; pull from row 0) -
         meta = {
             "episode_id": int(frames[0]["episode_id"]),
@@ -348,6 +368,7 @@ class PhaseB0EpisodeDataset(PhaseAEpisodeDataset):
             "scenario_type": str(frames[0]["scenario_type"]),
             "k_wrong_frames": int(frames[0]["k_wrong_frames"]),
             "target_button_id": int(frames[0]["target_button_id"]),
+            "target_cell": int(target_cell),
         }
 
         out: dict = {
@@ -355,6 +376,12 @@ class PhaseB0EpisodeDataset(PhaseAEpisodeDataset):
             "action_history": torch.from_numpy(np.stack(history_per_frame)).float(), # (T, K, 223)
             "loss_mask": torch.tensor(loss_mask, dtype=torch.float32),               # (T,)
             "instruction": instruction,
+            # B0 attempt 2: per-frame fields for aux target head.
+            # target_cell is constant per episode but broadcast to (T,) for
+            # micro-batch concat; episode_frame_idx is the per-frame position
+            # within the episode (used for aux-loss masking to first_n frames).
+            "target_cell": torch.tensor([target_cell] * len(frames), dtype=torch.long),  # (T,)
+            "episode_frame_idx": torch.tensor(episode_frame_idx, dtype=torch.long),       # (T,)
             "action_label": {
                 "dx_bins": torch.tensor(label_dx_bins, dtype=torch.long),            # (T,)
                 "dy_bins": torch.tensor(label_dy_bins, dtype=torch.long),            # (T,)

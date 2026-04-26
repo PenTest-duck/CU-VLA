@@ -107,7 +107,7 @@ class ModelConfig:
     # (history is naturally zero there) — prevents the trunk from learning to
     # read cursor-trajectory history instead of the instruction.
     aux_target_enabled: bool = True
-    aux_target_n_cells: int = 6      # B0_POSITION_GRID = (3,2) → 6 cells
+    aux_target_n_cells: int = 9      # B0_POSITION_GRID = (3,3) → 9 cells
     aux_target_hidden_dim: int = 256
 
 

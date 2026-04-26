@@ -193,6 +193,8 @@ def _assemble_micro_batch_b0(
     flat_proprio: list = []
     flat_history: list = []
     flat_loss_mask: list = []
+    flat_target_cell: list = []
+    flat_episode_frame_idx: list = []
     target_keys = (
         "dx", "dy", "dx_continuous", "dy_continuous",
         "click_left", "click_right",
@@ -217,6 +219,9 @@ def _assemble_micro_batch_b0(
         flat_proprio.append(ep["proprio"].float())
         flat_history.append(ep["action_history"].float())
         flat_loss_mask.append(ep["loss_mask"].float())
+        # B0 attempt 2: aux target-grid-cell + episode_frame_idx (for A3)
+        flat_target_cell.append(ep["target_cell"].long())
+        flat_episode_frame_idx.append(ep["episode_frame_idx"].long())
         label = ep["action_label"]
         flat_targets["dx"].append(label["dx_bins"])
         flat_targets["dy"].append(label["dy_bins"])
@@ -246,6 +251,10 @@ def _assemble_micro_batch_b0(
         for k in flat_targets
     }
     targets["done"] = targets["done"].float()
+    # B0 attempt 2: aux target labels routed through `targets` so the existing
+    # train_one_step / run_validation signatures don't need new parameters.
+    targets["target_cell"] = torch.cat(flat_target_cell, dim=0).to(device, non_blocking=True)
+    targets["episode_frame_idx"] = torch.cat(flat_episode_frame_idx, dim=0).to(device, non_blocking=True)
     return vision_preprocessed, text_rep, text_mask_rep, proprio, history, targets, loss_mask
 
 
@@ -304,7 +313,13 @@ def train_one_step(
             if phase == "b0":
                 vp, tr, tm, pr, hs, tgts, lm = _assemble_micro_batch_b0(model, micro_eps, device)
                 out = model(vp, tr, tm, pr, hs)
-                loss, per_head = total_loss_b0(out.head_logits, tgts, head_weights, lm)
+                loss, per_head = total_loss_b0(
+                    out.head_logits, tgts, head_weights, lm,
+                    aux_target_logits=out.aux_target_logits,
+                    aux_target_cells=tgts.get("target_cell"),
+                    aux_target_frame_idx=tgts.get("episode_frame_idx"),
+                    aux_target_first_n=1,
+                )
             else:
                 vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
                 out = model(vp, tr, tm, pr, hs)
@@ -312,12 +327,19 @@ def train_one_step(
 
         (loss / macro_batch_episodes * micro_batch_episodes).backward()
         for k, v in per_head.items():
-            step_per_head_loss[k] += float(v.detach()) / n_micros
+            # aux_target may not be in step_per_head_loss (initialized from
+            # _PHASE_B0_HEAD_NAMES which excludes it); accumulate into the dict
+            # if present in per_head.
+            step_per_head_loss[k] = step_per_head_loss.get(k, 0.0) + float(v.detach()) / n_micros
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), TRAIN.grad_clip_norm)
     opt.step()
 
-    step_per_head_loss["total"] = sum(step_per_head_loss[k] for k in head_names)
+    # Aggregate total over all per-head losses recorded this step (includes
+    # aux_target when present). Excludes "total" and "grad_norm" themselves.
+    step_per_head_loss["total"] = sum(
+        v for k, v in step_per_head_loss.items() if k not in ("total", "grad_norm")
+    )
     step_per_head_loss["grad_norm"] = float(grad_norm)
     return step_per_head_loss
 
@@ -358,6 +380,9 @@ def run_validation(
         "click_right_preds": [], "click_right_targets": [],
         "dx_logits": [], "dx_continuous": [],
         "dy_logits": [], "dy_continuous": [],
+        # B0 attempt 2: aux target diagnostics
+        "aux_target_preds": [], "aux_target_targets": [],
+        "aux_target_frame_idx": [], "aux_target_n_buttons": [],
     }
     with torch.no_grad():
         while idx < n:
@@ -370,13 +395,19 @@ def run_validation(
                         model, micro_eps, device,
                     )
                     out = model(vp, tr, tm, pr, hs)
-                    loss, per_head = total_loss_b0(out.head_logits, tgts, head_weights, lm)
+                    loss, per_head = total_loss_b0(
+                        out.head_logits, tgts, head_weights, lm,
+                        aux_target_logits=out.aux_target_logits,
+                        aux_target_cells=tgts.get("target_cell"),
+                        aux_target_frame_idx=tgts.get("episode_frame_idx"),
+                        aux_target_first_n=1,
+                    )
                 else:
                     vp, tr, tm, pr, hs, tgts = _assemble_micro_batch(model, micro_eps, device)
                     out = model(vp, tr, tm, pr, hs)
                     loss, per_head = total_loss(out.head_logits, tgts, head_weights)
             for k, v in per_head.items():
-                total_losses[k] += float(v.detach()) * batch_size
+                total_losses[k] = total_losses.get(k, 0.0) + float(v.detach()) * batch_size
             total_sum += float(loss.detach()) * batch_size
 
             if phase == "b0":
@@ -392,6 +423,11 @@ def run_validation(
                 b0_buffers["dx_continuous"].append(tgts["dx_continuous"].detach().float().cpu())
                 b0_buffers["dy_logits"].append(hl["dy"].detach().float().cpu())
                 b0_buffers["dy_continuous"].append(tgts["dy_continuous"].detach().float().cpu())
+                # B0 attempt 2: aux head val diagnostics
+                if out.aux_target_logits is not None and "target_cell" in tgts:
+                    b0_buffers["aux_target_preds"].append(out.aux_target_logits.argmax(dim=-1).detach().cpu())
+                    b0_buffers["aux_target_targets"].append(tgts["target_cell"].detach().cpu())
+                    b0_buffers["aux_target_frame_idx"].append(tgts["episode_frame_idx"].detach().cpu())
     if was_training:
         model.train(True)
     result = {k: v / max(1, n) for k, v in total_losses.items()}
@@ -435,6 +471,20 @@ def run_validation(
             "diag/dx/bin_10_freq":       bin10_dx,
             "diag/dy/bin_10_freq":       bin10_dy,
         })
+        # B0 attempt 2: aux target-grid-cell head diagnostics.
+        # acc_first_n is the gate-relevant signal (matches the loss scope —
+        # only frame 0 contributes to training loss). acc_all is for sanity
+        # comparison; later frames have history bias and shouldn't be relied on.
+        if b0_buffers["aux_target_preds"]:
+            ap = torch.cat(b0_buffers["aux_target_preds"]).flatten()
+            at = torch.cat(b0_buffers["aux_target_targets"]).flatten()
+            afi = torch.cat(b0_buffers["aux_target_frame_idx"]).flatten()
+            result["diag/aux_target/acc_all"] = float((ap == at).float().mean())
+            mask_first = afi < 1   # first_n=1 — only frame 0 in scope
+            if int(mask_first.sum()) > 0:
+                result["diag/aux_target/acc_first_n"] = float(
+                    (ap[mask_first] == at[mask_first]).float().mean()
+                )
         # TODO(B0): instruction-zeroing probe — see Task 23.
     return result
 

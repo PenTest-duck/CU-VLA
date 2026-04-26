@@ -317,3 +317,97 @@ def test_total_loss_b0_zero_weight_zeros_head_contribution():
     total_full, _ = total_loss_b0(head_logits, targets, weights_full, loss_mask)
     total_partial, _ = total_loss_b0(head_logits, targets, weights_no_aux, loss_mask)
     assert float(total_full) > float(total_partial) + 1e-4
+
+
+def test_aux_target_loss_first_n_mask_excludes_later_frames():
+    """Frames with episode_frame_idx >= first_n must contribute zero loss."""
+    import torch
+    from experiments.action_primitives.losses import aux_target_loss
+
+    B = 6
+    n_cells = 9
+    logits = torch.randn(B, n_cells, requires_grad=True)
+    target_cells = torch.tensor([0, 1, 2, 3, 4, 5])
+    # All frames have idx >= 1 — out of scope when first_n=1
+    frame_idx = torch.tensor([1, 2, 3, 4, 5, 6])
+    loss = aux_target_loss(logits, target_cells, frame_idx, first_n=1)
+    assert float(loss) == 0.0
+
+
+def test_aux_target_loss_first_n_mask_includes_frame_zero():
+    """Loss > 0 when at least one frame has idx < first_n."""
+    import torch
+    from experiments.action_primitives.losses import aux_target_loss
+
+    B = 6
+    n_cells = 9
+    # Random logits give nonzero CE on average
+    torch.manual_seed(0)
+    logits = torch.randn(B, n_cells)
+    target_cells = torch.tensor([0, 1, 2, 3, 4, 5])
+    # Half in-scope, half out
+    frame_idx = torch.tensor([0, 0, 0, 5, 5, 5])
+    loss = aux_target_loss(logits, target_cells, frame_idx, first_n=1)
+    assert float(loss) > 0.0
+
+
+def test_aux_target_loss_gradient_flows_only_to_in_scope_samples():
+    """Backprop through aux_target_loss should produce gradient only on the
+    rows of `logits` that are in scope."""
+    import torch
+    from experiments.action_primitives.losses import aux_target_loss
+
+    B = 6
+    n_cells = 9
+    torch.manual_seed(0)
+    logits = torch.randn(B, n_cells, requires_grad=True)
+    target_cells = torch.tensor([0, 1, 2, 3, 4, 5])
+    frame_idx = torch.tensor([0, 0, 0, 5, 5, 5])
+    loss = aux_target_loss(logits, target_cells, frame_idx, first_n=1)
+    loss.backward()
+    # Frames 0-2 (in scope) must have nonzero gradient; 3-5 must have zero.
+    assert (logits.grad[:3].abs().sum() > 0).item()
+    assert (logits.grad[3:].abs().sum() == 0).item()
+
+
+def test_total_loss_b0_with_aux_target_includes_aux_in_per_head():
+    """When aux_target_logits is provided, total_loss_b0 returns 'aux_target'
+    in per_head."""
+    import torch
+    from experiments.action_primitives.losses import total_loss_b0
+
+    B = 4
+    head_logits = {
+        "dx": torch.randn(B, 21), "dy": torch.randn(B, 21),
+        "click_left": torch.randn(B, 3), "click_right": torch.randn(B, 3),
+        "scroll": torch.randn(B, 21),
+        "keys": torch.randn(B, 77, 3),
+        "done": torch.randn(B, 1),
+    }
+    targets = {
+        "dx_continuous": torch.randn(B),
+        "dy_continuous": torch.randn(B),
+        "scroll_continuous": torch.randn(B),
+        "click_left": torch.randint(0, 3, (B,)),
+        "click_right": torch.randint(0, 3, (B,)),
+        "keys": torch.randint(0, 3, (B, 77)),
+        "done": torch.randint(0, 2, (B,)).float(),
+    }
+    loss_mask = torch.ones(B)
+    head_weights = {n: 1.0 for n in head_logits}
+    head_weights["aux_target"] = 0.2
+
+    aux_logits = torch.randn(B, 9)
+    aux_cells = torch.randint(0, 9, (B,))
+    aux_frame_idx = torch.zeros(B, dtype=torch.long)  # all in scope
+
+    total, per_head = total_loss_b0(
+        head_logits, targets, head_weights, loss_mask,
+        aux_target_logits=aux_logits,
+        aux_target_cells=aux_cells,
+        aux_target_frame_idx=aux_frame_idx,
+        aux_target_first_n=1,
+    )
+    assert "aux_target" in per_head
+    assert torch.isfinite(per_head["aux_target"])
+    assert torch.isfinite(total)

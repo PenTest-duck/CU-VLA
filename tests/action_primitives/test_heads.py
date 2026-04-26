@@ -31,3 +31,24 @@ def test_head_logits_total_matches_new_arch():
     expected = 21 + 21 + 3 + 3 + 21 + 231 + 1
     actual = sum(HEAD_LOGITS.values())
     assert actual == expected
+
+
+def test_aux_target_head_output_shape():
+    """AuxTargetHead: flattened (B, K, d) → (B, n_cells) logits."""
+    import torch
+    from experiments.action_primitives.heads import AuxTargetHead
+
+    head = AuxTargetHead(n_queries=16, d_model=768, n_cells=9, hidden_dim=256)
+    queries = torch.randn(4, 16, 768)
+    logits = head(queries)
+    assert logits.shape == (4, 9)
+
+
+def test_aux_target_head_param_count_modest():
+    """Aux head should be small (order of 3-4M for 16×768→256→9)."""
+    from experiments.action_primitives.heads import AuxTargetHead
+
+    head = AuxTargetHead(n_queries=16, d_model=768, n_cells=9, hidden_dim=256)
+    n = sum(p.numel() for p in head.parameters())
+    # ~12288*256 + 256*9 = ~3.15M
+    assert 1_000_000 < n < 10_000_000, f"AuxTargetHead has {n} params; expected 1M-10M"
