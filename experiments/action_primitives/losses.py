@@ -180,8 +180,14 @@ def _focal_ce_masked(
     loss_mask: torch.Tensor,
     gamma: float,
     label_smoothing: float = 0.0,
+    class_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-sample focal CE multiplied by loss_mask; mean over masked samples."""
+    """Per-sample focal CE multiplied by loss_mask; mean over masked samples.
+
+    If ``class_weight`` is provided, it must be a (C,) tensor; per-sample CE
+    is multiplied by ``class_weight[target]``. Used in B0 attempt 2 to
+    upweight click press/release (rare classes) over idle (~95% of frames).
+    """
     logp = F.log_softmax(logits, dim=-1)
     if label_smoothing > 0.0:
         C = logits.size(-1)
@@ -193,6 +199,8 @@ def _focal_ce_masked(
     p_true = logp.gather(-1, target.unsqueeze(-1)).squeeze(-1).exp()
     focal_weight = (1.0 - p_true) ** gamma
     per_sample = focal_weight * ce  # (B,)
+    if class_weight is not None:
+        per_sample = per_sample * class_weight.to(per_sample.device)[target]
     masked = per_sample * loss_mask
     n_active = loss_mask.sum().clamp(min=1)
     return masked.sum() / n_active
@@ -286,14 +294,15 @@ def total_loss_b0(
         bin_centers_mouse = torch.tensor(MOUSE_BIN_CENTERS, device=head_logits["dx"].device)
     if bin_centers_scroll is None:
         bin_centers_scroll = torch.tensor(SCROLL_BIN_CENTERS, device=head_logits["scroll"].device)
+    click_w = torch.tensor(LOSS.click_class_weight, device=head_logits["click_left"].device)
     per_head = {
         "dx":          _soft_label_ce_masked(head_logits["dx"], targets["dx_continuous"], bin_centers_mouse, loss_mask),
         "dy":          _soft_label_ce_masked(head_logits["dy"], targets["dy_continuous"], bin_centers_mouse, loss_mask),
-        "click_left":  _focal_ce_masked(head_logits["click_left"], targets["click_left"], loss_mask, LOSS.focal_gamma),
-        "click_right": _focal_ce_masked(head_logits["click_right"], targets["click_right"], loss_mask, LOSS.focal_gamma),
+        "click_left":  _focal_ce_masked(head_logits["click_left"], targets["click_left"], loss_mask, LOSS.focal_gamma, class_weight=click_w),
+        "click_right": _focal_ce_masked(head_logits["click_right"], targets["click_right"], loss_mask, LOSS.focal_gamma, class_weight=click_w),
         "scroll":      _soft_label_ce_masked(head_logits["scroll"], targets["scroll_continuous"], bin_centers_scroll, loss_mask),
         "keys":        _keys_focal_loss_masked(head_logits["keys"], targets["keys"], loss_mask, LOSS.focal_gamma, LOSS.idle_smoothing_keys),
         "done":        _done_loss_masked(head_logits["done"], targets["done"], loss_mask),
     }
-    total = sum(head_weights[n] * per_head[n] for n in per_head)
+    total = sum(head_weights.get(n, 0.0) * per_head[n] for n in per_head)
     return total, per_head

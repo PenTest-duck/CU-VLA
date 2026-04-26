@@ -244,3 +244,76 @@ def test_total_loss_b0_works_with_bf16_logits():
     head_weights = {n: 1.0 for n in head_logits}
     total, per_head = total_loss_b0(head_logits, targets, head_weights, loss_mask)
     assert torch.isfinite(total)
+
+
+def test_focal_ce_class_weight_upweights_press():
+    """class_weight=[1,5,5] makes a press misclassification produce ~5x the
+    loss of an idle misclassification of equal logit margin."""
+    import torch
+    from experiments.action_primitives.losses import _focal_ce_masked
+
+    # Sample 0: target=idle, predicted strongly toward press (wrong)
+    # Sample 1: target=press, predicted strongly toward idle (wrong)
+    # Same logit margin in both — only difference is target class.
+    logits = torch.tensor([
+        [0.1, 5.0, 0.1],
+        [5.0, 0.1, 0.1],
+    ])
+    targets = torch.tensor([0, 1])
+    loss_mask = torch.ones(2)
+
+    unweighted = _focal_ce_masked(logits, targets, loss_mask, gamma=2.0)
+    weighted = _focal_ce_masked(
+        logits, targets, loss_mask, gamma=2.0,
+        class_weight=torch.tensor([1.0, 5.0, 5.0]),
+    )
+    # With class_weight=[1,5,5], the press-target sample contributes 5x weight
+    # while idle-target stays at 1x. So weighted > unweighted by a factor close
+    # to (1 + 5) / (1 + 1) = 3x (roughly; focal weighting moderates this).
+    assert float(weighted) > float(unweighted) * 1.5
+
+
+def test_focal_ce_class_weight_none_matches_no_weight():
+    """class_weight=None must reproduce the no-weight path exactly."""
+    import torch
+    from experiments.action_primitives.losses import _focal_ce_masked
+
+    logits = torch.randn(8, 3)
+    targets = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1])
+    loss_mask = torch.ones(8)
+    a = _focal_ce_masked(logits, targets, loss_mask, gamma=2.0)
+    b = _focal_ce_masked(logits, targets, loss_mask, gamma=2.0, class_weight=None)
+    assert torch.allclose(a, b)
+
+
+def test_total_loss_b0_zero_weight_zeros_head_contribution():
+    """A head with weight=0 must not contribute to the total loss."""
+    import torch
+    from experiments.action_primitives.losses import total_loss_b0
+
+    B = 4
+    head_logits = {
+        "dx": torch.randn(B, 21), "dy": torch.randn(B, 21),
+        "click_left": torch.randn(B, 3), "click_right": torch.randn(B, 3),
+        "scroll": torch.randn(B, 21),
+        "keys": torch.randn(B, 77, 3),
+        "done": torch.randn(B, 1),
+    }
+    targets = {
+        "dx_continuous": torch.randn(B),
+        "dy_continuous": torch.randn(B),
+        "scroll_continuous": torch.randn(B),
+        "click_left": torch.randint(0, 3, (B,)),
+        "click_right": torch.randint(0, 3, (B,)),
+        "keys": torch.randint(0, 3, (B, 77)),
+        "done": torch.randint(0, 2, (B,)).float(),
+    }
+    loss_mask = torch.ones(B)
+
+    weights_full = {n: 1.0 for n in head_logits}
+    weights_no_aux = {n: 1.0 for n in head_logits if n not in ("scroll", "keys", "done")}
+    weights_no_aux.update({"scroll": 0.0, "keys": 0.0, "done": 0.0})
+
+    total_full, _ = total_loss_b0(head_logits, targets, weights_full, loss_mask)
+    total_partial, _ = total_loss_b0(head_logits, targets, weights_no_aux, loss_mask)
+    assert float(total_full) > float(total_partial) + 1e-4

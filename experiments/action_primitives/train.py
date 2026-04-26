@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from experiments.action_primitives.config import MODEL, MOUSE_BIN_CENTERS, TRAIN
+from experiments.action_primitives.config import LOSS, MODEL, MOUSE_BIN_CENTERS, TRAIN
 from experiments.action_primitives.dataset import (
     PhaseAEpisodeDataset,
     PhaseB0EpisodeDataset,
@@ -525,14 +525,13 @@ def main() -> None:
     print(f"steps/epoch: {steps_per_epoch}  total: {max_steps}  "
           f"macro={args.macro_batch_episodes}  micro={args.micro_batch_episodes}")
 
-    # Uniform per-head weights. Phase A uses the legacy 5-way "click" head;
+    # Per-head weights. Phase A uses the legacy 5-way "click" head;
     # Phase B0 splits it into "click_left" / "click_right" 3-way heads.
+    # B0 attempt 2: read from LOSS.head_weights so scroll/keys/done can be
+    # downweighted (their losses are empirically ~1e-9 in attempt 1) and the
+    # aux_target weight is wired in for A3.
     if args.phase == "b0":
-        head_weights = {
-            "dx": 1.0, "dy": 1.0,
-            "click_left": 1.0, "click_right": 1.0,
-            "scroll": 1.0, "keys": 1.0, "done": 1.0,
-        }
+        head_weights = dict(LOSS.head_weights)
     else:
         head_weights = {"dx": 1.0, "dy": 1.0, "click": 1.0, "scroll": 1.0, "keys": 1.0, "done": 1.0}
 

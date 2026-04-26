@@ -100,10 +100,29 @@ MODEL = ModelConfig()
 # ---------- Loss (Q2, Q3) ----------
 @dataclass(frozen=True)
 class LossConfig:
-    focal_gamma: float = 3.0           # B0 default (Phase A used 2.0)
+    # B0 attempt 1 used gamma=3.0; reverted to Phase A's 2.0 in attempt 2 because
+    # gamma=3 + 95% idle imbalance starved the press class of gradient (val
+    # recall_press oscillated 0.40-0.97 across val checkpoints).
+    focal_gamma: float = 2.0
     label_smoothing_mouse: float = 0.05
     idle_smoothing_keys: float = 0.05
-    # Initial per-head weights will be re-computed from L_i^init at train start (Q2)
+    # Click_left / click_right CE class weights: [idle, press, release].
+    # 5x weight on press/release vs idle to overcome ~95% idle class imbalance
+    # that focal alone underweights (idle still dominates by sheer count).
+    click_class_weight: tuple = (1.0, 5.0, 5.0)
+    # Per-head loss weights for B0 attempt 2.
+    # scroll/keys/done losses are empirically ~1e-9 in attempt 1 (these heads
+    # are trivially solvable in L-click-only data); dropping their weight to
+    # 0.1 frees up the optimizer's effective gradient bandwidth for the heads
+    # that actually need it (dx/dy/click). aux_target=0.2 starts low; can be
+    # raised if val/diag/aux_target/acc_first_n stays below random (1/n_buttons).
+    head_weights: dict = field(default_factory=lambda: {
+        "dx": 1.0, "dy": 1.0,
+        "click_left": 1.0, "click_right": 1.0,
+        "scroll": 0.1, "keys": 0.1, "done": 0.1,
+        "aux_target": 0.2,   # used by A3 aux head; ignored when aux head disabled
+    })
+    # Legacy: kept for any code path that still references it.
     placeholder_weights: dict = field(default_factory=lambda: {
         "dx": 1.0, "dy": 1.0,
         "click_left": 1.0, "click_right": 1.0,
