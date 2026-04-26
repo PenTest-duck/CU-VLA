@@ -39,7 +39,32 @@ import boto3
 
 
 JOB_PREFIX = "cu-vla-"
-DEFAULT_REGION = "us-west-2"
+FALLBACK_REGION = "us-west-2"
+
+
+def _load_dotenv_if_present() -> None:
+    """Load CU_VLA_SM_* config from <repo-root>/.env if present.
+
+    Mirrors launch_sm_job.py's loader so operator commands honor the same
+    project-scoped config without a separate setup. Existing env vars take
+    precedence (override=False) so explicit overrides still win.
+    """
+    env_path = _PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(env_path, override=False)
+
+
+def _default_region() -> str:
+    """CU_VLA_SM_REGION (from .env or shell) wins; falls back to us-west-2.
+    Same rationale as launch_sm_job._default_region — pin explicitly so we
+    don't accidentally inherit the user's boto3 profile region.
+    """
+    return os.environ.get("CU_VLA_SM_REGION", FALLBACK_REGION)
 
 # Approximate $/hr for cost estimates. SageMaker bills per-second; spot
 # discount is variable. These are us-west-2 on-demand list prices —
@@ -64,7 +89,7 @@ def _logs_client(region: str):
 def resolve_job(
     name: Optional[str] = None,
     filter_: tuple[str, ...] = (),
-    region: str = DEFAULT_REGION,
+    region: str = FALLBACK_REGION,
     status: Optional[str] = None,
 ) -> str:
     """Resolve a job name from a literal name, 'latest', or --filter substring."""
@@ -276,8 +301,10 @@ def cmd_reconcile_ckpts(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv_if_present()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--region", default=DEFAULT_REGION)
+    parser.add_argument("--region", default=_default_region(),
+                        help=f"AWS region (default: $CU_VLA_SM_REGION or {FALLBACK_REGION})")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 

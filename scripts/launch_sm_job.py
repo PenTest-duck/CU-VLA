@@ -54,7 +54,18 @@ def _load_dotenv_if_present() -> None:
 
 DEFAULT_REPO_URL = "https://github.com/PenTest-duck/CU-VLA.git"
 DEFAULT_INSTANCE = "ml.g6e.xlarge"
-DEFAULT_REGION = "us-west-2"
+FALLBACK_REGION = "us-west-2"
+
+
+def _default_region() -> str:
+    """Pin the SageMaker region. CU_VLA_SM_REGION (from .env or shell) wins;
+    falls back to us-west-2. Note: we deliberately do NOT inherit the user's
+    boto3 profile region — that often defaults to wherever the user's main
+    AWS work happens (e.g. ap-southeast-2), causing CreateTrainingJob to
+    fail with ResourceLimitExceeded for instance types that aren't
+    available there. Pinning explicitly is safer.
+    """
+    return os.environ.get("CU_VLA_SM_REGION", FALLBACK_REGION)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -71,7 +82,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--instance-type", default=DEFAULT_INSTANCE,
                         help=f"SageMaker instance type (default: {DEFAULT_INSTANCE})")
     parser.add_argument("--instance-count", type=int, default=1)
-    parser.add_argument("--region", default=DEFAULT_REGION)
+    parser.add_argument("--region", default=_default_region(),
+                        help=f"AWS region (default: $CU_VLA_SM_REGION or {FALLBACK_REGION})")
     parser.add_argument("--spot", dest="spot", action="store_true", default=True,
                         help="Use spot instances (default; ~70%% cheaper)")
     parser.add_argument("--no-spot", dest="spot", action="store_false",

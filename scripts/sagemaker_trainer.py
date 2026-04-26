@@ -18,7 +18,10 @@ import shlex
 from pathlib import Path
 from typing import Any, Iterable
 
+import boto3
+
 from sagemaker.core import image_uris
+from sagemaker.core.helper.session_helper import Session
 from sagemaker.core.shapes.shapes import (
     CheckpointConfig,
     OutputDataConfig,
@@ -164,6 +167,12 @@ def make_trainer(
         s3_output_path=f"s3://{s3_bucket}/output",
     )
 
+    # Pin the SageMaker Session to our region. Without this, ModelTrainer
+    # builds a default Session from the user's boto3 profile region (e.g.
+    # ap-southeast-2 for an Australian dev), and CreateTrainingJob fails
+    # with ResourceLimitExceeded because g6e.xlarge isn't available there.
+    sagemaker_session = Session(boto_session=boto3.Session(region_name=region))
+
     return ModelTrainer(
         training_image=training_image,
         source_code=source_code,
@@ -174,4 +183,5 @@ def make_trainer(
         environment=environment,
         role=role_arn,
         base_job_name=job_name,    # SDK appends a UUID/timestamp suffix automatically
+        sagemaker_session=sagemaker_session,
     )
