@@ -55,7 +55,7 @@ def test_factory_no_spot_omits_max_wait(mock_mt, mock_image):
 
 @patch("scripts.sagemaker_trainer.image_uris")
 @patch("scripts.sagemaker_trainer.ModelTrainer")
-def test_factory_sets_checkpoint_config_only_for_spot(mock_mt, mock_image):
+def test_factory_sets_checkpoint_config_for_spot(mock_mt, mock_image):
     mock_image.retrieve.return_value = "img"
     make_trainer(**_make_kwargs(use_spot=True))
 
@@ -68,12 +68,21 @@ def test_factory_sets_checkpoint_config_only_for_spot(mock_mt, mock_image):
 
 @patch("scripts.sagemaker_trainer.image_uris")
 @patch("scripts.sagemaker_trainer.ModelTrainer")
-def test_factory_no_checkpoint_config_when_no_spot(mock_mt, mock_image):
+def test_factory_sets_checkpoint_config_for_on_demand_too(mock_mt, mock_image):
+    """On-demand needs the S3 checkpoint sync just as much as spot —
+    without it, /opt/ml/checkpoints is on the ephemeral instance volume and
+    vanishes when the job terminates. Relying on the HF Hub upload as the
+    sole persistence path is unsafe (it silently fails open if the repo
+    doesn't exist or HF auth lapses, as discovered 2026-04-27 when a 5.5h
+    on-demand B0 run lost all 1275 steps of training).
+    """
     mock_image.retrieve.return_value = "img"
     make_trainer(**_make_kwargs(use_spot=False))
-    # On-demand training has no need for the S3 sync volume — final/best.pt go
-    # to HF Hub directly.
-    assert mock_mt.call_args.kwargs["checkpoint_config"] is None
+
+    cc = mock_mt.call_args.kwargs["checkpoint_config"]
+    assert cc is not None
+    assert cc.s3_uri == "s3://cu-vla-sm-123/checkpoints/cu-vla-test-20260101-000000"
+    assert cc.local_path == "/opt/ml/checkpoints"
 
 
 @patch("scripts.sagemaker_trainer.image_uris")

@@ -160,12 +160,16 @@ def make_trainer(
         max_wait_time_in_seconds=max_wait,  # None for on-demand
     )
 
-    checkpoint_config = None
-    if use_spot:
-        checkpoint_config = CheckpointConfig(
-            s3_uri=f"s3://{s3_bucket}/checkpoints/{job_name}",
-            local_path="/opt/ml/checkpoints",
-        )
+    # ALWAYS set checkpoint_config, regardless of spot/on-demand. Spot needs
+    # it for resume on interruption; on-demand needs it for ANY checkpoint
+    # persistence at all — without S3 sync, /opt/ml/checkpoints lives on the
+    # ephemeral instance volume and vanishes when the job terminates.
+    # (Bug discovered 2026-04-27: on-demand B0 attempt 2 ran 1275 steps, then
+    # all ckpts were lost when SageMaker terminated the instance.)
+    checkpoint_config = CheckpointConfig(
+        s3_uri=f"s3://{s3_bucket}/checkpoints/{job_name}",
+        local_path="/opt/ml/checkpoints",
+    )
 
     output_data_config = OutputDataConfig(
         s3_output_path=f"s3://{s3_bucket}/output",
