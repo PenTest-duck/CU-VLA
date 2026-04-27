@@ -35,6 +35,52 @@ from experiments.action_primitives.metrics import (
 from experiments.action_primitives.model import ActionPrimitivesACT
 
 
+class _HFUploader:
+    """Per-run HF Hub uploader with consecutive-failure backstop.
+
+    Single transient failures (network blip, HF outage) shouldn't kill a
+    multi-hour training run, but persistent failures (auth lapse, repo
+    permissions revoked, repo deleted mid-run, etc.) must surface as a hard
+    error rather than silently swallowing every checkpoint for the remainder
+    of the run.
+
+    Counter resets to 0 on each successful upload.
+    """
+
+    MAX_CONSECUTIVE_FAILURES = 3
+
+    def __init__(self, repo_id: str, repo_type: str = "model") -> None:
+        self.repo_id = repo_id
+        self.repo_type = repo_type
+        self.consecutive_failures = 0
+
+    def upload(self, path: Path) -> None:
+        """Upload a single file to HF Hub. Raises RuntimeError after
+        MAX_CONSECUTIVE_FAILURES consecutive errors."""
+        from huggingface_hub import upload_file
+        try:
+            upload_file(
+                path_or_fileobj=str(path),
+                path_in_repo=path.name,
+                repo_id=self.repo_id,
+                repo_type=self.repo_type,
+            )
+            print(f"[hf-upload] {path.name} → {self.repo_id}", flush=True)
+            self.consecutive_failures = 0
+        except Exception as e:
+            self.consecutive_failures += 1
+            n = self.consecutive_failures
+            print(f"[hf-upload failed {n}/{self.MAX_CONSECUTIVE_FAILURES}] "
+                  f"{path.name}: {type(e).__name__}: {e}", flush=True)
+            if n >= self.MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f"HF upload failed {n} consecutive times to "
+                    f"{self.repo_id!r}. Refusing to continue training because "
+                    f"subsequent checkpoints would silently be lost. "
+                    f"Latest error: {type(e).__name__}: {e}"
+                ) from e
+
+
 def cosine_lr(step: int, max_steps: int, warmup_steps: int, base_lr: float, min_frac: float = 0.1) -> float:
     if step < warmup_steps:
         return base_lr * step / max(1, warmup_steps)
@@ -544,6 +590,23 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
+    # HF upload preflight — fail loud and early if the repo can't be reached
+    # before training starts. Prevents the failure mode where 5h of training
+    # runs while every checkpoint upload silently 404s on a missing repo
+    # (discovered 2026-04-27 when B0 attempt 2's 1275-step run lost all
+    # checkpoints to a non-existent HF repo + try/except-everywhere upload code).
+    if args.hf_upload_repo:
+        from huggingface_hub import create_repo
+        try:
+            create_repo(args.hf_upload_repo, repo_type="model", exist_ok=True)
+            print(f"[hf-upload] verified repo PenTest-duck/cu-vla-... -> {args.hf_upload_repo}")
+        except Exception as e:
+            raise SystemExit(
+                f"[hf-upload] FATAL: cannot create/access HF repo {args.hf_upload_repo!r}. "
+                f"Refusing to start training because checkpoints would be unrecoverable. "
+                f"Underlying error: {type(e).__name__}: {e}"
+            )
+
     # Data — exactly one of --data-dir or --hf-data-repo must be provided
     if (args.data_dir is None) == (args.hf_data_repo is None):
         parser.error(
@@ -626,17 +689,13 @@ def main() -> None:
     else:
         iterator = infinite_loader(train_ds, seed=42)
 
+    # Module-level HFUploader (defined at top of train.py); instantiated once
+    # per run, holds consecutive-failure state. None if no upload repo set.
+    hf_uploader = _HFUploader(args.hf_upload_repo) if args.hf_upload_repo else None
+
     def _upload_to_hf(path: Path) -> None:
-        """Best-effort upload; log but don't crash the run if it fails."""
-        if not args.hf_upload_repo:
-            return
-        try:
-            from huggingface_hub import upload_file
-            upload_file(path_or_fileobj=str(path), path_in_repo=path.name,
-                        repo_id=args.hf_upload_repo, repo_type="model")
-            print(f"[hf-upload] {path.name} → {args.hf_upload_repo}")
-        except Exception as e:
-            print(f"[hf-upload failed] {path.name}: {e}")
+        if hf_uploader is not None:
+            hf_uploader.upload(path)
 
     model.train(True)
     step = start_step
